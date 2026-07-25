@@ -58,6 +58,11 @@ polymarket = [
 # Declared so `uv sync` reconstructs the anchor-test environment (was previously
 # a manually-installed, undeclared dep).
 chain = ["solana", "solders"]
+# Signal Trials x402 seller integration (H0.2) — the official OKX Python x402 seller SDK that
+# H4.1's SignalTrialsPaymentASGI binds to. Version pinned exactly: the middleware contract
+# (verify -> handler -> settle -> PAYMENT-RESPONSE ordering, hook signatures, settlement-status
+# surface, nonce replay behavior) is read from THIS installed source and must not drift silently.
+signal-trials = ["okxweb3-app-x402==0.1.1", "httpx>=0.27", "websockets>=12"]
 
 [dependency-groups]
 # pyyaml: tests/test_deploy_scaffold.py parses compose.coolify.yml (D-0, dec-d0-dep-001).

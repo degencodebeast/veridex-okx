@@ -1577,6 +1577,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nest-asyncio"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/f8/51569ac65d696c8ecbee95938f89d4abf00f47d58d48f6fbabfe8f0baefe/nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe", size = 7418, upload-time = "2024-01-21T14:25:19.227Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
+]
+
+[[package]]
 name = "numpy"
 version = "2.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1711,6 +1720,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/94/a8/f98e50356cf167df656c526c2dfeec2d7dde182f2a3da4b458a5938e2776/numpy-2.5.1-cp314-cp314t-win32.whl", hash = "sha256:6eab239876581b2b3c5a242281b6007bbdbcd1c7085d7709bb57c5929b11e6bf", size = 6263298, upload-time = "2026-07-04T17:07:53.445Z" },
     { url = "https://files.pythonhosted.org/packages/72/ac/96ae880cdecad0b3275d9359fcec72667b49a4863c9f12942e43679dda02/numpy-2.5.1-cp314-cp314t-win_amd64.whl", hash = "sha256:83ce9c80d5b521b0d77ddcbe5447c218d247929b6cc056ca5351342accfff0af", size = 12748623, upload-time = "2026-07-04T17:07:55.384Z" },
     { url = "https://files.pythonhosted.org/packages/a1/5a/4d2b1601df3602dba7a14f3348ba9bfe94a18adb428e693df6154c293831/numpy-2.5.1-cp314-cp314t-win_arm64.whl", hash = "sha256:5a6db61f9aaa57e369905c67d852045d3c4f7126405b29d09b19dec118e9c9cb", size = 10697674, upload-time = "2026-07-04T17:07:58.506Z" },
+]
+
+[[package]]
+name = "okxweb3-app-x402"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nest-asyncio" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/59/3fc06bce07c938e397372969485a2e8ef425ca94f955ca401dc02e4257bb/okxweb3_app_x402-0.1.1.tar.gz", hash = "sha256:8b6891ff5b3817c36e272800559b1296c582ec4202b8faecafde4855f60d0153", size = 95586, upload-time = "2026-07-09T11:49:10.582Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/02/ab/3e644a3d8c1f39a80bd6d778a434ab5fe3a36cbb09f12b40b88e96ab2006/okxweb3_app_x402-0.1.1-py3-none-any.whl", hash = "sha256:5c16efd7b30b495609008fb690884909433a1af18b642f87e859ebfdbf2caefc", size = 134103, upload-time = "2026-07-09T11:49:12.266Z" },
 ]
 
 [[package]]
@@ -2773,6 +2796,11 @@ postgres = [
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
 ]
+signal-trials = [
+    { name = "httpx" },
+    { name = "okxweb3-app-x402" },
+    { name = "websockets" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -2791,7 +2819,9 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
     { name = "httpx", marker = "extra == 'live'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'polymarket'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'signal-trials'", specifier = ">=0.27" },
     { name = "numpy", marker = "extra == 'polymarket'" },
+    { name = "okxweb3-app-x402", marker = "extra == 'signal-trials'", specifier = "==0.1.1" },
     { name = "openai", marker = "extra == 'agent'" },
     { name = "orjson", marker = "extra == 'polymarket'" },
     { name = "poly-eip712-structs", marker = "extra == 'polymarket'" },
@@ -2807,8 +2837,9 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.30" },
     { name = "web3", marker = "extra == 'polymarket'" },
     { name = "websockets", marker = "extra == 'api'", specifier = ">=15,<16" },
+    { name = "websockets", marker = "extra == 'signal-trials'", specifier = ">=12" },
 ]
-provides-extras = ["postgres", "agent", "live", "api", "polymarket", "chain"]
+provides-extras = ["postgres", "agent", "live", "api", "polymarket", "chain", "signal-trials"]
 
 [package.metadata.requires-dev]
 dev = [
