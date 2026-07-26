@@ -1914,11 +1914,23 @@ def test_redaction_ignores_empty_secrets():
 # ==================================================================================================
 
 
+class LiveClientConstructed(BaseException):
+    """Deliberately a BaseException, NOT an Exception.
+
+    main() wraps the probe in a broad `except Exception`. An AssertionError is an Exception, so a
+    tripwire raising one is CAUGHT BY THE CODE IT GUARDS and converted into a tidy "failure artifact
+    written" - the safety mechanism fires and the suite stays green. Measured, not theorised: with a
+    misspelled monkeypatch target the real _probe ran, this tripwire fired, and
+    test_main_writes_a_failure_artifact_when_the_probe_raises still PASSED. Deriving from
+    BaseException puts it outside the reach of the handler under test.
+    """
+
+
 class _AsyncClientTripwire:
     """Raises if anything tries to construct a live client. Armed in every main() test."""
 
     def __init__(self, *args, **kwargs):
-        raise AssertionError("TRIPWIRE: a real httpx.AsyncClient was constructed inside a test")
+        raise LiveClientConstructed("TRIPWIRE: a real httpx.AsyncClient was constructed inside a test")
 
 
 @pytest.fixture
@@ -1937,7 +1949,7 @@ def _set_sentinel_credentials(monkeypatch):
     monkeypatch.setenv("OKX_PASSPHRASE", "SENTINEL-PASS-DO-NOT-LEAK")
 
 
-def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script, tmp_path):
+def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script, tmp_path, capsys):
     """ABSENCE is decided HERE, and this is the only place in the codebase where it is decided.
 
     Both reviewers verified carry-forward 5 as SATISFIED and were right at the level they measured:
@@ -1948,8 +1960,16 @@ def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script,
     """
     out = tmp_path / "preflight_result.json"
     assert operator_script.main(["--out", str(out)]) == 2
+    # ABSENCE is a property of the FILESYSTEM, not of a return value.
     assert not out.exists(), "an aborted run must leave ABSENCE, not a failure artifact"
     assert list(tmp_path.iterdir()) == []
+    # STANDING LESSON 62: a guard firing is not the guard under test. Exit 2 alone cannot say WHICH
+    # guard produced it, so identify the cause - the message must name every missing variable.
+    stderr = capsys.readouterr().err
+    assert "aborted before any request" in stderr
+    for variable in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"):
+        assert variable in stderr, f"the abort did not name {variable}"
+    assert "SENTINEL" not in stderr
 
 
 def test_main_redacts_credentials_out_of_the_failure_artifact(operator_script, tmp_path, monkeypatch):
@@ -1988,7 +2008,40 @@ def test_main_writes_a_failure_artifact_when_the_probe_raises(operator_script, t
     monkeypatch.setattr(operator_script, "_probe", exploding_probe)
     out = tmp_path / "preflight_result.json"
     assert operator_script.main(["--out", str(out)]) == 1
-    assert json.loads(out.read_text())["probe_status"] == "failed"
+
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] == "failed"
+    # STANDING LESSON 62. `except Exception` catches EVERYTHING, so exit 1 plus "failed" is reached
+    # by any error at all - including a bug in this test's own setup. Measured: with a misspelled
+    # monkeypatch target the real _probe ran, the live-client tripwire fired, and this test still
+    # PASSED. Identify the exception that was actually injected.
+    assert "OKXAPIError" in payload["failure_reason"], f"a different guard fired: {payload['failure_reason']}"
+    assert "51000" in payload["failure_reason"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit], ids=["KeyboardInterrupt", "SystemExit"])
+def test_main_does_not_swallow_an_operator_interrupt(operator_script, tmp_path, monkeypatch, interrupt):
+    """main()'s handler must stay `except Exception`, never widen to BaseException.
+
+    Found by a surviving mutant while closing standing lesson 62, and it is a real operator property
+    rather than a test-harness one. The live probe runs for ~30 minutes; widening the handler would
+    convert a Ctrl-C into "failure artifact written" and exit 1 - an artifact claiming the PROBE
+    FAILED when in fact the operator stopped it. That is a false record in the one document a later
+    stage reads, and it is the same absence-versus-failure confusion carry-forward 5 exists to
+    prevent, arriving through the exception handler instead of through the writer.
+
+    It also keeps this suite's own live-client tripwire outside the reach of the code it guards.
+    """
+    _set_sentinel_credentials(monkeypatch)
+
+    async def interrupted_probe(creds, args):
+        raise interrupt()
+
+    monkeypatch.setattr(operator_script, "_probe", interrupted_probe)
+    out = tmp_path / "preflight_result.json"
+    with pytest.raises(interrupt):
+        operator_script.main(["--out", str(out)])
+    assert not out.exists(), "an interrupted run must not claim the probe FAILED"
 
 
 def test_main_writes_a_completed_artifact_on_success(operator_script, tmp_path, monkeypatch):
@@ -2028,7 +2081,9 @@ def test_main_threads_the_operator_supplied_threshold_into_the_decision(operator
 @pytest.mark.parametrize(
     ("exit_code", "scenario"), [(2, "abort"), (1, "failure"), (0, "success")], ids=["abort", "failure", "success"]
 )
-def test_main_returns_a_distinct_exit_code_per_outcome(operator_script, tmp_path, monkeypatch, exit_code, scenario):
+def test_main_returns_a_distinct_exit_code_per_outcome(
+    operator_script, tmp_path, monkeypatch, capsys, exit_code, scenario
+):
     """Per C28 the exit code IS the surface. All three were unpinned."""
     if scenario != "abort":
         _set_sentinel_credentials(monkeypatch)
@@ -2039,7 +2094,19 @@ def test_main_returns_a_distinct_exit_code_per_outcome(operator_script, tmp_path
         return _full(41, 0, 0, 0)
 
     monkeypatch.setattr(operator_script, "_probe", probe)
-    assert operator_script.main(["--out", str(tmp_path / f"{scenario}.json")]) == exit_code
+    out = tmp_path / f"{scenario}.json"
+    assert operator_script.main(["--out", str(out)]) == exit_code
+
+    # STANDING LESSON 62: an exit code alone names no cause. Each scenario asserts the state that
+    # identifies WHICH path produced it, so a wrong-guard pass is impossible.
+    stderr = capsys.readouterr().err
+    if scenario == "abort":
+        assert not out.exists()
+        assert "OKX_API_KEY" in stderr
+    elif scenario == "failure":
+        assert json.loads(out.read_text())["failure_reason"].startswith("RuntimeError: boom")
+    else:
+        assert json.loads(out.read_text())["probe_status"] == "completed"
 
 
 # --- QUALITY MINOR-2: HttpxTransport and filters_by_chain, both on the live operator path ----------
