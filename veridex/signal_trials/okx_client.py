@@ -14,10 +14,11 @@ Two trust-relevant properties this module is responsible for:
    ``bar``/``bar_ms`` to be persisted in every receipt, and a season must never mix bars.
 2. **Credential secrecy.** ``OKXCredentials`` has a redacting ``__repr__`` so a traceback or a
    log line can never echo the secret key or passphrase. This module performs no logging at all.
-3. **Fail closed, never quietly empty.** An error envelope or an off-contract candle row raises
-   (``OKXAPIError`` / ``OKXResponseError``) instead of degrading into an empty page or series.
-   §7 permits an empty settlement result only for genuine absence, so a swallowed API failure
-   would masquerade as a lawful ``UNSCORED`` — a false provenance claim rather than a diagnostic.
+3. **Fail closed, never quietly empty.** An error envelope, an off-contract signal row, or an
+   off-contract candle row raises (``OKXAPIError`` / ``OKXResponseError``) instead of degrading
+   into an empty page or series. §7 permits an empty settlement result only for genuine absence,
+   so a swallowed API failure would masquerade as a lawful ``UNSCORED`` — a false provenance
+   claim rather than a diagnostic.
 
 Normalization of the raw signal dicts is task H2.2 and deliberately does NOT happen here —
 ``SignalPage.signals`` carries the wire dicts untouched.
@@ -220,8 +221,19 @@ class OKXMarketClient:
         payload = await self._transport.request("POST", SIGNAL_LIST_PATH, params=None, json_body=body, headers=headers)
 
         rows = _rows(payload)
+        # Row-shape guard, mirroring the candle path below: validate before the page can be
+        # represented as a result. Two failures ride on this, and the second is the silent one.
+        # `SignalPage.signals` is annotated tuple[dict[str, Any], ...] and mypy cannot see a breach
+        # because `_rows` returns list[Any]. Worse, the cursor read below used to skip a non-dict
+        # last row and leave next_cursor=None — indistinguishable from end-of-pagination, so a
+        # season fetch would stop after page 1 and report a complete dataset. Absence of rows and
+        # absence of a cursor stay legitimate; only a row of the wrong shape raises.
+        for row in rows:
+            if not isinstance(row, dict):
+                raise OKXResponseError(f"signal row must be a JSON object, got {type(row).__name__}")
+
         next_cursor: str | None = None
-        if rows and isinstance(rows[-1], dict):
+        if rows:
             raw_cursor = rows[-1].get("cursor")
             if raw_cursor is not None:
                 next_cursor = str(raw_cursor)
