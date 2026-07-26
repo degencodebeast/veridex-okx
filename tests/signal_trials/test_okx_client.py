@@ -107,6 +107,13 @@ async def test_get_candles_rejects_rows_that_are_not_the_frozen_record(row: obje
 CANDLE_CONFIRMED = ["1753400000000", "1.0", "1.2", "0.9", "1.1", "5", "5.5", "1"]
 CANDLE_UNCONFIRMED = ["1753400060000", "1.1", "1.3", "1.0", "1.2", "6", "6.6", "0"]
 
+# A SECOND (chain, token) pair. Deliberately NOT the frozen manifest values: every other vector in
+# this file uses chain "501" and token "So1", which is exactly the constancy these two exist to
+# break. They assert nothing about which chains the season selects — only that the arguments reach
+# the request instead of being baked in.
+CHAIN_B = "56"
+TOKEN_B = "0xB0B"
+
 
 def _signal_row(cursor: str, token_address: str) -> dict[str, object]:
     """One wire signal row. Carried through untouched — normalization is H2.2, not this module."""
@@ -259,7 +266,9 @@ async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_i
     assert params is None
     assert isinstance(body, list) and len(body) == 1
     # Whole-body equality: the predeclared MVP filter manifest (§5.1) is otherwise unpinned, and a
-    # rewritten threshold changes which signals the season is ever able to see.
+    # rewritten threshold changes which signals the season is ever able to see. The BREADTH of this
+    # assertion is load-bearing — it is the sole detector for a rewritten `minAmountUsd` as well as
+    # for a dropped `cursor`. Narrowing it to just the cursor key would silently unpin the manifest.
     assert body == [
         {
             "chainIndex": "501",
@@ -271,3 +280,87 @@ async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_i
             "cursor": "CURSOR-LAST",
         }
     ]
+
+
+# --- C21 PINS. Two further constants the C18 sweep MEASURED as unpinned: the (chain, token) pair,
+# held at "501"/"So1" by every vector including the C18 pins themselves, and the wire-column-to-field
+# mapping, which no vector reads at all. Both are settlement-critical and neither is reachable by any
+# existing guard — see the note on PKT-DEC-C17-R2-A1 in the mapping pin below.
+
+
+async def test_get_candles_sends_the_requested_chain_and_token_rather_than_constants():
+    """PIN 5a — chain and token provenance on the settlement request.
+
+    Every other vector in this file requests chain "501" and token "So1", so a client that baked
+    either into the query is indistinguishable from one that reads its arguments. This is the
+    widest blast radius of the whole constancy class: a wrong endpoint fetches the wrong SOURCE,
+    but a wrong chain or token settles every trial against a market the trial was never about.
+    """
+    fake = RecordingFake({"code": "0", "data": []})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    await client.get_candles("501", "So1", "1m")
+    await client.get_candles(CHAIN_B, TOKEN_B, "1m")
+
+    assert len(fake.calls) == 2  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
+    first_params, second_params = fake.calls[0][2], fake.calls[1][2]
+    assert (first_params["chainIndex"], first_params["tokenContractAddress"]) == ("501", "So1")
+    assert (second_params["chainIndex"], second_params["tokenContractAddress"]) == (CHAIN_B, TOKEN_B)
+    # Stated directly rather than left implicit in the two equalities above: the request must VARY
+    # with the arguments. A client hard-coding either value satisfies neither line.
+    assert first_params["chainIndex"] != second_params["chainIndex"]
+    assert first_params["tokenContractAddress"] != second_params["tokenContractAddress"]
+
+
+async def test_list_signals_sends_the_requested_chain_rather_than_a_constant():
+    """PIN 5b — the same provenance on the signal-list request, which carries its own chainIndex."""
+    fake = RecordingFake({"code": "0", "data": []})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    await client.list_signals(SignalFilters(chain_index="501"))
+    await client.list_signals(SignalFilters(chain_index=CHAIN_B))
+
+    assert len(fake.calls) == 2  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
+    first_body, second_body = fake.calls[0][3], fake.calls[1][3]
+    assert isinstance(first_body, list) and len(first_body) == 1
+    assert isinstance(second_body, list) and len(second_body) == 1
+    assert first_body[0]["chainIndex"] == "501"
+    assert second_body[0]["chainIndex"] == CHAIN_B
+    assert first_body[0]["chainIndex"] != second_body[0]["chainIndex"]
+
+
+async def test_get_candles_maps_every_wire_column_to_its_own_field():
+    """PIN 6 — the wire-column-to-field MAPPING, which nothing else in this repo reaches.
+
+    The frozen record is [ts, o, h, l, c, vol, volUsd, confirm] and the mapping is established by
+    the tuple unpack in ``get_candles``. Transposing two columns there is SILENT: ruff and
+    ``mypy --strict`` both pass (eight names, eight values, all floats), Law's H3.2 suite reads only
+    ``ts_open_ms``/``confirmed`` and asserts on identity, and — measured, not assumed — the
+    PKT-DEC-C17-R2-A1 field-order assertion passes too, because ``Candle`` is constructed by KEYWORD.
+    That assertion protects Law's POSITIONAL construction against a dataclass reorder, which is a
+    different law from this one. Nothing else covers the mapping, so it is pinned here by VALUE.
+
+    Every numeric value below is distinct, so ANY transposition among the six is detected rather
+    than only the adjacent ones.
+    """
+    row = ["1753400000000", "11.0", "22.0", "3.0", "14.0", "55.0", "66.0", "1"]
+    fake = RecordingFake({"code": "0", "data": [row]})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    series = await client.get_candles("501", "So1", "1m")
+
+    assert isinstance(series, CandleSeries)  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
+    assert len(series.candles) == 1
+    candle = series.candles[0]
+    assert candle.ts_open_ms == 1753400000000
+    assert candle.open == 11.0
+    assert candle.high == 22.0
+    assert candle.low == 3.0
+    assert candle.close == 14.0
+    assert candle.vol == 55.0
+    assert candle.vol_usd == 66.0
+    assert candle.confirmed is True
+    # Guards the FIXTURE, not the client: if a later edit made two of these values equal, the pin
+    # would silently stop detecting a swap between them while every assertion above still passed.
+    numeric = [candle.open, candle.high, candle.low, candle.close, candle.vol, candle.vol_usd]
+    assert len(set(numeric)) == len(numeric)
