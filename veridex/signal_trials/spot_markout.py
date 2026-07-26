@@ -5,11 +5,13 @@ Two laws live here, and both exist to make a spot trial hard to flatter.
 **The close-boundary law.** A trial opened at ``t0`` with horizon ``H`` settles at ``T = t0 + H``
 against the FIRST candle whose close lands at or after ``T``. OKX's ``ts`` is the candle OPEN time,
 so the close is one bar later: ``close_ts = ts_open + series.bar_ms``. The accepted lag window is
-half-open, ``0 <= close_ts - T < bar_ms``: a lag of a full bar or more means some other bar already
-closed between ``T`` and this one, so this is not the settlement bar and the trial is left UNSCORED
-rather than settled against the wrong price. Unconfirmed candles are never eligible — an in-progress
-bar's close is a moving number, and settling on it would let the same trial score differently on two
-reads. No eligible candle (including an empty series) is ``None``: unscored, never guessed.
+half-open, ``0 <= close_ts - T < bar_ms``: past a full bar of lag we can no longer show that THIS is
+the bar that first closed after ``T``. Either another bar closed in between, or the series has a hole
+where that bar would have been — for an illiquid token (no trades, no candle) the hole is the commoner
+cause — and in neither case is this the settlement bar, so the trial is left UNSCORED rather than
+settled against the wrong price. Unconfirmed candles are never eligible either: an in-progress bar's
+close is a moving number, and settling on it would let the same trial score differently on two reads.
+No eligible candle (including an empty series) is ``None`` — unscored, never guessed.
 
 **The symmetric-cost law.** ``follow`` and ``fade`` are mirror-image directional stances on the same
 gross move, and BOTH pay ``cost_bps``. Charging cost only to the follow leg would turn the fee into a
@@ -17,13 +19,16 @@ gross move, and BOTH pay ``cost_bps``. Charging cost only to the follow leg woul
 free, and it is exactly 0 — abstaining is the honest way to decline a trial, and it must never be
 worth more or less than nothing.
 
-Rounding to integer bps happens ONCE, on the gross move. The two legs are then pure integer
-arithmetic off that single value, which makes ``follow + fade == -2 * cost_bps`` exact by
-construction — no float rounding can drift the two legs apart and quietly break the symmetry above.
+Rounding to integer bps happens ONCE, on the gross move, to the nearest integer with ties to even.
+The two legs are then pure integer arithmetic off that single value, which makes
+``follow + fade == -2 * cost_bps`` exact by construction — no float rounding can drift the two legs
+apart and quietly break the symmetry above. The MODE matters as much as the single application:
+see ``spot_markout`` for why ``math.floor`` would reintroduce a directional bias.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from veridex.signal_trials.okx_client import Candle, CandleSeries
@@ -42,9 +47,17 @@ def assert_positive_price(x: float, name: str) -> float:
 
     Spot prices are UNBOUNDED above — this is deliberately not the ``[0, 1]`` check that guards a
     probability. A token can legitimately trade at ``3620.5`` or at ``0.000004``; only non-positive
-    values are impossible. The bound matters because a ``0.0`` entry would otherwise reach the
-    ``(future - entry) / entry`` division, and ``NaN`` would propagate silently through it. ``not
-    x > 0`` rejects ``NaN`` too, which ``x <= 0`` would let through.
+    and non-finite values are impossible.
+
+    What the guard buys is a NAMED refusal in place of an anonymous crash. Left to the arithmetic,
+    ``0.0`` raises a bare ``ZeroDivisionError``; ``NaN`` reaches ``round()`` and raises
+    ``ValueError: cannot convert float NaN to integer``; ``+inf`` raises ``OverflowError``, which is
+    not even a ``ValueError`` and so escapes the refusal posture ``SpotMarkoutError`` documents.
+    None of the three names the offending field or its value. This does.
+
+    The predicate is spelled ``not (x > 0 and math.isfinite(x))`` rather than ``x <= 0`` because each
+    half catches something the other misses: ``NaN`` fails every comparison, so ``x <= 0`` would let
+    it through, while ``inf > 0`` is ``True``, so positivity alone admits it.
 
     Args:
         x: The candidate price.
@@ -55,10 +68,11 @@ def assert_positive_price(x: float, name: str) -> float:
         ``x`` unchanged, so this can wrap an expression inline.
 
     Raises:
-        SpotMarkoutError: If ``x`` is not strictly greater than zero (including ``NaN``).
+        SpotMarkoutError: If ``x`` is not a strictly positive finite number — this includes ``0.0``,
+            negatives, ``NaN``, ``+inf`` and ``-inf``.
     """
-    if not x > 0:
-        raise SpotMarkoutError(f"{name} must be a positive spot price, got {x!r}")
+    if not (x > 0 and math.isfinite(x)):
+        raise SpotMarkoutError(f"{name} must be a positive finite spot price, got {x!r}")
     return x
 
 
@@ -71,9 +85,12 @@ def select_settlement_candle(series: CandleSeries, *, t0_ms: int, horizon_ms: in
     ``close_ts`` wins. ``bar_ms`` comes from the series (request provenance, never inferred from the
     wire) — the same timestamps under a different bar width are a different settlement.
 
-    Selection is order-independent: it depends only on ``close_ts``, not on the order OKX returned
-    the rows in, so a re-fetch that paginates differently settles identically. Duplicate rows sharing
-    a ``ts_open_ms`` resolve to the first occurrence, which is stable for a fixed input.
+    Selection depends only on ``close_ts``, so GIVEN DISTINCT ``ts_open_ms`` it is order-independent
+    and a re-fetch that paginates differently settles identically. That guarantee does NOT extend to
+    duplicate ``ts_open_ms``: two such rows tie on ``close_ts``, ``min`` keeps whichever the wire put
+    first, and if their closes differ the settlement PRICE follows wire order. Deduping the wire is
+    not this module's job — a caller that needs cross-re-fetch determinism has to guarantee
+    ``ts_open_ms`` uniqueness upstream.
 
     Args:
         series: The candles plus their bar provenance.
@@ -114,14 +131,18 @@ class MarkoutResult:
 def spot_markout(entry: float, future: float, cost_bps: int) -> MarkoutResult:
     """Score the three stances on one spot trial.
 
-    ``gross = (future - entry) / entry * 1e4`` basis points, rounded once to an integer. Then
+    ``gross = (future - entry) / entry * 1e4`` basis points, rounded once to the NEAREST integer with
+    ties to even — Python's built-in ``round``. The mode is load-bearing rather than incidental: it
+    has to satisfy ``fade(+m) == follow(-m)``, and ``math.floor`` does not (``floor(0.5) == 0`` while
+    ``-floor(-0.5) == 1``). Under ``floor``, fading an up-move and following the mirror-image
+    down-move stop paying the same, which is a farmable directional bias. Then
     ``follow = gross - cost_bps`` and ``fade = -gross - cost_bps``: the fade leg mirrors the gross
     move but STILL pays the cost, because a stance that is charged nothing to take is a stance an
     agent will take for free. ``abstain`` is exactly 0.
 
     Args:
-        entry: Spot price at trial open. Must be positive.
-        future: Spot price at the settlement candle's close. Must be positive.
+        entry: Spot price at trial open. Must be positive and finite.
+        future: Spot price at the settlement candle's close. Must be positive and finite.
         cost_bps: Round-trip cost charged to each directional stance, in basis points.
 
     Returns:
@@ -129,9 +150,9 @@ def spot_markout(entry: float, future: float, cost_bps: int) -> MarkoutResult:
         strictly — a markout of exactly 0 is a wash, not a win.
 
     Raises:
-        SpotMarkoutError: If either price is not positive, or if ``cost_bps`` is negative. A
-            negative cost would pay agents to trade and would invert the symmetric-cost law, so it
-            is rejected rather than applied.
+        SpotMarkoutError: If either price is not a positive finite number, or if ``cost_bps`` is
+            negative. A negative cost would pay agents to trade and would invert the symmetric-cost
+            law, so it is rejected rather than applied.
     """
     assert_positive_price(entry, "entry")
     assert_positive_price(future, "future")

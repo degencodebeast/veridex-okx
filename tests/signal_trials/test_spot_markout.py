@@ -36,3 +36,60 @@ def test_unconfirmed_rejected_and_missing_unscored():
 def test_spot_prices_not_probability_bounded():
     assert assert_positive_price(3620.5, "entry") == 3620.5
     with pytest.raises(SpotMarkoutError): assert_positive_price(0.0, "entry")
+
+
+# --- Regression pins appended after the QUALITY review of 2cfc047 (Q1, Q3, INFO-1, INFO-2). ---
+# The mandated block above is byte-identical to the REGION A mandate and is not touched. Each pin
+# below was captured FAILING against the specific mutation it exists to kill: absence-RED is
+# impossible for behaviour that already exists and is already correct, so mutant-RED stands in.
+
+
+def test_min_close_ts_wins_regardless_of_wire_order():
+    """The MIN-selection rule itself, which every mandated test leaves unpinned.
+
+    Each mandated selection test builds a series of at most ONE candle, so any function returning
+    *some* eligible candle passes them: min -> max, min -> first-in-wire-order and
+    min -> last-in-wire-order all survive. Two eligible candles at distinct close_ts, asserted in
+    both wire orders, kill all three at once.
+    """
+    early = _c(T - BAR, close=100.0)  # close_ts == T, lag 0
+    late = _c(T - BAR + 30_000, close=999.0)  # close_ts == T + 30s, still inside the window
+    assert select_settlement_candle(_series(early, late), t0_ms=T0, horizon_ms=H) is early
+    assert select_settlement_candle(_series(late, early), t0_ms=T0, horizon_ms=H) is early
+
+
+def test_follow_profitable_is_false_at_exact_breakeven():
+    """A markout of exactly 0 is a wash, not a win. Kills ``> 0`` -> ``>= 0``."""
+    r = spot_markout(entry=100.0, future=100.25, cost_bps=25)  # gross +25bps, follow exactly 0
+    assert r.follow_markout_bps == 0
+    assert r.follow_profitable is False
+
+
+def test_rounding_is_nearest_ties_to_even_and_mirrors_under_negation():
+    """Pins the rounding MODE, which the mandated vectors leave free.
+
+    The mirror symmetry ``fade(+m) == follow(-m)`` is the property that makes the choice
+    load-bearing: ``math.floor`` breaks it and would reintroduce a farmable directional bias while
+    every mandated test stays green.
+    """
+    up = spot_markout(entry=10_000.0, future=10_002.5, cost_bps=0)  # gross exactly +2.5
+    down = spot_markout(entry=10_000.0, future=9_997.5, cost_bps=0)  # gross exactly -2.5
+    assert up.follow_markout_bps == 2  # ties to even, not 3
+    assert down.follow_markout_bps == -2  # math.floor would give -3
+    assert up.fade_markout_bps == down.follow_markout_bps  # fade(+m) == follow(-m)
+    truncating = spot_markout(entry=16_384.0, future=16_386.5, cost_bps=0)  # gross 1.52587890625
+    assert truncating.follow_markout_bps == 2  # int() and math.floor() would both give 1
+
+
+def test_non_finite_prices_rejected():
+    """Non-finite prices must be refused by the guard, not escape as an uncatchable error.
+
+    ``+inf`` satisfies ``not x > 0`` and so passed the original guard, then surfaced as
+    ``OverflowError`` — which is not a ``ValueError`` and therefore not caught by a caller following
+    ``SpotMarkoutError``'s documented ValueError contract.
+    """
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(SpotMarkoutError):
+            assert_positive_price(bad, "entry")
+    with pytest.raises(SpotMarkoutError):
+        spot_markout(entry=100.0, future=float("inf"), cost_bps=25)
