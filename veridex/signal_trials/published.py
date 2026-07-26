@@ -20,6 +20,18 @@ scorer's verdict — including an intentional ``no_season``, which must stay
 distinguishable from ``not_built`` — while the season document is the payload
 ``GET /signal-trials/season`` serves. A ``no_season`` verdict has a state and no
 document, so a single combined file could not represent it honestly.
+
+Separate files mean the two can disagree, and the third rule is what keeps that from
+becoming a lie:
+
+* **The state is authoritative on every read.** Writes stay atomic per file, which is
+  what a crash between two file operations requires — but that same property means a
+  ``no_season`` verdict recorded over a directory that once held a season leaves the
+  old payload on disk. So ``read_season`` consults the state first: under ``not_built``
+  or ``no_season`` it serves nothing, and under ``qualified``/``exploratory`` it refuses
+  a payload whose own ``season_status`` disagrees. Deleting a superseded payload is an
+  optimisation; refusing to serve it is the correctness, and it holds even if the
+  process died before any deletion could run.
 """
 
 from __future__ import annotations
@@ -38,6 +50,11 @@ PUBLISHED_STATES: frozenset[str] = frozenset({"not_built", "qualified", "explora
 
 #: The state of a data dir that has never been published to.
 NOT_BUILT: PublishedState = "not_built"
+
+#: States under which NO season document may be served, whatever is on disk.
+#: ``not_built`` means the scorer never ran; ``no_season`` means it ran and declined.
+#: Both are answers, and neither of them is a season.
+UNPUBLISHED_STATES: frozenset[str] = frozenset({"not_built", "no_season"})
 
 PUBLISHED_DIRNAME = "published"
 STATE_FILENAME = "state.json"
@@ -158,21 +175,55 @@ def read_state(data_dir: Path | str | None) -> dict[str, Any]:
 
 
 def read_season(data_dir: Path | str | None) -> dict[str, Any] | None:
-    """Read the published season document, or ``None`` when none is published.
+    """Read the published season, with the published STATE as the authority.
+
+    The two artifacts are written separately and can disagree — deliberately, because
+    atomic writes are per-file and a crash can land between them. The scorer's
+    ``no_season`` branch is specified to record its verdict without deleting anything,
+    so a declined preflight over a directory that once held a season leaves a stale
+    ``season.json`` sitting next to a ``no_season`` state. Reading the two independently
+    let the API answer ``no_season`` on ``/health`` and ``200 qualified`` on ``/season``
+    in the same breath.
+
+    So the state decides, on every read:
+
+    * ``not_built`` and ``no_season`` mean nothing is published. Any payload on disk is
+      a leftover from an earlier generation and is not served, whether or not the
+      scorer got around to deleting it. Deleting it is an optimisation; this is the
+      correctness.
+    * ``qualified`` and ``exploratory`` serve the payload, but only if the payload
+      agrees that it is that kind of season. A document whose ``season_status``
+      contradicts the authoritative state is a cross-generation artifact and is refused
+      rather than served, on the same principle as a corrupt one: it is not absent, so
+      reporting absence would be a lie.
 
     Args:
         data_dir: The signal-trials data directory, or ``None`` when none is
             configured.
 
     Returns:
-        The season document, or ``None`` if nothing has been published.
+        The season document, or ``None`` when the state says nothing is published or
+        no payload exists.
 
     Raises:
-        ValueError: The artifact exists but is unreadable.
+        ValueError: The state artifact is unreadable or carries an unknown state; or
+            the season artifact is unreadable; or the payload's ``season_status``
+            disagrees with the authoritative state.
     """
     if data_dir is None:
+        return None
+    state = read_state(data_dir)["state"]
+    if state in UNPUBLISHED_STATES:
         return None
     path = _published_dir(data_dir) / SEASON_FILENAME
     if not path.is_file():
         return None
-    return _read_json_object(path)
+    season = _read_json_object(path)
+    payload_status = season.get("season_status")
+    if payload_status != state:
+        raise ValueError(
+            f"published artifact {SEASON_FILENAME} carries season_status {payload_status!r} "
+            f"while the authoritative state is {state!r}; refusing to serve a "
+            "cross-generation season payload"
+        )
+    return season

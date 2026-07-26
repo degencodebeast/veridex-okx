@@ -88,7 +88,15 @@ def register_signal_trials_routes(
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/season", response_model=None)
     async def signal_trials_season() -> SignalTrialsSeasonResponse | JSONResponse:
-        """Serve the published season, or 404 when none has been published."""
+        """Serve the published season, or 404 when none has been published.
+
+        "None has been published" is decided by the published STATE, not by whether a
+        payload file happens to exist. Under ``not_built`` or ``no_season`` this route
+        answers 404 even if an older ``season.json`` is still on disk — otherwise a
+        declined preflight would leave ``/health`` reporting ``no_season`` while this
+        route served a stale ``qualified`` season, and the API would be asserting both
+        at once. See :func:`~veridex.signal_trials.published.read_season`.
+        """
         season = read_season(data_dir)
         if season is None:
             return _error(404, "no_season_published")

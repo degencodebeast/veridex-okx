@@ -115,6 +115,31 @@ def _client_for(app: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://sig")
 
 
+async def _aget_must_not_raise(client, path):
+    """``client.get(path)`` where the request RAISING is itself the failure to report.
+
+    The async twin of :func:`_must_not_raise`. ASGITransport re-raises application
+    exceptions, so a route that blows up fails the test by exception rather than by
+    assertion — detection by crash, which C23 does not bank.
+    """
+    try:
+        return await client.get(path)
+    except Exception as error:  # noqa: BLE001 - re-raised as an assertion below
+        raise AssertionError(f"GET {path} should have answered, got {type(error).__name__}: {error}") from error
+
+
+def _publish(data_dir, season, detail=None):
+    """Publish a season CONSISTENTLY: the payload plus the state that authorises it.
+
+    The state is authoritative on reads, so a payload written without a matching state
+    is not published — it is a leftover. Writing the pair through one helper keeps the
+    tests that care about *content* from silently depending on that distinction, and
+    leaves the tests that care about *disagreement* to write the two files themselves.
+    """
+    write_season(data_dir, season)
+    write_state(data_dir, season["season_status"], detail if detail is not None else {})
+
+
 def _must_not_raise(build):
     """Run ``build`` and convert any refusal into a PINNED assertion failure.
 
@@ -171,7 +196,7 @@ def test_state_layout_is_published_state_json(tmp_path):
 @pytest.mark.parametrize("season", [SEASON_A, SEASON_B])
 def test_season_round_trips_exactly(tmp_path, season):
     """Two distinct documents: a reader returning a fixed season fails on the other one."""
-    write_season(tmp_path, season)
+    _publish(tmp_path, season)
     assert read_season(tmp_path) == season
     assert json.loads((tmp_path / "published" / "season.json").read_text()) == season
 
@@ -186,12 +211,55 @@ def test_rewriting_replaces_rather_than_accumulates(tmp_path):
     assert read_state(tmp_path) == {"state": "exploratory", "detail": {"n": 2}}
 
 
-def test_state_and_season_are_independent_files(tmp_path):
-    """Writing one must not disturb the other: /health and /season answer separately."""
+def test_writing_a_season_does_not_invent_a_state(tmp_path):
+    """The two files are written independently — a payload alone publishes nothing.
+
+    This is the surviving half of a test that used to assert the WRONG other half: that
+    a ``no_season`` state still yielded the stale payload. Independence on the WRITE side
+    is real and is what atomic per-file writes require. Independence on the READ side was
+    the defect; see the transition tests below.
+    """
     write_season(tmp_path, SEASON_A)
     assert read_state(tmp_path) == {"state": "not_built", "detail": {}}
-    write_state(tmp_path, "no_season", {"why": "retention too shallow"})
-    assert read_season(tmp_path) == SEASON_A
+    assert read_season(tmp_path) is None
+
+
+@pytest.mark.parametrize("published", [SEASON_A, SEASON_B])
+@pytest.mark.parametrize("retiring_state", ["no_season", "not_built"])
+def test_a_retiring_state_hides_a_previously_published_season(tmp_path, published, retiring_state):
+    """The state is authoritative: retiring it must retire the payload with it.
+
+    The scorer's no-season branch records its verdict WITHOUT deleting anything, so this
+    is the ordinary sequence, not a corruption case. Reading the two files independently
+    let the API answer ``no_season`` on /health and ``200 qualified`` on /season at once.
+
+    Run against both a qualified and an exploratory prior season, because a reader that
+    special-cased only one status would otherwise pass.
+    """
+    write_season(tmp_path, published)
+    write_state(tmp_path, published["season_status"], {"n": published["sample_size"]})
+    assert read_season(tmp_path) == published  # precondition: it really was being served
+
+    write_state(tmp_path, retiring_state, {"why": "preflight declined"})
+
+    assert read_state(tmp_path)["state"] == retiring_state
+    # _must_not_raise because the failure mode here is not only "serves the stale doc":
+    # a reader that consults the payload before the state raises on the mismatch instead,
+    # which is production crashing rather than this test catching it (PKT-DEC-C23).
+    assert _must_not_raise(lambda: read_season(tmp_path)) is None
+
+
+def test_a_payload_from_another_generation_is_refused_not_served(tmp_path):
+    """A payload whose own status contradicts the state is cross-generation. Fail closed.
+
+    Not absent and not corrupt — structurally valid, and wrong. Serving it would report
+    an exploratory season as qualified, or the reverse, which is the badge the frozen
+    spec attaches a skill claim to.
+    """
+    write_season(tmp_path, SEASON_A)  # season_status == "qualified"
+    write_state(tmp_path, "exploratory", {})
+    with pytest.raises(ValueError, match="cross-generation"):
+        read_season(tmp_path)
 
 
 def test_writes_leave_no_temporary_files_behind(tmp_path):
@@ -220,12 +288,19 @@ def test_reader_refuses_a_state_outside_the_frozen_set(tmp_path):
 
 @pytest.mark.parametrize("reader", [read_state, read_season])
 def test_reader_refuses_a_corrupt_artifact(tmp_path, reader):
-    """Unreadable is not the same as absent — reporting ``not_built`` here would be a lie."""
+    """Unreadable is not the same as absent — reporting ``not_built`` here would be a lie.
+
+    Matched on the CORRUPTION message specifically. Both readers now have other ways to
+    reject a corrupt file for an unrelated reason — an empty object has no known state
+    and no ``season_status`` — so a bare ``pytest.raises(ValueError)`` passes even if the
+    decode error is swallowed, and the operator loses the one diagnostic that says which
+    file is unreadable.
+    """
     published = tmp_path / "published"
     published.mkdir(parents=True)
     (published / "state.json").write_text("{not json")
     (published / "season.json").write_text("{not json")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not readable JSON"):
         reader(tmp_path)
 
 
@@ -238,7 +313,7 @@ def test_data_dir_is_created_on_demand(tmp_path):
 
 def test_data_dir_accepts_a_string_path(tmp_path):
     """Callers read the location out of the environment, so a plain string must work."""
-    write_season(str(tmp_path), SEASON_B)
+    _publish(str(tmp_path), SEASON_B)
     assert read_season(str(tmp_path)) == SEASON_B
 
 
@@ -364,9 +439,13 @@ async def test_persisted_state_survives_an_app_rebuild(tmp_path, monkeypatch, st
     An intentional ``no_season`` stays distinguishable from ``not_built`` via health,
     while both honestly 404 on ``/season``.
     """
+    # The payload must MATCH the state it is published under — a qualified document
+    # under an exploratory state is a cross-generation artifact and is refused, not
+    # served. Picking it by status keeps this test about persistence rather than
+    # accidentally exercising the mismatch path.
     write_state(tmp_path, state, {"note": state})
     if expect_season:
-        write_season(tmp_path, SEASON_A)
+        write_season(tmp_path, SEASON_A if state == "qualified" else SEASON_B)
     monkeypatch.setenv(_DATA_DIR_ENV, str(tmp_path))
 
     async with _client_for(create_app()) as c:  # rebuilt app over the SAME data dir
@@ -389,7 +468,7 @@ async def test_season_route_serves_the_published_document(tmp_path, season):
     Run against two documents that differ in every field, so an implementation that
     returns a constant season fails on the second.
     """
-    write_season(tmp_path, season)
+    _publish(tmp_path, season)
     async with _client_for(_routed_app(data_dir=tmp_path)) as c:
         r = await c.get("/signal-trials/season")
         assert r.status_code == 200
@@ -413,6 +492,37 @@ async def test_a_season_published_after_startup_is_served_without_a_rebuild(tmp_
 
         assert (await c.get("/signal-trials/season")).status_code == 200
         assert (await c.get("/signal-trials/health")).json()["season_state"] == "qualified"
+
+
+@pytest.mark.parametrize("retiring_state", ["no_season", "not_built"])
+async def test_the_route_stops_serving_a_season_the_moment_the_state_retires_it(tmp_path, retiring_state):
+    """End-to-end: /health and /season must never contradict each other.
+
+    The sequence is the ordinary one, not a corruption case — a season is published, a
+    later preflight declines and records its verdict without deleting the payload. Before
+    the fix this produced ``health.season_state == "no_season"`` alongside
+    ``GET /season -> 200`` with ``season_status == "qualified"``: the API asserting both
+    "no season" and an old qualified season at the same time.
+
+    Asserted through the live route rather than the repository, because that pairing is
+    what a caller and the UI actually observe.
+    """
+    app = _routed_app(data_dir=tmp_path)
+    async with _client_for(app) as c:
+        _publish(tmp_path, SEASON_A, {"n": 61})
+        assert (await c.get("/signal-trials/health")).json()["season_state"] == "qualified"
+        assert (await c.get("/signal-trials/season")).status_code == 200
+
+        write_state(tmp_path, retiring_state, {"why": "preflight declined"})
+
+        health = await c.get("/signal-trials/health")
+        # Fetched through _aget_must_not_raise: a route that consults the payload before
+        # the state raises on the mismatch and the request 500s, which is detection by
+        # crash rather than by assertion (PKT-DEC-C23).
+        season = await _aget_must_not_raise(c, "/signal-trials/season")
+        assert health.json()["season_state"] == retiring_state
+        assert season.status_code == 404
+        assert season.json() == {"error": "no_season_published"}
 
 
 async def test_a_blank_data_dir_is_treated_as_unconfigured(tmp_path, monkeypatch):
@@ -445,12 +555,18 @@ async def test_a_blank_data_dir_is_treated_as_unconfigured(tmp_path, monkeypatch
 
 
 async def test_a_corrupt_season_artifact_is_never_served_as_an_empty_season(tmp_path):
-    """Corruption must not degrade into a plausible-looking 404 or a fabricated body."""
+    """Corruption must not degrade into a plausible-looking 404 or a fabricated body.
+
+    A ``qualified`` state is written alongside the corrupt payload on purpose. The state
+    is authoritative, so without it the directory reads as ``not_built`` and the corrupt
+    file is never opened — the test would pass for the wrong reason, never reaching the
+    corruption path it is named for.
+    """
+    write_state(tmp_path, "qualified", {})
     published = tmp_path / "published"
-    published.mkdir(parents=True)
     (published / "season.json").write_text("{not json")
     async with _client_for(_routed_app(data_dir=tmp_path)) as c:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="season.json is not readable JSON"):
             await c.get("/signal-trials/season")
 
 
