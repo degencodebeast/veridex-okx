@@ -94,3 +94,157 @@ async def test_get_candles_rejects_rows_that_are_not_the_frozen_record(row: obje
     client = OKXMarketClient(RecordingFake({"code": "0", "data": [row]}), OKXCredentials("k", "s", "p"))
     with pytest.raises(OKXResponseError):
         await client.get_candles("501", "So1", "1m")
+
+
+# --- C18 PINS (frozen-vector-constancy remediation). Every vector above holds four parameters
+# CONSTANT: `bar` is "1m" throughout, `confirm` is "1" in every candle row, `cursor`/`before_ms` are
+# never passed, and the candles REQUEST itself is never asserted. Constancy is invisible to coverage
+# — every line runs, the value is simply never varied — so six materially wrong clients pass all
+# twelve tests above: a hard-coded `bar_ms`, an ignored `cursor`, a hard-coded `confirmed`, a swapped
+# settlement endpoint, a dropped `before`, and a rewritten `minAmountUsd`. Two of those are
+# settlement-critical. These pins vary each held-constant parameter; they add no new behaviour.
+
+CANDLE_CONFIRMED = ["1753400000000", "1.0", "1.2", "0.9", "1.1", "5", "5.5", "1"]
+CANDLE_UNCONFIRMED = ["1753400060000", "1.1", "1.3", "1.0", "1.2", "6", "6.6", "0"]
+
+
+def _signal_row(cursor: str, token_address: str) -> dict[str, object]:
+    """One wire signal row. Carried through untouched — normalization is H2.2, not this module."""
+    return {
+        "timestamp": "1753400000000",
+        "price": "0.042",
+        "chainIndex": "501",
+        "amountUsd": "1500",
+        "triggerWalletCount": "3",
+        "walletType": "1",
+        "triggerWalletAddress": "0xa,0xb,0xc",
+        "soldRatioPercent": "0",
+        "token": {
+            "tokenAddress": token_address,
+            "symbol": "TOK",
+            "name": "Tok",
+            "marketCapUsd": "2000000",
+            "holders": "900",
+            "top10HolderPercent": "31.5",
+        },
+        "cursor": cursor,
+    }
+
+
+async def test_get_candles_takes_bar_ms_from_the_requested_bar_and_not_from_a_constant():
+    """PIN 1 — bar provenance at more than one bar.
+
+    `1m` is the only bar any other vector requests, so a client returning a hard-coded 60_000 is
+    indistinguishable from one reading `BAR_MS[bar]`. §7 computes `close_ts = ts + bar_ms`, so a
+    wrong width silently skews every settlement boundary — and bar provenance is the very property
+    this module is named for.
+    """
+    fake = RecordingFake({"code": "0", "data": [CANDLE_CONFIRMED]})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    series = await client.get_candles("501", "So1", "1H")
+
+    assert series.bar == "1H"
+    # Compared to the LITERAL width as well as to the table: a client that also rewrote `BAR_MS`
+    # would otherwise agree with itself.
+    assert series.bar_ms == 3_600_000
+    assert series.bar_ms == BAR_MS["1H"]
+    assert BAR_MS["1H"] != BAR_MS["1m"]
+    assert fake.calls[0][2]["bar"] == "1H"
+
+
+async def test_get_candles_reads_the_confirm_column_of_every_row():
+    """PIN 2 — `confirmed` comes from the row, never from an assumption.
+
+    `confirm` is "1" in every other vector and each series holds exactly one candle, so both
+    `confirmed=True` hard-coded and a column read once for the whole series pass. The settlement
+    selector keys eligibility on `confirmed`; a client that always claims confirmation would settle
+    trials against candles OKX may still revise.
+    """
+    fake = RecordingFake({"code": "0", "data": [CANDLE_CONFIRMED, CANDLE_UNCONFIRMED]})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    series = await client.get_candles("501", "So1", "1m")
+
+    assert [c.confirmed for c in series.candles] == [True, False]
+    assert [c.ts_open_ms for c in series.candles] == [1753400000000, 1753400060000]
+
+
+async def test_get_candles_pins_the_settlement_endpoint_and_its_query_params():
+    """PIN 3 — the candles REQUEST, which no other vector asserts at all.
+
+    The path is compared to the literal rather than to `HISTORICAL_CANDLES_PATH`, because a client
+    that redefined the constant would agree with itself. §7 freezes this endpoint as THE settlement
+    source, and `before`/`limit` decide which window is settled against.
+    """
+    fake = RecordingFake({"code": "0", "data": []})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    await client.get_candles("501", "So1", "1m", before_ms=1753400000000, limit=50)
+
+    method, path, params, json_body, headers = fake.calls[0]
+    assert method == "GET"
+    assert path == "/api/v6/dex/market/historical-candles"
+    assert params == {
+        "chainIndex": "501",
+        "tokenContractAddress": "So1",
+        "bar": "1m",
+        "limit": "50",
+        "before": "1753400000000",
+    }
+    assert json_body is None
+    assert "OK-ACCESS-SIGN" in headers
+
+
+async def test_get_candles_omits_before_when_unset_and_sends_the_default_limit():
+    """The other branch of the same pin: `before` is conditional, so both of its branches need a
+    vector, and `limit` has a default that nothing else exercises."""
+    fake = RecordingFake({"code": "0", "data": []})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    await client.get_candles("501", "So1", "1m")
+
+    assert fake.calls[0][2] == {
+        "chainIndex": "501",
+        "tokenContractAddress": "So1",
+        "bar": "1m",
+        "limit": "100",
+    }
+
+
+async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_it():
+    """PIN 4 — pagination, across a two-item page.
+
+    Every other vector holds exactly one row and never passes `cursor`, so first-item and last-item
+    selection are indistinguishable there, and a client that ignores the argument entirely is
+    unobservable — it would silently re-fetch page 1 forever and truncate the season's dataset.
+    """
+    first, last = _signal_row("CURSOR-FIRST", "So1"), _signal_row("CURSOR-LAST", "So2")
+    fake = RecordingFake({"code": "0", "data": [first, last]})
+    client = OKXMarketClient(fake, OKXCredentials("k", "s", "p"))
+
+    page = await client.list_signals(SignalFilters(chain_index="501"))
+
+    assert page.signals == (first, last)
+    assert page.next_cursor == "CURSOR-LAST"
+    assert "cursor" not in fake.calls[0][3][0]
+
+    await client.list_signals(SignalFilters(chain_index="501"), cursor=page.next_cursor)
+
+    method, path, params, body, _ = fake.calls[1]
+    assert method == "POST"
+    assert path == "/api/v6/dex/market/signal/list"
+    assert params is None
+    # Whole-body equality: the predeclared MVP filter manifest (§5.1) is otherwise unpinned, and a
+    # rewritten threshold changes which signals the season is ever able to see.
+    assert body == [
+        {
+            "chainIndex": "501",
+            "walletType": "1",
+            "minAddressCount": 2,
+            "minAmountUsd": 1000,
+            "minMarketCapUsd": 100_000,
+            "minLiquidityUsd": 20_000,
+            "cursor": "CURSOR-LAST",
+        }
+    ]
