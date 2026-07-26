@@ -14,8 +14,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
+from veridex.api import server as server_module
 from veridex.api.router import create_app
-from veridex.api.server import create_server_app
+from veridex.api.server import (
+    _build_okx_facilitator,
+    _mount_signal_trials_402,
+    create_server_app,
+)
 from veridex.api.signal_trials_router import register_signal_trials_routes
 from veridex.api.signal_trials_schemas import (
     CommitRequest,
@@ -467,15 +472,17 @@ def test_season_response_refuses_not_built():
 
 def test_row_model_represents_unscored_honestly():
     """An agent with nothing scored yet carries nulls, never a fabricated zero."""
-    row = SignalTrialsRowModel(
-        agent_id="a",
-        qualified=False,
-        avg_brier=None,
-        capped_avg_markout_bps=None,
-        active_decisions=0,
-        active_coverage=0.0,
-        unscored=3,
-        is_control=False,
+    row = _must_not_raise(
+        lambda: SignalTrialsRowModel(
+            agent_id="a",
+            qualified=False,
+            avg_brier=None,
+            capped_avg_markout_bps=None,
+            active_decisions=0,
+            active_coverage=0.0,
+            unscored=3,
+            is_control=False,
+        )
     )
     assert row.avg_brier is None and row.capped_avg_markout_bps is None
 
@@ -508,6 +515,30 @@ _X402_ENV = {
     "PAY_TO_ADDRESS": PAYOUT_ALPHA,
 }
 _PROD_ENV = {**_X402_ENV, "APP_ENV": "production"}
+
+# Three DISTINCT sentinels. Not credentials and not credential-shaped — their only job
+# is to be told apart, so that a permutation of the three slots cannot pass.
+_SENTINEL_CREDENTIALS = {
+    "OKX_API_KEY": "sentinel-api-key",
+    "OKX_SECRET": "sentinel-secret",
+    "OKX_PASSPHRASE": "sentinel-passphrase",
+}
+
+
+def _must_not_raise(build):
+    """Run ``build`` and convert any refusal into a PINNED assertion failure.
+
+    A test whose subject simply raises fails by exception, which PKT-DEC-C23 classifies
+    as detection-by-crash rather than a banked kill. Turning the refusal into an
+    AssertionError is what makes "this configuration must be accepted" a property the
+    suite owns rather than one it happens to notice.
+    """
+    try:
+        return build()
+    except Exception as error:  # noqa: BLE001 - re-raised as an assertion below
+        raise AssertionError(
+            f"expected this configuration to be accepted, got {type(error).__name__}: {error}"
+        ) from error
 
 
 def _dev_settings() -> Settings:
@@ -581,7 +612,9 @@ async def test_the_emitted_challenge_names_the_configured_payout_address(payout)
     """
     async with _client_for(_served({**_X402_ENV, "PAY_TO_ADDRESS": payout})) as c:
         r = await c.get("/signal-trials/commit")
-        assert r.status_code == 402
+        # No separate status assertion: _challenge discriminates before it decodes, so
+        # a single call site cannot mis-order the check (CF-5a — prefer removing the
+        # hazard over documenting it).
         assert _challenge(r)["accepts"][0]["payTo"] == payout
 
 
@@ -688,7 +721,9 @@ def test_a_disabled_non_production_config_still_boots_without_the_sdk_extra():
     ``okxweb3-app-x402`` is an optional extra, so the import has to stay behind this
     branch or an install without it cannot start at all.
     """
-    guard = create_server_app(env={**_X402_ENV, "X402_ENABLED": "false"}, settings=_dev_settings())
+    guard = _must_not_raise(
+        lambda: create_server_app(env={**_X402_ENV, "X402_ENABLED": "false"}, settings=_dev_settings())
+    )
     assert guard is not None
 
 
@@ -710,8 +745,64 @@ def test_production_builds_the_real_facilitator_from_the_documented_env_names():
     two. Construction performs no network call — the SDK fetches supported kinds
     lazily, on the first protected request.
     """
-    env = {**_PROD_ENV, "OKX_API_KEY": "key", "OKX_SECRET": "secret", "OKX_PASSPHRASE": "pass"}
-    assert create_server_app(env=env, settings=_prod_settings()) is not None
+    env = {**_PROD_ENV, **_SENTINEL_CREDENTIALS}
+    assert _must_not_raise(lambda: create_server_app(env=env, settings=_prod_settings())) is not None
+
+
+def test_the_three_okx_credentials_are_not_transposed():
+    """Each credential must reach the slot it belongs in — the leakage-path pin.
+
+    Held at three interchangeable values everywhere else, so any permutation of them
+    satisfies the SDK's "all three present" check and every other test here. The worst
+    permutation is not a startup failure: populating the passphrase slot from the secret
+    key puts the SECRET KEY on the wire, in a header, to a third party, on every single
+    request (the class PKT-DEC-C23 ranks highest). Distinct sentinels are the only thing
+    that can tell the permutations apart.
+
+    Reaches into the SDK's auth provider because 0.1.1 exposes no accessor for what it
+    stored; these are the only observable of the mapping. Values are sentinels — never a
+    real or realistic credential.
+    """
+    client = _build_okx_facilitator(_SENTINEL_CREDENTIALS, sync_settle=True)
+    auth = client._auth
+    assert (auth._api_key, auth._secret_key, auth._passphrase) == (
+        _SENTINEL_CREDENTIALS["OKX_API_KEY"],
+        _SENTINEL_CREDENTIALS["OKX_SECRET"],
+        _SENTINEL_CREDENTIALS["OKX_PASSPHRASE"],
+    )
+
+
+def test_production_settlement_is_synchronous(monkeypatch):
+    """``sync_settle`` is what stops an unsettled commit returning 200.
+
+    Held at its single value everywhere else in this file, so a hard-coded ``False``
+    would pass every other test while silently converting the gate to fire-and-forget
+    settlement — a commit receipt with no transaction behind it. Spying on the builder
+    is what makes the forwarded value observable at all; the client keeps it private.
+    """
+    captured: dict[str, object] = {}
+    real = server_module._build_okx_facilitator
+
+    def _spy(env, *, sync_settle):
+        captured["sync_settle"] = sync_settle
+        return real(env, sync_settle=sync_settle)
+
+    monkeypatch.setattr(server_module, "_build_okx_facilitator", _spy)
+    create_server_app(env={**_PROD_ENV, **_SENTINEL_CREDENTIALS}, settings=_prod_settings())
+    assert captured["sync_settle"] is True
+
+
+def test_the_mount_registers_the_exact_scheme_for_x_layer():
+    """Without a registered scheme the SDK raises ``RouteConfigurationError`` on the
+    first commit request — a 500 from production code rather than a 402, and detection
+    by crash rather than by assertion. Pinned here so the property is banked
+    (PKT-DEC-C23: detected-by-exception is a gap, not a kill).
+    """
+    resource_server = _mount_signal_trials_402(
+        FastAPI(), _X402_ENV, is_production=False, facilitator=FakeFacilitator()
+    )
+    assert resource_server is not None
+    assert resource_server.has_registered_scheme(X_LAYER_MAINNET, "exact")
 
 
 @pytest.mark.parametrize("ambiguous", ["maybe", "yes please", "TRUE-ish", "2"])
@@ -724,7 +815,9 @@ def test_an_unrecognized_x402_enabled_value_mounts_no_gate(ambiguous):
     Without it an unrecognized value would raise for want of a facilitator instead of
     booting honestly ungated — a typo in ``X402_ENABLED`` would take the app down.
     """
-    guard = create_server_app(env={**_X402_ENV, "X402_ENABLED": ambiguous}, settings=_dev_settings())
+    guard = _must_not_raise(
+        lambda: create_server_app(env={**_X402_ENV, "X402_ENABLED": ambiguous}, settings=_dev_settings())
+    )
     assert guard is not None
 
 

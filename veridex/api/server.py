@@ -292,7 +292,7 @@ def _mount_signal_trials_402(
     *,
     is_production: bool,
     facilitator: Any,
-) -> None:
+) -> Any:
     """Mount the TEMPORARY stock x402 layer over the signal-trials commit route.
 
     This is the H1.2 placeholder that H4.1 replaces with ``SignalTrialsPaymentASGI``. Its
@@ -316,6 +316,12 @@ def _mount_signal_trials_402(
       :func:`~veridex.signal_trials.payments.build_resource_server` enforces by refusing
       the fake and anything wrapping it.
 
+    Returns:
+        The composed ``x402ResourceServer`` when a gate was mounted, else ``None``.
+        Returned so a test can assert the scheme registration directly: without it, the
+        only symptom of a missing scheme is the SDK raising on the first request, which
+        is the code crashing rather than a test catching it (``PKT-DEC-C23``).
+
     Raises:
         ValueError: x402 is enabled with no facilitator available; or the configuration
             is otherwise refused by the fail-closed loader (disabled in production, an
@@ -338,7 +344,7 @@ def _mount_signal_trials_402(
     # malformed payout address, or carries a price that cannot honestly be charged.
     x402_settings = load_x402_settings(env)
     if not x402_settings.enabled:
-        return
+        return None
 
     resolved_facilitator = facilitator
     if resolved_facilitator is None and is_production:
@@ -358,6 +364,7 @@ def _mount_signal_trials_402(
         routes={f"{method} {COMMIT_PATH}": {"accepts": [commit_price]} for method in GATED_METHODS},
         server=resource_server,
     )
+    return resource_server
 
 
 def create_server_app(
