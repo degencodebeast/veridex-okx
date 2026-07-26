@@ -245,6 +245,15 @@ def register_signal_trials_routes(
         would make it indistinguishable from an intact receipt. Both are the same lie in opposite
         directions, and this is the trust surface the whole benchmark rests on.
 
+        That holds for a row whose bytes are DESTROYED as well as one that was edited: an
+        unreadable row verifies as four ``fail``s rather than escaping as an exception, which is
+        decided in :func:`~veridex.signal_trials.receipts.verify_receipt` rather than papered over
+        here. This handler deliberately does NOT catch broadly. A ``ValueError`` reaching it would
+        mean the verifier stopped honouring that contract, and swallowing it here would hide the
+        regression while leaving the route looking correct. What can still legitimately produce a
+        500 is an ``OSError`` — an unreadable disk or a permissions fault — which genuinely is the
+        service being broken rather than a statement about the receipt.
+
         404 covers everything that is NOT a finalized receipt, under ONE code, because the
         distinctions are not the caller's business and some of them are nobody's: a staged row is
         a commitment that was received and not yet paid for, a quarantined slot is a settlement

@@ -853,7 +853,7 @@ class ReceiptStore:
 
 
 def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
-    """Verify a finalized receipt's COMMIT-TIME claims. Never raises on a bad receipt.
+    """Verify a finalized receipt's COMMIT-TIME claims. Never raises on a receipt that fails.
 
     Four checks, all four always evaluated, each reporting only what it covers:
 
@@ -881,6 +881,25 @@ def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
     receipt that does not exist, because "no such receipt" is a different statement from "this
     receipt does not verify" and the route answers them with different status codes.
 
+    An UNREADABLE row — bytes that are not JSON, or JSON that is not an object — reports all four
+    checks as ``fail``. It is neither an exception nor a 404, and both of those were considered:
+
+    * Not an exception, because a row that exists and re-derives nothing is precisely what ``fail``
+      means. Letting it escape makes the route answer 500, and a 500 says "this service is
+      broken" when the truth is "this receipt does not verify" — the same conflation between an
+      outage and a finding that this function is built to avoid everywhere else. This module
+      already reasons this way for an absent ``manifest_hash`` and for absent timestamps.
+    * Not a ``KeyError``, because that maps to 404 and :meth:`ReceiptStore._read_json` fixes the
+      principle that corruption is never reported as absence. A destroyed receipt and a receipt
+      that never existed are different facts, acted on differently, and must not share an answer.
+
+    Only ``ValueError`` is absorbed, and only here. An ``OSError`` — an unreadable disk, a
+    permissions fault — is left to propagate: that genuinely IS the service being broken rather
+    than a statement about the receipt, and a 500 is the honest answer to it. The tolerance is also
+    scoped to this function: :meth:`ReceiptStore.finalized_payload` and :meth:`ReceiptStore.record`
+    still raise, because the payment path reads a ``None`` from ``record`` as "the slot points at a
+    receipt with no record behind it", which would be the wrong diagnosis on the money path.
+
     Args:
         receipt_id: The receipt to verify. Arrives from a URL path segment on the free verify
             route, and is resolved through :meth:`ReceiptStore.finalized_payload`, which refuses
@@ -898,7 +917,14 @@ def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
             outcome is unknown; neither is a receipt, and reporting checks over one would let an
             unpaid commitment be quoted as a verified one.
     """
-    payload = store.finalized_payload(receipt_id)
+    try:
+        payload = store.finalized_payload(receipt_id)
+    except ValueError:
+        # The row EXISTS — the file is there — but nothing in it can be re-derived. Every check
+        # fails because every check's input is unreadable, which is a verdict about the receipt
+        # and not an error in the service.
+        unreadable: dict[str, CheckState] = dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+        return VerifyReport(receipt_id=receipt_id, checks=unreadable)
     if payload is None:
         raise KeyError(f"no finalized receipt {receipt_id!r}; pending and quarantined rows are not receipts")
 

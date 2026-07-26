@@ -22,11 +22,22 @@ Two properties are what this file exists to defend, and both are honesty propert
 * **A pending staging row is NOT a receipt.** It is a commitment that was received, not one
   that was paid for, so ``verify_receipt`` raises ``KeyError`` and the route answers 404.
 
-**Every discriminating test asserts the WHOLE four-key verdict**, not the one key it perturbed.
-A single-key assertion cannot tell "this check noticed" from "every check fails on every
-mutation", and a four-key equality that passes because everything is ``"pass"`` cannot tell
-which check produced which verdict. Each mutation below therefore pins all four values, so a
-check that stopped discriminating shows up as a diff rather than as a still-green suite.
+**Every discriminating test asserts the WHOLE four-key verdict**, not the one key it perturbed,
+**with one exception named below**. A single-key assertion cannot tell "this check noticed" from
+"every check fails on every mutation", and a four-key equality that passes because everything is
+``"pass"`` cannot tell which check produced which verdict. Each mutation below therefore pins all
+four values, so a check that stopped discriminating shows up as a diff rather than as a
+still-green suite.
+
+The exception is the coupling tripwire in
+``test_the_body_derivation_covers_every_field_a_commit_request_can_carry``, which asserts only the
+key it is pinning. That loop walks all three :data:`COMMIT_BODY_FIELDS`, and ``committed_trial_id``
+is bound by BOTH ``body_hash`` and ``manifest`` while the other two are bound by ``body_hash``
+alone — so no single whole-verdict expectation is correct for all three iterations. Whole-verdict
+discrimination for those same fields is covered by the parametrised tests above it. The claim in
+this docstring was originally written as an unqualified universal and was falsified by that one
+line; it is stated with its exception now because a docstring that overstates its own suite is the
+same defect class the suite exists to catch.
 
 Several tests mutate a field the manifest binds and then RESEAL the manifest hash over the
 mutated row — a forger who fixed up the seal. That is the only way to prove
@@ -169,6 +180,18 @@ class _TamperableStore(ReceiptStore):
             payload["manifest_hash"] = run_manifest_hash(commit_manifest(payload))
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
+    def corrupt(self, receipt_id: str, *, raw: str) -> None:
+        """Replace a finalized row's bytes wholesale, including with bytes that are not JSON.
+
+        A weaker write than any :meth:`tamper`, and reachable by the same adversary — anyone able
+        to write to the finalized directory, which is the precondition every tamper test already
+        assumes. It exists because :meth:`tamper` cannot express it: that method round-trips
+        through ``json.loads``, so it can only ever produce a well-formed object, and the row
+        states that matter here are the ones that are not objects at all.
+        """
+        path = Path(self.root) / _FINALIZED_DIRNAME / f"{receipt_id}.json"
+        path.write_text(raw, encoding="utf-8")
+
 
 @pytest.fixture
 def store(tmp_path: Path) -> _TamperableStore:
@@ -233,6 +256,19 @@ def _all_pass(**overrides: str) -> dict[str, str]:
 def _client_for(app: FastAPI) -> AsyncClient:
     """An in-process client over ``app``; no socket is opened."""
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://sig")
+
+
+def _server_client_for(app: FastAPI) -> AsyncClient:
+    """A client that reports what a REAL SERVER would answer, rather than re-raising.
+
+    ``ASGITransport`` defaults to ``raise_app_exceptions=True``, which surfaces an unhandled
+    exception to the test as the exception itself. That is convenient for debugging and useless
+    for the question these tests ask: a deployed server does not re-raise, it runs Starlette's
+    ``ServerErrorMiddleware`` and answers ``500``. Asserting "never a 500" against a transport
+    that cannot produce a 500 would be asserting nothing — which is exactly how this branch went
+    uncovered in the first place.
+    """
+    return AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://sig")
 
 
 def _verify_app(store: ReceiptStore | None) -> FastAPI:
@@ -576,23 +612,28 @@ def test_a_receipt_id_that_could_escape_the_finalized_tree_is_not_a_receipt(stor
 
 
 def test_tamper_is_not_a_production_capability():
-    """The mutation the tamper tests need exists on the TEST subclass only. On ``ReceiptStore`` it
-    would be a supported way to rewrite a paid receipt after it was sealed."""
-    assert not hasattr(ReceiptStore, "tamper")
-    assert "tamper" in vars(_TamperableStore)
+    """Both raw writes the tests need exist on the TEST subclass only. On ``ReceiptStore`` either
+    would be a supported way to rewrite or destroy a paid receipt after it was sealed."""
+    for method in ("tamper", "corrupt"):
+        assert not hasattr(ReceiptStore, method)
+        assert method in vars(_TamperableStore)
 
 
 def test_no_module_under_veridex_can_tamper_a_receipt():
-    """Nothing in the production tree may CALL or DEFINE the raw write.
+    """Nothing in the production tree may CALL or DEFINE either raw write.
 
-    Matched on the call and definition syntax, not on the word: "tamper-evident" and
-    "tamper-resistant" are all over the production docstrings and are the opposite of a violation.
+    Matched on the call and definition syntax, not on the words: "tamper-evident",
+    "tamper-resistant" and "corrupt" are all over the production docstrings — ``replay_catalog.py``
+    alone says "(tampered / corrupt / unverified)" — and every one of them is the opposite of a
+    violation. A word-based predicate would report those as offenders and would have to be
+    weakened until it caught nothing.
     """
     root = Path(__file__).resolve().parents[2] / "veridex"
+    markers = (".tamper(", "def tamper", ".corrupt(", "def corrupt")
     offenders = sorted(
         str(path.relative_to(root))
         for path in root.rglob("*.py")
-        if any(marker in path.read_text(encoding="utf-8") for marker in (".tamper(", "def tamper"))
+        if any(marker in path.read_text(encoding="utf-8") for marker in markers)
     )
     assert offenders == []
 
@@ -629,26 +670,31 @@ async def test_the_verify_endpoint_maps_a_pending_staging_id_to_404(store, live_
 
 
 @pytest.mark.parametrize(
-    ("receipt_id", "reaches_the_handler"),
+    "receipt_id",
     [
-        ("rcpt-unknown", "rcpt-unknown"),
-        # PERCENT-ENCODED dot-dot survives client normalization and arrives AS ".." — this is the
-        # traversal attempt that actually reaches the handler, and the store's path guard is the
-        # only thing between it and ``finalized/../..json``. Verified by the printed request path:
-        # the client sends /signal-trials/receipts/../verify without collapsing it.
-        ("%2E%2E", ".."),
+        "rcpt-unknown",
+        # PERCENT-ENCODED dot-dot survives client normalization and arrives at the handler AS
+        # "..", so the store's path guard is the only thing between it and ``finalized/../..json``.
+        # A raw ".." would be collapsed by the client and never reach the route at all — see the
+        # framework-404 test below for that half.
+        "%2E%2E",
     ],
 )
-async def test_the_verify_endpoint_refuses_an_unresolvable_id_with_the_LANE_envelope(
-    store, receipt_id, reaches_the_handler
-):
+async def test_the_verify_endpoint_refuses_an_unresolvable_id_with_the_LANE_envelope(store, receipt_id):
     """These ids reach the handler, so the refusal is the lane's own ``{"error": ...}`` contract —
-    one code for every not-a-receipt, naming nothing about which one applied."""
+    one code for every not-a-receipt, naming nothing about which one applied.
+
+    The envelope IS the evidence that the handler ran: only this route produces
+    ``{"error": ...}``, while a request that never matched the route yields FastAPI's
+    ``{"detail": ...}``. An earlier revision also carried a parametrised expected-decoded-value
+    and asserted it, which was a tautology — the value came from the parameter list, so the
+    assertion could not fail and verified nothing about what the handler received. It is gone
+    rather than reworded; a false mechanism is worse than none.
+    """
     async with _client_for(_verify_app(store)) as client:
         response = await client.get(_verify_path(receipt_id))
     assert response.status_code == 404
     assert response.json() == {"error": "receipt_not_found"}
-    assert reaches_the_handler  # documents the decoded value the handler actually saw
 
 
 @pytest.mark.parametrize("receipt_id", ["..", "a%2Fb", "..%2F..%2Fetc%2Fpasswd"])
@@ -662,6 +708,105 @@ async def test_an_id_the_ROUTE_cannot_carry_is_404_from_the_framework(store, rec
         response = await client.get(_verify_path(receipt_id))
     assert response.status_code == 404
     assert "checks" not in response.json()
+
+
+# --- an UNREADABLE row is a verdict, not an outage (SPEC F1) ---
+#
+# The corruption an attacker reaches with a simpler write than any tamper in this file: destroy the
+# bytes. Before the fix each of these raised ValueError out of verify_receipt and the route answered
+# 500 — the exact failure the route's docstring says must never happen, on the branch the packet
+# calls the honesty surface. The suite could not see it: the endpoint tests all used a transport that
+# re-raises instead of producing the 500 a deployed server produces, and nothing ever wrote a
+# non-JSON row.
+
+#: The three row states that are not a JSON object. ``[1,2,3]`` is the one that matters most: it
+#: parses cleanly, so a verifier guarding only against a decode error would still crash on it.
+_UNREADABLE_ROWS = [
+    pytest.param("{not json", id="unparseable"),
+    pytest.param("[1,2,3]", id="valid_json_but_not_an_object"),
+    pytest.param("", id="empty_file"),
+    pytest.param('"a string"', id="valid_json_scalar"),
+]
+
+
+@pytest.mark.parametrize("raw", _UNREADABLE_ROWS)
+def test_an_unreadable_row_verifies_as_four_fails_and_does_not_raise(committed_receipt, store, raw):
+    """A row that exists and re-derives nothing is what ``fail`` means.
+
+    Not an exception, because verification failing is the answer this function exists to give. Not
+    a ``KeyError`` either — that maps to 404, and ``_read_json``'s own docstring fixes the principle
+    that corruption is never reported as absence. A destroyed receipt must not be indistinguishable
+    from one that never existed.
+    """
+    store.corrupt(committed_receipt.receipt_id, raw=raw)
+    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+
+
+@pytest.mark.parametrize("raw", _UNREADABLE_ROWS)
+async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_an_unreadable_row(committed_receipt, store, raw):
+    """The honesty surface, on the branch that falsified it. Asserted through a transport that
+    would actually report a 500, so this test can fail the way the defect failed."""
+    store.corrupt(committed_receipt.receipt_id, raw=raw)
+    async with _server_client_for(_verify_app(store)) as client:
+        response = await client.get(_verify_path(committed_receipt.receipt_id))
+    assert response.status_code == 200
+    assert response.json() == {
+        "receipt_id": committed_receipt.receipt_id,
+        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+    }
+
+
+async def test_an_unreadable_row_is_not_reported_as_ABSENCE(committed_receipt, store):
+    """Corruption and non-existence are different facts and must not share an answer.
+
+    A 404 here would tell a caller its receipt never existed, when what happened is that the row
+    was destroyed — the difference between "you were never paid for this" and "your receipt no
+    longer verifies", which are acted on differently.
+    """
+    store.corrupt(committed_receipt.receipt_id, raw="{not json")
+    async with _server_client_for(_verify_app(store)) as client:
+        corrupt_response = await client.get(_verify_path(committed_receipt.receipt_id))
+        absent_response = await client.get(_verify_path("rcpt_" + "0" * 32))
+    assert corrupt_response.status_code == 200
+    assert absent_response.status_code == 404
+    assert corrupt_response.json() != absent_response.json()
+
+
+async def test_an_INFRASTRUCTURE_fault_is_still_a_500_and_not_a_verdict(committed_receipt, store, monkeypatch):
+    """Only corruption becomes a verdict. A disk or permissions fault stays an error.
+
+    The distinction is the whole justification for catching ``ValueError`` narrowly instead of
+    ``Exception``: an unreadable ROW is a statement about the receipt, while an unreadable DISK is
+    a statement about the service, and reporting the second as four ``fail``s would tell every
+    caller their receipts are invalid during an outage. Without this test the narrow catch and a
+    broad one are observationally identical, which is exactly the kind of untested distinction
+    that let the original 500 through.
+    """
+
+    def _unreadable_disk(receipt_id: str) -> dict[str, Any] | None:
+        raise OSError("simulated unreadable disk")
+
+    monkeypatch.setattr(store, "finalized_payload", _unreadable_disk)
+    with pytest.raises(OSError, match="simulated unreadable disk"):
+        verify_receipt(committed_receipt.receipt_id, store)
+    async with _server_client_for(_verify_app(store)) as client:
+        response = await client.get(_verify_path(committed_receipt.receipt_id))
+    assert response.status_code == 500
+
+
+def test_the_unreadable_row_tolerance_is_SCOPED_to_the_verifier(committed_receipt, store):
+    """The tolerance lives in ``verify_receipt`` only — ``_read_json`` and ``finalized_payload`` still
+    raise, and ``record()`` still propagates.
+
+    Deliberate, and this test is what stops a later edit from "simplifying" it. Softening the read
+    itself would return ``None`` for a corrupt row, which the payment path reads as "the slot points
+    at a receipt with no record behind it" — a different and wrong diagnosis, on the money path.
+    """
+    store.corrupt(committed_receipt.receipt_id, raw="{not json")
+    with pytest.raises(ValueError):
+        store.finalized_payload(committed_receipt.receipt_id)
+    with pytest.raises(ValueError):
+        store.record(committed_receipt.receipt_id)
 
 
 async def test_the_verify_endpoint_answers_404_when_no_store_is_configured():
