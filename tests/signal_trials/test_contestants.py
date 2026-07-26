@@ -370,8 +370,16 @@ def test_neutral_is_exactly_one_half_and_ignores_the_signal():
     """A declined trial is 0.5 regardless of how extreme the signal is.
 
     The mandated neutral vector uses the default signal, whose formula value differs from 0.5
-    anyway; these use signals that would otherwise CLAMP, so a body that fell through to the
-    formula would return 0.15 and 0.35 rather than 0.5.
+    anyway. This one is chosen to be far from neutral under the mutant that actually threatens the
+    guard, which is not a literal fall-through but a SUBSTITUTION — ``if ext is None: ext = 0``,
+    reading "no price history" as "not extended". **Stating that assumed ``ext`` is the point:**
+    the numbers below are only evaluable once it is fixed, and they differ under ``ext=1``.
+
+    With ``ext`` substituted as 0, this signal gives ``crowding_fader`` a raw 0.000 that clamps to
+    0.15, and ``selective_calibrator`` a raw 0.425 that does NOT clamp. Both differ from 0.5, which
+    is the entire requirement here — the vector has to be far from neutral, not to clamp. A LITERAL
+    fall-through, with the guard deleted so ``None`` reaches the arithmetic, instead raises
+    ``TypeError`` on ``0.20 * None``; that is also a kill, but a different one.
     """
     extreme = _sig(w=2, c10=100.0, mc=100_000.0)
     assert crowding_fader(extreme, ext=None) == 0.5
