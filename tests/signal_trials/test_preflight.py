@@ -2281,7 +2281,8 @@ def test_a_pre_probe_stop_makes_a_PREVIOUS_artifact_unconsumable(
 
 
 @pytest.mark.parametrize(
-    ("argv_extra", "status"), [(["--min-trials", "1"], "refused"), ([], "aborted")],
+    ("argv_extra", "status"),
+    [(["--min-trials", "1"], "refused"), ([], "aborted")],
     ids=["refused", "aborted"],
 )
 def test_a_stopped_run_is_not_consumable_as_a_completed_one(operator_script, tmp_path, monkeypatch, argv_extra, status):
