@@ -303,12 +303,23 @@ def _mount_signal_trials_402(
     is_production: bool,
     facilitator: Any,
 ) -> Any:
-    """Mount the TEMPORARY stock x402 layer over the signal-trials commit route.
+    """Mount the settlement-atomic Signal Trials payment path onto the composed app.
 
-    This is the H1.2 placeholder that H4.1 replaces with ``SignalTrialsPaymentASGI``. Its
-    only job is to make ``GET|POST /signal-trials/commit`` answer with a genuine 402
-    challenge instead of reaching the handler unpaid. Free reads are untouched — the
-    middleware passes through any path its route table does not match.
+    This replaces H1.2's temporary stock ``PaymentMiddlewareASGI`` placeholder with
+    :class:`~veridex.signal_trials.payments.SignalTrialsPaymentASGI`, and wires the durable
+    dependencies the wrapper needs. It does four things, and the last two are what make the
+    wrapper reachable rather than merely present:
+
+    * resolves and validates the x402 configuration, fail-closed;
+    * builds the resource server and registers the X Layer scheme;
+    * constructs **one** :class:`~veridex.signal_trials.receipts.ReceiptStore` and **one**
+      :class:`~veridex.signal_trials.live.LiveTrialRepository` over the configured durable
+      root, runs startup reconciliation, and exposes both so the free routes and the payment
+      path share them;
+    * mounts the custom wrapper, so a paid commit reaches it in the served request path.
+
+    Free reads are untouched: the wrapper intercepts the commit path only and passes
+    everything else straight through.
 
     Mounted on the COMPOSED FastAPI (``guard.app``), never on the guard itself: the guard
     delegates to this app, so middleware attached to the guard object would not be in the
@@ -339,38 +350,47 @@ def _mount_signal_trials_402(
         is the code crashing rather than a test catching it (``PKT-DEC-C23``).
 
     Raises:
-        ValueError: x402 is enabled with no facilitator available; or the configuration
-            is otherwise refused by the fail-closed loader (disabled in production, an
-            invalid payout address, an invalid commit price, a fake in production).
+        ValueError: x402 is enabled with no facilitator available; or with no
+            ``SIGNAL_TRIALS_DATA_DIR`` naming a durable root to record commits into; or the
+            configuration is otherwise refused by the fail-closed loader (disabled in
+            production, an invalid payout address, an invalid commit price, a fake in
+            production).
     """
     # Lazy, exactly like the psycopg and agno imports: the x402 SDK is an optional extra.
-    from x402.http.middleware.fastapi import PaymentMiddlewareASGI  # type: ignore[import-untyped]
+    # ``Path`` is stdlib and kept local only to hold this addendum's diff inside the one
+    # function it was granted, rather than widening the module's import block.
+    from pathlib import Path
+
     from x402.mechanisms.evm.exact.server import ExactEvmScheme  # type: ignore[import-untyped]
 
+    from veridex.signal_trials.live import LiveTrialRepository
     from veridex.signal_trials.payments import (
-        COMMIT_PATH,
-        GATED_METHODS,
         X_LAYER_MAINNET,
-        build_commit_price,
+        SignalTrialsPaymentASGI,
         build_resource_server,
         load_x402_settings,
     )
+    from veridex.signal_trials.receipts import ReceiptStore
 
     # Authoritative, fail-closed: refuses a production config that is disabled, carries a
     # malformed payout address, or carries a price that cannot honestly be charged.
     #
-    # The loader is handed the production decision ALREADY RESOLVED rather than being left
-    # to re-derive one from ``env["APP_ENV"]``. Three duties key off production-ness — the
-    # must-be-enabled rule and the PAY_TO_ADDRESS well-formedness rule, both owned by the
-    # loader, and the fake-facilitator refusal owned by ``build_resource_server`` — and
-    # they must not disagree about it. When only ``Settings`` carries the production signal
-    # (a ``veridex/.env`` deployment, or any caller supplying ``env=`` while letting
-    # ``settings`` default), a loader re-deriving from ``env`` alone reads the config as
-    # development and applies NEITHER of its two rules, mounting a paywall whose payout
-    # address was never validated. Overriding ``APP_ENV`` is what makes the resolved answer
-    # reach the rules; it reuses the loader's canonical checks rather than restating them,
-    # which matters because ``_EVM_ADDRESS`` is private to the frozen ``payments.py``.
-    x402_settings = load_x402_settings({**env, "APP_ENV": "production"} if is_production else env)
+    # The production decision is passed as an EXPLICIT PARAMETER rather than synthesized into
+    # the mapping. Three duties key off production-ness — the must-be-enabled rule and the
+    # PAY_TO_ADDRESS well-formedness rule, both owned by the loader, and the fake-facilitator
+    # refusal owned by ``build_resource_server`` — and they must not disagree about it. When
+    # only ``Settings`` carries the production signal (a ``veridex/.env`` deployment, or any
+    # caller supplying ``env=`` while letting ``settings`` default), a loader re-deriving from
+    # ``env`` alone reads the config as development and applies NEITHER rule, mounting a
+    # paywall whose payout address was never validated.
+    #
+    # An earlier revision achieved that by overriding ``APP_ENV`` in a copy of the mapping. It
+    # reached the right verdict and was LOSSY: it overwrote the value the loader's diagnostics
+    # quote, so an operator who typed ``APP_ENV=prodction`` — correctly classified as
+    # production by the fail-closed rule — was told their environment was ``'production'``.
+    # The one message able to explain why a development-looking deploy started enforcing
+    # production rules instead confirmed a value nobody had set.
+    x402_settings = load_x402_settings(env, is_production=is_production)
     if not x402_settings.enabled:
         return None
 
@@ -386,11 +406,65 @@ def _mount_signal_trials_402(
     resource_server = build_resource_server(x402_settings, resolved_facilitator, is_production=is_production)
     resource_server.register(X_LAYER_MAINNET, ExactEvmScheme())
 
-    commit_price = build_commit_price(x402_settings)
+    # The DURABLE ROOT, resolved from the SAME mapping this factory resolved everything else
+    # from. Reading ``os.environ`` here instead would give the payment path a second source for
+    # one variable, and two sources for one key is the shape that produced the resolved-versus-
+    # requested trial id defect.
+    #
+    # A blank or missing root FAILS STARTUP whenever payments are enabled. The alternative is
+    # charging a real payer against a store that is ephemeral or that nothing else reads: the
+    # money moves and the record it buys lands where no free read, no verifier and no operator
+    # script will ever find it. Refusing to boot is the only failure direction that cannot take
+    # someone's money.
+    data_root_raw = env.get("SIGNAL_TRIALS_DATA_DIR", "").strip()
+    if not data_root_raw:
+        raise ValueError(
+            "X402_ENABLED requires SIGNAL_TRIALS_DATA_DIR to name a durable directory: a paid "
+            "commit must be recorded where the free reads and the operator tooling look, and "
+            "charging against an unconfigured or ephemeral store would take payment for a "
+            "record nothing can serve"
+        )
+    data_root = Path(data_root_raw)
+
+    # ONE store and ONE repository, shared by the free routes and the payment wrapper. The
+    # layout matches ``scripts/signal_trials/open_live_trial.py`` exactly — the repository lives
+    # at ``<root>/live`` — so the process that opens a trial and the process that serves it agree
+    # without a second convention.
+    receipt_store = ReceiptStore(data_root)
+    live_trials = LiveTrialRepository(data_root / "live")
+
+    # STARTUP RECOVERY, before the app can accept a single paid commit. The plan requires the
+    # reconciler at startup precisely because a crash means the request path's ``finally`` never
+    # ran: a journaled settlement with no finalized record, or an attempt marker with no journal,
+    # exists exactly when nobody was around to notice. Run here rather than in a lifespan hook so
+    # it completes during composition — strictly before the server binds a socket, and therefore
+    # before any request can observe an unreconciled store.
+    receipt_store.reconcile()
+
+    # Exposed on the COMPOSED app's state so the already-registered free routes resolve the same
+    # objects per request. The routes are registered inside ``build_agentos_app`` before this
+    # function runs, so late binding through ``app.state`` is what lets one store serve both
+    # sides without threading constructor arguments through the AgentOS composition — which is
+    # why ``veridex/runtime/agentos_service.py`` needs no change.
+    app.state.signal_trials_store = receipt_store
+    app.state.signal_trials_live = live_trials
+    app.state.signal_trials_data_dir = data_root
+
+    # THE CUSTOM WRAPPER, in place of the SDK's stock ``PaymentMiddlewareASGI``. Not a
+    # preference: the stock layer settles through the resource server's hook pipeline, and
+    # ``_settle_payment_core`` runs its after-settle hooks inside the ``try`` that guards the
+    # facilitator call, so an exception from one reaches the settle-FAILURE hooks and can delete
+    # records after a settlement that really happened. The wrapper calls verify and settle
+    # directly, registers no hooks, and owns the durable slot/journal ordering itself.
+    #
+    # Added to ``app`` — the composed FastAPI, ``guard.app`` — never to the guard, which merely
+    # delegates to this app and whose middleware would not be in the request path at all.
     app.add_middleware(
-        PaymentMiddlewareASGI,
-        routes={f"{method} {COMMIT_PATH}": {"accepts": [commit_price]} for method in GATED_METHODS},
+        SignalTrialsPaymentASGI,
         server=resource_server,
+        settings=x402_settings,
+        store=receipt_store,
+        live_trials=live_trials,
     )
     return resource_server
 

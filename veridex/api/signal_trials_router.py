@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from veridex.signal_trials.live import LiveTrial, LiveTrialRepository
+    from veridex.signal_trials.receipts import ReceiptStore
+
 #: Every route this lane owns lives under this prefix.
 SIGNAL_TRIALS_PREFIX = "/signal-trials"
 
@@ -56,11 +59,31 @@ def _error(status_code: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": code})
 
 
+def _open_trial_response(trial: LiveTrial) -> OpenTrialResponse:
+    """Render a trial as frozen §11 discovery: evidence, its hash, and the deadline.
+
+    ``evidence`` comes from ``visible_at_decision`` and ``evidence_hash`` binds exactly that
+    payload, so the two cannot describe different snapshots. Nothing derived after the horizon is
+    reachable through either — the leakage boundary is enforced in the canonicalizer, and this
+    function does not widen it by assembling its own view of the signal.
+    """
+    return OpenTrialResponse(
+        trial_id=trial.trial_id,
+        trial_mode="live",
+        t0_ms=trial.t0_ms,
+        commit_deadline_ms=trial.commit_deadline_ms,
+        evidence=trial.evidence,
+        evidence_hash=trial.evidence_hash,
+    )
+
+
 def register_signal_trials_routes(
     app: FastAPI,
     *,
     data_dir: Path | str | None = None,
     open_trial_provider: Callable[[], OpenTrialResponse | None] | None = None,
+    live_trials: LiveTrialRepository | None = None,
+    store: ReceiptStore | None = None,
 ) -> None:
     """Register the signal-trials routes onto ``app``.
 
@@ -71,10 +94,44 @@ def register_signal_trials_routes(
             ``not_built`` rather than an error — a fresh deployment with no volume
             attached still answers ``/health``.
         open_trial_provider: Returns the currently open live trial, or ``None`` when
-            none is open. H1.2 ships no live-trial store, so the default is ``None``
-            and ``/open-trial`` honestly reports ``no_open_trial``; H4.1 supplies the
-            real provider without changing this route's contract.
+            none is open. Retained from H1.2 as the injectable seam; ``live_trials``
+            takes precedence when both are supplied.
+        live_trials: The published open-trial repository. ``None`` means this deployment
+            has no live-trial store, which reads as ``trials_not_open`` — an honest
+            statement, and the only state in which the commit route may refuse without
+            naming a misconfiguration.
+        store: The two-phase commit store, needed for the commit route to be servable at
+            all. Present so this function can tell "no trials here" apart from "trials
+            but no payment gate", which are fixed differently.
+
+    **Dependencies are resolved PER REQUEST, preferring the composition root's.** These routes
+    are registered from inside the AgentOS composition, which runs BEFORE the composition root
+    can build the durable Signal Trials dependencies — so a value captured at registration time
+    would permanently be the one that was available too early. Each handler therefore consults
+    ``app.state`` first and falls back to whatever was injected here, which is what lets ONE
+    store and ONE repository serve both the free reads and the payment wrapper without
+    threading constructor arguments through ``build_agentos_app``. Injected values remain
+    authoritative for any caller that supplies them and sets no state, so every existing test
+    composition is unaffected.
     """
+
+    def _live_trials() -> LiveTrialRepository | None:
+        """The live-trial repository the composition root built, else the injected one."""
+        return getattr(app.state, "signal_trials_live", None) or live_trials
+
+    def _store() -> ReceiptStore | None:
+        """The commit store the composition root built, else the injected one."""
+        return getattr(app.state, "signal_trials_store", None) or store
+
+    def _data_dir() -> Path | str | None:
+        """The published-season root, preferring the one the composition root resolved.
+
+        The composition root resolves ``SIGNAL_TRIALS_DATA_DIR`` from the same mapping it
+        resolves everything else from. Preferring it here keeps one variable to one source: a
+        second independent read is how the season repository and the commit store could come to
+        disagree about which directory this deployment actually uses.
+        """
+        return getattr(app.state, "signal_trials_data_dir", None) or data_dir
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/health")
     async def signal_trials_health() -> dict[str, Any]:
@@ -84,7 +141,7 @@ def register_signal_trials_routes(
         and declined to build a season — from ``not_built``, where it never ran. Both
         answer ``404`` on ``/season``, so health is the only place they differ.
         """
-        return {"ok": True, "season_state": read_state(data_dir)["state"]}
+        return {"ok": True, "season_state": read_state(_data_dir())["state"]}
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/season", response_model=None)
     async def signal_trials_season() -> SignalTrialsSeasonResponse | JSONResponse:
@@ -97,23 +154,45 @@ def register_signal_trials_routes(
         route served a stale ``qualified`` season, and the API would be asserting both
         at once. See :func:`~veridex.signal_trials.published.read_season`.
         """
-        season = read_season(data_dir)
+        season = read_season(_data_dir())
         if season is None:
             return _error(404, "no_season_published")
         return SignalTrialsSeasonResponse(**season)
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/open-trial", response_model=None)
     async def signal_trials_open_trial() -> OpenTrialResponse | JSONResponse:
-        """Frozen §11 discovery: the open live trial's no-future evidence, hash and deadline."""
-        trial = None if open_trial_provider is None else open_trial_provider()
-        if trial is None:
-            return _error(404, "no_open_trial")
-        return trial
+        """Frozen §11 discovery: the open live trial's no-future evidence, hash and deadline.
 
-    @app.get(f"{SIGNAL_TRIALS_PREFIX}/trials/{{trial_id}}")
-    async def signal_trials_trial(trial_id: str) -> JSONResponse:
-        """No trial store exists until H4.1, so every id is honestly unknown."""
-        return _error(404, "trial_not_found")
+        The repository is consulted first and the callable second, so a deployment that has a
+        real published trial serves it while a test supplying a provider still works. Both are
+        read per request: a live trial is opened by a separate process, so a value captured at
+        registration would keep reporting ``no_open_trial`` after one was published.
+        """
+        repo = _live_trials()
+        trial = repo.current() if repo is not None else None
+        if trial is not None:
+            return _open_trial_response(trial)
+        provided = None if open_trial_provider is None else open_trial_provider()
+        if provided is None:
+            return _error(404, "no_open_trial")
+        return provided
+
+    @app.get(f"{SIGNAL_TRIALS_PREFIX}/trials/{{trial_id}}", response_model=None)
+    async def signal_trials_trial(trial_id: str) -> JSONResponse | OpenTrialResponse:
+        """Serve a known trial's decision-time evidence, or 404 for an id nothing matches.
+
+        Carries the same no-future evidence as ``/open-trial`` and nothing more. Outcomes,
+        markouts and participant records are H4.3's, and serving a placeholder for them here
+        would publish a settlement state that has not been computed.
+
+        The id is never echoed into the refusal: it arrives from a URL path segment, so echoing
+        it would reflect caller-controlled text back into logs and responses.
+        """
+        repo = _live_trials()
+        trial = None if repo is None else repo.get(trial_id)
+        if trial is None:
+            return _error(404, "trial_not_found")
+        return _open_trial_response(trial)
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/agents/{{payer_id}}")
     async def signal_trials_agent(payer_id: str) -> JSONResponse:
@@ -122,18 +201,38 @@ def register_signal_trials_routes(
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/commit")
     async def signal_trials_commit_get() -> JSONResponse:
-        """GET is gated alongside POST so the OKX review probe meets the paywall, not a 200."""
-        return _error(503, "trials_not_open")
+        """Refuse honestly when no payment gate is in front of this route.
+
+        Both commit handlers are UNREACHABLE on a properly composed app: H4.1 mounts
+        :class:`~veridex.signal_trials.payments.SignalTrialsPaymentASGI` around the app, and it
+        answers every gated method on this path itself — a 402 challenge when unpaid, and the
+        settlement-atomic commit path when paid. These handlers are what remains when no gate is
+        mounted, and their only job is to make that state impossible to mistake for a success.
+        """
+        return _commit_unavailable()
 
     @app.post(f"{SIGNAL_TRIALS_PREFIX}/commit")
     async def signal_trials_commit_post(commit: CommitRequest) -> JSONResponse:
-        """Validate the frozen request shape, then refuse honestly.
+        """Refuse honestly when no payment gate is in front of this route.
 
-        The body is parsed even though nothing is done with it: it keeps the frozen
-        request contract live in the OpenAPI schema and exercised by tests, so the
-        shape H4.1 inherits has been checked against real callers rather than assumed.
+        The body is still parsed, so the frozen request contract stays live in the OpenAPI
+        schema and a malformed body is still a 422 rather than a 503 — a caller debugging its
+        request shape gets the same answer whether or not a gate happens to be mounted.
         """
-        return _error(503, "trials_not_open")
+        return _commit_unavailable()
+
+    def _commit_unavailable() -> JSONResponse:
+        """Name WHICH precondition is missing, because the two are fixed differently.
+
+        ``trials_not_open`` means this deployment has no live-trial store at all, so there is
+        nothing to commit to — the H1.2 answer, and still the truthful one.
+        ``payment_gate_not_configured`` means trials exist but no payment layer is in the request
+        path, which is an operator misconfiguration rather than a quiet period: a free 200 here
+        would publish a benchmark commitment that was never paid for.
+        """
+        if _live_trials() is None or _store() is None:
+            return _error(503, "trials_not_open")
+        return _error(503, "payment_gate_not_configured")
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/receipts/{{receipt_id}}/verify")
     async def signal_trials_verify_receipt(receipt_id: str) -> JSONResponse:
