@@ -144,12 +144,17 @@ async def test_get_candles_takes_bar_ms_from_the_requested_bar_and_not_from_a_co
 
     series = await client.get_candles("501", "So1", "1H")
 
+    # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1). This type check must stay FIRST: a mutant whose
+    # failure mode is a `None` return would raise AttributeError on any attribute access ahead of
+    # it, which classifies as a FALSE kill and proves nothing. Do not "tidy" it away or reorder it.
+    assert isinstance(series, CandleSeries)
     assert series.bar == "1H"
     # Compared to the LITERAL width as well as to the table: a client that also rewrote `BAR_MS`
     # would otherwise agree with itself.
     assert series.bar_ms == 3_600_000
     assert series.bar_ms == BAR_MS["1H"]
     assert BAR_MS["1H"] != BAR_MS["1m"]
+    assert len(fake.calls) == 1
     assert fake.calls[0][2]["bar"] == "1H"
 
 
@@ -166,6 +171,9 @@ async def test_get_candles_reads_the_confirm_column_of_every_row():
 
     series = await client.get_candles("501", "So1", "1m")
 
+    # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1) — see the note in the bar-provenance pin above.
+    assert isinstance(series, CandleSeries)
+    assert len(series.candles) == 2
     assert [c.confirmed for c in series.candles] == [True, False]
     assert [c.ts_open_ms for c in series.candles] == [1753400000000, 1753400060000]
 
@@ -182,6 +190,9 @@ async def test_get_candles_pins_the_settlement_endpoint_and_its_query_params():
 
     await client.get_candles("501", "So1", "1m", before_ms=1753400000000, limit=50)
 
+    # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1): a mutant that skips the request entirely would
+    # raise IndexError on `fake.calls[0]`, a FALSE kill. Discriminate the call count FIRST.
+    assert len(fake.calls) == 1
     method, path, params, json_body, headers = fake.calls[0]
     assert method == "GET"
     assert path == "/api/v6/dex/market/historical-candles"
@@ -204,6 +215,7 @@ async def test_get_candles_omits_before_when_unset_and_sends_the_default_limit()
 
     await client.get_candles("501", "So1", "1m")
 
+    assert len(fake.calls) == 1  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
     assert fake.calls[0][2] == {
         "chainIndex": "501",
         "tokenContractAddress": "So1",
@@ -225,16 +237,27 @@ async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_i
 
     page = await client.list_signals(SignalFilters(chain_index="501"))
 
-    assert page.signals == (first, last)
+    # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1), and this pin has three separate false-kill
+    # hazards: a `None` page (AttributeError), a `None` body (TypeError on subscript), and an
+    # absent second request (IndexError on `calls[1]`). Each is discriminated BEFORE the assertion
+    # it could mask. `next_cursor` is asserted first because it is the targeted property.
+    assert page is not None
     assert page.next_cursor == "CURSOR-LAST"
-    assert "cursor" not in fake.calls[0][3][0]
+    assert page.signals == (first, last)
+
+    assert len(fake.calls) == 1
+    first_body = fake.calls[0][3]
+    assert isinstance(first_body, list) and len(first_body) == 1
+    assert "cursor" not in first_body[0]
 
     await client.list_signals(SignalFilters(chain_index="501"), cursor=page.next_cursor)
 
+    assert len(fake.calls) == 2
     method, path, params, body, _ = fake.calls[1]
     assert method == "POST"
     assert path == "/api/v6/dex/market/signal/list"
     assert params is None
+    assert isinstance(body, list) and len(body) == 1
     # Whole-body equality: the predeclared MVP filter manifest (§5.1) is otherwise unpinned, and a
     # rewritten threshold changes which signals the season is ever able to see.
     assert body == [
