@@ -84,6 +84,23 @@ def test_commit_price_carries_pay_to_and_timeout():
     assert p.price == "$0.01"
 
 
+@pytest.mark.parametrize("payout", ["0x" + "f0" * 20, "0x" + "9c" * 20])
+def test_commit_price_routes_to_the_configured_payout_address(payout):
+    """``pay_to`` decides WHERE THE MONEY GOES, so it must come from the configuration.
+
+    Every other test in this file holds the payout at one accepted literal, and a
+    ``build_commit_price`` that ignored ``settings.pay_to`` and returned a hard-coded
+    address would satisfy all of them — an implementation routing every payment to a
+    fixed address would ship green. Two distinct addresses, neither of them that
+    literal, is the smallest change that makes such an implementation observable.
+
+    One assertion by design: there is no second, redundant assertion here that a later
+    edit could re-order ahead of it (PKT-DEC-C20 rule 1 / CF-5a).
+    """
+    settings = load_x402_settings({**PROD_ENV, "PAY_TO_ADDRESS": payout})
+    assert build_commit_price(settings).pay_to == payout
+
+
 # --- positive controls: the configurations build_resource_server must ALLOW ---
 
 
