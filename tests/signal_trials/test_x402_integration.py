@@ -1577,3 +1577,83 @@ async def test_F1_a_validation_refusal_under_an_off_spelling_RELEASES_the_slot()
     accepted = await _paid_post(in_window, _body(0.6, trial_id=requested))
     assert accepted.status_code == 200, accepted.text
     assert facilitator.settle_calls == 1 and store.count_finalized() == 1
+
+
+# ----------------------------------------------------------------------------------------
+# M1 — the body of the receipt_id guard, which nothing pinned.
+#
+# The guard added with the F1 fix answers a replay with the ORIGINAL receipt. It fires ONLY when
+# a finalized record already answers for this payer and trial -- that is, only AFTER a successful
+# settlement. `release_slot`'s own contract names that circumstance as unlawful by name: releasing
+# "after a successful one -- reopens the slot ... and is a double charge". So a release inside this
+# branch destroys the finalized idempotency pointer in the only case the line can execute.
+#
+# It is unreachable while the slot key is correct, which is exactly why it went unnoticed: mutant
+# J3 (skip the guard entirely) SURVIVED the sweep because no test entered the branch at all. An
+# unreachable branch whose body is wrong is worse than a missing branch, because it reads as a
+# safeguard.
+#
+# Reaching it needs `created=True` while a finalized record exists -- states the store makes
+# mutually exclusive. The subclass below forces that disagreement, which is what a regressed key
+# or a lost slot file would produce, without reintroducing either.
+# ----------------------------------------------------------------------------------------
+
+
+class _AmnesiacSlotStore(_FaultInjectingStore):
+    """A store that reports a FRESH slot while a finalized record still answers for it.
+
+    Models the one state the guard exists for: the slot pointer and the finalized record
+    disagreeing. Real causes are a regressed slot key or a slot file lost to a partial restore;
+    neither is reintroduced here, because the point is to reach the branch, not to rebuild the
+    defect that made it reachable.
+    """
+
+    def __init__(self, root: Path, **faults: Any) -> None:
+        super().__init__(root, **faults)
+        self.force_fresh_slot = False
+
+    def acquire_slot(self, payer: str, trial_id: str, *, now_ms: int) -> tuple[bool, str]:
+        """Claim a fresh slot on demand, without touching the slot already on disk."""
+        if self.force_fresh_slot:
+            return True, "in_flight"
+        return super().acquire_slot(payer, trial_id, now_ms=now_ms)
+
+
+async def test_M1_the_replay_guard_RETAINS_the_finalized_idempotency_pointer():
+    """Answering a replay must not delete the pointer that makes the replay answerable.
+
+    Two properties, and the guard needs both. It must return the ORIGINAL receipt without
+    settling -- that is what makes it a guard rather than a fall-through -- and it must leave the
+    finalized slot standing, because that slot is the whole anti-double-charge mechanism. A guard
+    that answers correctly once and erases the pointer on its way out has converted a permanent
+    protection into a single-use one.
+    """
+    facilitator = FakeFacilitator()
+    store = _AmnesiacSlotStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    app = _build_app(facilitator=facilitator, store=store, trial=trial, settings=_settings())
+
+    first = await _paid_post(app, _body(0.6))
+    assert first.status_code == 200
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized"
+
+    # Force the slot pointer and the finalized record to disagree, so the guard is entered.
+    store.force_fresh_slot = True
+    replay = await _paid_post(app, _body(0.6))
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["receipt_id"] == first.json()["receipt_id"]
+    assert facilitator.settle_calls == 1, "the guard must answer from the record, never settle again"
+    assert store.count_finalized() == 1
+    # THE M1 ASSERTION. Releasing here would delete the finalized pointer, and the next retry
+    # bearing a fresh signature would find no slot at all.
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized", (
+        "the guard destroyed the finalized idempotency pointer it was answering from"
+    )
+
+    # And the protection is still permanent, not spent: a further replay behaves identically.
+    again = await _paid_post(app, _body(0.6))
+    assert again.status_code == 200 and again.json()["receipt_id"] == first.json()["receipt_id"]
+    assert facilitator.settle_calls == 1
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized"
+    assert len(store.public_records(FAKE_PAYER)) == 1

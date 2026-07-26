@@ -811,14 +811,24 @@ class SignalTrialsPaymentASGI:
             # A finalized record already answers for this commitment, so return the ORIGINAL
             # receipt and settle nothing.
             #
+            # NOTHING IS RELEASED HERE, and that is the whole point of the branch. It fires only
+            # when a finalized record exists — only ever AFTER a successful settlement — and
+            # ``release_slot`` names that circumstance unlawful by name: releasing after a
+            # successful settlement reopens the slot to a fresh-signature retry and IS the double
+            # charge. An earlier revision released here, which in the only case the line could
+            # execute deleted the very pointer this branch was answering from, turning a permanent
+            # protection into a single-use one.
+            #
+            # Nothing leaks by not releasing. If a slot was created at some other key — which is
+            # the only way this branch is reachable at all — it holds ``in_flight`` with no attempt
+            # marker, and that is precisely what the reconciler releases as "provably never reached
+            # settle".
+            #
             # With acquisition keyed on the resolved id this should not be reachable: the slot was
-            # created ``in_flight`` a moment ago and ``finalized_for`` consults that same key. It
-            # is honoured rather than assumed anyway. A previous revision argued the branch away
-            # as "structural rather than lucky" and was wrong — the argument rested on
-            # ``get(x).trial_id == x``, a property of the resolver, not of this function. Reading
-            # the answer the validator already computed costs one comparison; discarding it and
-            # falling through to settle is a double charge.
-            self.store.release_slot(payer, trial.trial_id)
+            # created ``in_flight`` a moment ago and ``finalized_for`` consults that same key. It is
+            # honoured rather than assumed anyway. A revision before that argued the branch away as
+            # "structural rather than lucky" and was wrong — the argument rested on
+            # ``get(x).trial_id == x``, a property of the resolver, not of this function.
             await self._send_receipt(send, outcome.receipt_id, settled=None)
             return
 
