@@ -81,6 +81,7 @@ from veridex.api.schemas import (
     RuntimeEventsResponse,
     VerifyResponse,
 )
+from veridex.api.signal_trials_router import register_signal_trials_routes
 from veridex.api.ws import ArenaConnectionManager, register_arena_routes
 from veridex.backtest.report import BacktestReport
 from veridex.backtest.runner import run_backtest
@@ -2238,5 +2239,13 @@ def create_app(
     # imports the directional scorer/leaderboard. Registered last so it composes like the deploy
     # and arena route groups above.
     register_maker_routes(app, store=resolved_store, require_principal=require_principal)
+
+    # --- Signal Trials free reads + honest commit stub (separate payments lane) ----------
+    # Reads the published-season repository out of SIGNAL_TRIALS_DATA_DIR (the persistent
+    # volume the offline scorer publishes into), mirroring how REPLAY_PACK_ROOT is resolved
+    # above: the environment is read HERE, at the composition root, so the router itself
+    # stays injectable. A blank/unset value means no repository is configured, which reads
+    # as an honest ``not_built`` rather than an error.
+    register_signal_trials_routes(app, data_dir=os.environ.get("SIGNAL_TRIALS_DATA_DIR", "") or None)
 
     return app

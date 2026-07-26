@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI
 
 from veridex.api.readiness import build_readiness_router
-from veridex.config import get_settings
+from veridex.config import _NON_PRODUCTION_APP_ENVS, get_settings
 from veridex.ingest.replay_catalog import build_catalog
 from veridex.store import InMemoryStore, PostgresStore, Store
 
@@ -223,6 +223,143 @@ def _resolve_verifier(verifier: _Verifier | None) -> _Verifier:
     return verify_privy_token
 
 
+def _x402_is_production(env: Mapping[str, str], settings: Settings) -> bool:
+    """Decide the x402 money path's production-ness FAIL-CLOSED, from both available sources.
+
+    ``X402Settings`` carries five fields and cannot hold ``APP_ENV``, so the production
+    decision has to be made here, at the call site. Two sources are in play and they can
+    disagree: the ``env`` mapping this factory is handed, and the resolved
+    :class:`~veridex.config.Settings`. Either one saying "production" is enough.
+
+    The asymmetry is deliberate. A disagreement that resolved to non-production would let
+    a :class:`~veridex.signal_trials.payments.FakeFacilitator` back a configuration
+    carrying a real payout address — the exact pairing ``build_resource_server`` exists to
+    refuse. Resolving to production instead only ever costs a test an explicit opt-out.
+
+    The env-side rule reuses :data:`veridex.config._NON_PRODUCTION_APP_ENVS` rather than
+    restating it: a second copy of the money path's production rule is a copy that can
+    drift out of agreement with the loader that enforces it.
+    """
+    app_env = env.get("APP_ENV", "development").strip().casefold()
+    return settings.is_production or app_env not in _NON_PRODUCTION_APP_ENVS
+
+
+def _x402_may_be_configured(env: Mapping[str, str]) -> bool:
+    """Cheap pre-check deciding only whether the x402 SDK needs importing at all.
+
+    The SDK is an OPTIONAL extra (``signal-trials``), so an install without it must still
+    boot as long as no payment gate is wanted. This check is deliberately more LENIENT
+    than the authoritative parse in ``load_x402_settings``: anything that loader could
+    read as enabled also passes here, so the import is never skipped for a configuration
+    that wanted a gate. The real decision stays with the loader.
+    """
+    return env.get("X402_ENABLED", "").strip().casefold() not in {"", "0", "false", "no", "off"}
+
+
+def _build_okx_facilitator(env: Mapping[str, str], *, sync_settle: bool) -> Any:
+    """Build the REAL OKX facilitator client that settles commit payments on X Layer.
+
+    Credentials are read from the environment and handed straight to the SDK, which
+    refuses a partial set. They are never logged, echoed, or attached to app state.
+
+    Note that ``build_resource_server(settings)`` — the one-argument form — binds NO
+    facilitator at all, leaving ``_facilitator_clients`` empty; the resulting server
+    fails route validation on the first protected request instead of emitting a
+    challenge. Production therefore has to pass a real client explicitly, which is what
+    this builds.
+    """
+    from x402.http import (  # type: ignore[import-untyped]
+        OKXAuthConfig,
+        OKXFacilitatorClient,
+        OKXFacilitatorConfig,
+    )
+
+    return OKXFacilitatorClient(
+        OKXFacilitatorConfig(
+            auth=OKXAuthConfig(
+                api_key=env.get("OKX_API_KEY", "").strip(),
+                secret_key=env.get("OKX_SECRET", "").strip(),
+                passphrase=env.get("OKX_PASSPHRASE", "").strip(),
+            ),
+            sync_settle=sync_settle,
+        )
+    )
+
+
+def _mount_signal_trials_402(
+    app: FastAPI,
+    env: Mapping[str, str],
+    *,
+    is_production: bool,
+    facilitator: Any,
+) -> None:
+    """Mount the TEMPORARY stock x402 layer over the signal-trials commit route.
+
+    This is the H1.2 placeholder that H4.1 replaces with ``SignalTrialsPaymentASGI``. Its
+    only job is to make ``GET|POST /signal-trials/commit`` answer with a genuine 402
+    challenge instead of reaching the handler unpaid. Free reads are untouched — the
+    middleware passes through any path its route table does not match.
+
+    Mounted on the COMPOSED FastAPI (``guard.app``), never on the guard itself: the guard
+    delegates to this app, so middleware attached to the guard object would not be in the
+    request path at all.
+
+    Three things must all be true before a challenge can be emitted, and each one fails
+    closed rather than degrading:
+
+    * a facilitator must be bound — the SDK validates route configuration lazily, on the
+      first protected request, and raises ``RouteConfigurationError`` (a 500, uncaught by
+      the middleware) rather than a 402 when none is;
+    * ``ExactEvmScheme`` must be registered for the network, or route validation fails
+      the same way;
+    * in production the facilitator must be the real one, which
+      :func:`~veridex.signal_trials.payments.build_resource_server` enforces by refusing
+      the fake and anything wrapping it.
+
+    Raises:
+        ValueError: x402 is enabled with no facilitator available; or the configuration
+            is otherwise refused by the fail-closed loader (disabled in production, an
+            invalid payout address, an invalid commit price, a fake in production).
+    """
+    # Lazy, exactly like the psycopg and agno imports: the x402 SDK is an optional extra.
+    from x402.http.middleware.fastapi import PaymentMiddlewareASGI  # type: ignore[import-untyped]
+    from x402.mechanisms.evm.exact.server import ExactEvmScheme  # type: ignore[import-untyped]
+
+    from veridex.signal_trials.payments import (
+        COMMIT_PATH,
+        GATED_METHODS,
+        X_LAYER_MAINNET,
+        build_commit_price,
+        build_resource_server,
+        load_x402_settings,
+    )
+
+    # Authoritative, fail-closed: refuses a production config that is disabled, carries a
+    # malformed payout address, or carries a price that cannot honestly be charged.
+    x402_settings = load_x402_settings(env)
+    if not x402_settings.enabled:
+        return
+
+    resolved_facilitator = facilitator
+    if resolved_facilitator is None and is_production:
+        resolved_facilitator = _build_okx_facilitator(env, sync_settle=x402_settings.sync_settle)
+    if resolved_facilitator is None:
+        raise ValueError(
+            "X402_ENABLED=true requires a facilitator: a gate mounted without one raises "
+            "RouteConfigurationError on the first commit request instead of returning 402"
+        )
+
+    resource_server = build_resource_server(x402_settings, resolved_facilitator, is_production=is_production)
+    resource_server.register(X_LAYER_MAINNET, ExactEvmScheme())
+
+    commit_price = build_commit_price(x402_settings)
+    app.add_middleware(
+        PaymentMiddlewareASGI,
+        routes={f"{method} {COMMIT_PATH}": {"accepts": [commit_price]} for method in GATED_METHODS},
+        server=resource_server,
+    )
+
+
 def create_server_app(
     env: Mapping[str, str] | None = None,
     *,
@@ -230,6 +367,7 @@ def create_server_app(
     settings: Settings | None = None,
     verifier: _Verifier | None = None,
     surface_only: bool = True,
+    x402_facilitator: Any = None,
 ) -> DenyByDefaultGuard:
     """Build the public-deploy app: the deny-by-default GUARD hosting the AgentOS surface.
 
@@ -254,6 +392,10 @@ def create_server_app(
             Privy material). Defaults to :func:`~veridex.config.get_settings`.
         verifier: Injection seam for tests — the Privy token verifier. Defaults to the real
             ``verify_privy_token``.
+        x402_facilitator: Injection seam for tests — the facilitator client the stock 402 layer
+            settles through. ``None`` builds the REAL OKX client from the environment in production,
+            and is refused outside production (a mounted gate with no facilitator cannot challenge).
+            Non-production tests inject a ``FakeFacilitator``; production refuses one.
         surface_only: When ``True`` (the deployed default), the served composition mounts the AgentOS
             surface behind deny-by-default and is NOT an executor — so an ephemeral in-memory AgentOS
             owner/session DB is acceptable (non-authoritative; readiness discloses it as non-gating). When
@@ -368,6 +510,18 @@ def create_server_app(
     # -> create_app(replay_catalog=...)); reaffirmed here for locality — the object is identical, so this
     # no longer depends on statement ordering to overwrite a divergent env-built catalog.
     app.state.replay_catalog = replay_catalog  # R-2: trusted hash-verified catalog for /readyz + R-3
+
+    # Signal Trials: the TEMPORARY stock x402 layer over the commit route (H1.2; H4.1 replaces it).
+    # Attached to the COMPOSED app, not to the guard — see ``app = guard.app`` above.
+    #
+    # Production ALWAYS goes through the fail-closed loader, even when X402_ENABLED looks unset, so a
+    # production deploy that forgot to enable payments refuses to start rather than serving the commit
+    # route ungated. Outside production the SDK is not even imported unless payments were asked for,
+    # which keeps installs without the optional ``signal-trials`` extra bootable.
+    x402_is_production = _x402_is_production(resolved_env, resolved_settings)
+    if x402_is_production or _x402_may_be_configured(resolved_env):
+        _mount_signal_trials_402(app, resolved_env, is_production=x402_is_production, facilitator=x402_facilitator)
+
     return guard  # RETURN THE GUARD (the ASGI callable) — never the inner FastAPI
 
 
