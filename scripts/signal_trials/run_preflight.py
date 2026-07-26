@@ -1,0 +1,343 @@
+"""Operator entrypoint for the (chain x bar) matrix preflight — GATE B, live, operator-run.
+
+    OKX_API_KEY=… OKX_SECRET_KEY=… OKX_PASSPHRASE=… \
+        .venv/bin/python scripts/signal_trials/run_preflight.py --out preflight_result.json
+
+This is the ONLY place in the codebase that constructs a real OKX transport. Everything it
+orchestrates — ``run_matrix_probe``, ``select_combo``, ``write_preflight_result`` — is exercised in
+tests against in-memory fakes, so importing this module must never read a credential, open a
+connection, or run a probe. It does not: every one of those happens inside ``main``.
+
+Three operator-facing properties:
+
+**It prints all four counts and their rejection reasons**, not just the winner. "0 eligible" and
+"0 eligible because nothing settled" are different findings, and only the second one says that
+retention rather than density is the constraint — which is the answer §5.1 wants from this run.
+
+**It always leaves an artifact, and the artifact says which kind of run it was.** A completed probe
+writes ``probe_status="completed"``; a failed one writes ``probe_status="failed"`` with a reason and
+no counts. Absence of the file means the run never reached the writer. A later stage reading
+``preflight_result.json`` can tell the three apart without seeing this terminal.
+
+**Credential values never reach a rendered string.** ``OKXCredentials`` redacts its own ``repr``,
+and every failure reason is passed through ``redact`` before it is printed or written — an upstream
+error message that echoed a key would otherwise be committed into an artifact an operator attaches
+to a review.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from veridex.signal_trials.okx_client import (
+    CandleSeries,
+    OKXCredentials,
+    OKXMarketClient,
+    SignalFilters,
+    SignalPage,
+)
+from veridex.signal_trials.preflight import (
+    COMBO_ORDER,
+    FROZEN_COOLDOWN_MS,
+    FROZEN_HORIZON_MS,
+    FROZEN_MIN_TRIALS,
+    PROBE_ABORTED,
+    PROBE_REFUSED,
+    SIGNAL_SOURCE_DIRECTION,
+    ComboSelection,
+    MatrixProbeResult,
+    run_matrix_probe,
+    select_combo,
+    supersede_existing_artifact,
+    write_preflight_failure,
+    write_preflight_not_run,
+    write_preflight_result,
+)
+
+REDACTED = "***"
+DEFAULT_BASE_URL = "https://web3.okx.com"
+REQUEST_TIMEOUT_SECONDS = 30.0
+
+_CREDENTIAL_VARS: tuple[str, ...] = ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
+
+
+class NonFrozenPolicyError(RuntimeError):
+    """The operator asked for a season policy other than the frozen one.
+
+    §5.1 fixes qualification at >= 40 trials, the same-token cooldown at 4h and the sole ranking
+    horizon at 1h, and EXPLICITLY FORBIDS lowering thresholds after observing outcomes. This command
+    writes the AUTHORITATIVE `preflight_result.json` that H2.4 consumes, so a run under different
+    rules must not be able to reach that artifact at all — not merely be disclosed inside it.
+
+    The switches are kept rather than deleted so an operator who asks for a different policy gets a
+    refusal that NAMES the frozen value and the one supplied, instead of an unknown-argument error
+    that reads like a typo.
+    """
+
+
+class MissingCredentialError(RuntimeError):
+    """A required OKX credential is absent from the environment.
+
+    Names the VARIABLE and never its value: this message is printed to a terminal an operator may
+    screenshot into a review.
+    """
+
+
+class HttpxTransport:
+    """The concrete OKX HTTP seam, satisfying ``okx_client.Transport`` structurally.
+
+    ``params`` is passed straight through as a dict so httpx serializes it in iteration order — the
+    OKX signature covers the query string, so a transport that reordered it would produce a URL the
+    ``OK-ACCESS-SIGN`` no longer matches.
+
+    ``raise_for_status`` handles transport-level failures; OKX signals APPLICATION errors inside an
+    HTTP 200 envelope, and those are the client's business, not this transport's.
+    """
+
+    def __init__(self, http: httpx.AsyncClient) -> None:
+        self._http = http
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None,
+        json_body: object | None,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        response = await self._http.request(method, path, params=params, json=json_body, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError(f"OKX response must be a JSON object, got {type(payload).__name__}")
+        return payload
+
+
+class FrozenSignalListSource:
+    """Binds an OKX client to the frozen Signal List endpoint AND attests that endpoint's polarity.
+
+    Polarity is a property of the endpoint, so the only party that can attest it is whoever bound
+    the client to one — which is this file, and only this file. `POST /api/v6/dex/market/signal/list`
+    is documented as "Get latest buy-direction token signals", and its documented rows carry no
+    direction member at all, so no row-level check can establish what the endpoint already
+    guarantees.
+
+    The attestation is deliberately NOT on `OKXMarketClient` itself: that class is a generic reader
+    which will happily be pointed at another path, and it is outside this task's ownership. Putting
+    the declaration on the binding rather than on the reader is what makes a future generalisation
+    fail closed instead of silently inheriting a guarantee it no longer has.
+    """
+
+    signal_source_direction = SIGNAL_SOURCE_DIRECTION
+
+    def __init__(self, client: OKXMarketClient) -> None:
+        self._client = client
+
+    async def list_signals(self, f: SignalFilters, cursor: str | None = None) -> SignalPage:
+        return await self._client.list_signals(f, cursor)
+
+    async def get_candles(
+        self,
+        chain_index: str,
+        token: str,
+        bar: str,
+        *,
+        before_ms: int | None = None,
+        limit: int = 100,
+    ) -> CandleSeries:
+        return await self._client.get_candles(chain_index, token, bar, before_ms=before_ms, limit=limit)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="run_preflight",
+        description="Probe the frozen (chain x bar) matrix and write preflight_result.json.",
+    )
+    parser.add_argument("--out", type=Path, required=True, help="destination for preflight_result.json")
+    parser.add_argument(
+        "--min-trials",
+        dest="min_trials",
+        type=int,
+        default=FROZEN_MIN_TRIALS,
+        help="FROZEN at %(default)s by spec 5.1; any other value is REFUSED (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--cooldown-ms",
+        dest="cooldown_ms",
+        type=int,
+        default=FROZEN_COOLDOWN_MS,
+        help="FROZEN at %(default)s ms (4h); any other value is REFUSED (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--horizon-ms",
+        dest="horizon_ms",
+        type=int,
+        default=FROZEN_HORIZON_MS,
+        help="FROZEN at %(default)s ms (1h); any other value is REFUSED (default: %(default)s)",
+    )
+    return parser.parse_args(argv)
+
+
+def assert_frozen_policy(args: argparse.Namespace) -> None:
+    """Refuse to run the AUTHORITATIVE preflight under anything but the frozen season policy.
+
+    Raises:
+        NonFrozenPolicyError: naming every deviating switch, its frozen value and the value supplied.
+    """
+    deviations = [
+        (flag, frozen, supplied)
+        for flag, frozen, supplied in (
+            ("--min-trials", FROZEN_MIN_TRIALS, args.min_trials),
+            ("--cooldown-ms", FROZEN_COOLDOWN_MS, args.cooldown_ms),
+            ("--horizon-ms", FROZEN_HORIZON_MS, args.horizon_ms),
+        )
+        if supplied != frozen
+    ]
+    if deviations:
+        detail = "; ".join(
+            f"{flag} is frozen at {frozen} but {supplied} was supplied" for flag, frozen, supplied in deviations
+        )
+        raise NonFrozenPolicyError(
+            f"refusing to write an authoritative preflight artifact under a non-frozen season policy: {detail}. "
+            f"Spec 5.1 fixes these and forbids lowering thresholds after observing outcomes."
+        )
+
+
+def credentials_from_env(env: Mapping[str, str]) -> OKXCredentials:
+    """Read the OKX credentials, naming any that are missing or blank.
+
+    Raises:
+        MissingCredentialError: Listing the missing VARIABLE NAMES only.
+    """
+    missing = [name for name in _CREDENTIAL_VARS if not env.get(name, "").strip()]
+    if missing:
+        raise MissingCredentialError(f"missing or blank OKX credentials in the environment: {', '.join(missing)}")
+    return OKXCredentials(
+        api_key=env["OKX_API_KEY"],
+        secret_key=env["OKX_SECRET_KEY"],
+        passphrase=env["OKX_PASSPHRASE"],
+        base_url=env.get("OKX_BASE_URL", DEFAULT_BASE_URL),
+    )
+
+
+def redact(text: str, secrets: Sequence[str]) -> str:
+    """Replace every credential value in ``text``.
+
+    Blank and whitespace-only entries are skipped: replacing the empty string would rewrite every
+    character boundary in the message, which destroys the diagnostic while looking like redaction.
+    """
+    redacted = text
+    for secret in secrets:
+        if secret.strip():
+            redacted = redacted.replace(secret, REDACTED)
+    return redacted
+
+
+def filters_by_chain() -> dict[str, SignalFilters]:
+    """The predeclared MVP dataset filters (§5.1), one entry per chain in the frozen matrix."""
+    return {chain_index: SignalFilters(chain_index=chain_index) for chain_index, _ in COMBO_ORDER}
+
+
+def render_summary(sel: ComboSelection, result: MatrixProbeResult) -> str:
+    """All four combos with their counts and rejection reasons, then the decision."""
+    by_combo = {(count.chain_index, count.bar): count for count in result.counts}
+    lines = [
+        "(chain x bar) matrix preflight",
+        f"direction_semantics_confirmed: {result.direction_semantics_confirmed}",
+        "",
+    ]
+    for chain_index, bar in COMBO_ORDER:
+        count = by_combo.get((chain_index, bar))
+        if count is None:
+            lines.append(f"  chain {chain_index} bar {bar}: MISSING FROM MATRIX")
+            continue
+        rendered = " ".join(f"{reason}={n}" for reason, n in sorted(count.rejection_reasons.items())) or "none"
+        lines.append(
+            f"  chain {chain_index} bar {bar}: eligible_settleable={count.eligible_settleable}  rejections: {rendered}"
+        )
+    lines.extend(
+        [
+            "",
+            f"season_status: {sel.season_status}",
+            f"chain_index:   {sel.chain_index}",
+            f"bar:           {sel.bar}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _probe(creds: OKXCredentials, args: argparse.Namespace) -> MatrixProbeResult:
+    """Construct the live transport and run the probe. The only network path in this repository."""
+    async with httpx.AsyncClient(base_url=creds.base_url, timeout=REQUEST_TIMEOUT_SECONDS) as http:
+        source = FrozenSignalListSource(OKXMarketClient(HttpxTransport(http), creds))
+        return await run_matrix_probe(
+            source,
+            filters_by_chain(),
+            cooldown_ms=args.cooldown_ms,
+            horizon_ms=args.horizon_ms,
+            min_trials=args.min_trials,
+        )
+
+
+def _record_not_run(probe_status: str, reason: str, out: Path, verb: str) -> None:
+    """Leave the authoritative path describing THIS invocation, not a previous one.
+
+    An earlier revision wrote nothing here, reasoning that a run which probed nothing should leave
+    ABSENCE. That reasoning was right about the state and wrong about how to express it: absence is
+    only honest when the path is genuinely absent, and re-running the fixed
+    `--out preflight_result.json` command means an artifact from the LAST run is normally sitting
+    there. A refusal that writes nothing therefore leaves H2.4 a stale combo it cannot tell apart
+    from this run's result, because H2.4 reads the artifact and never sees the terminal.
+
+    So: move any previous artifact aside, then record what actually happened.
+    """
+    superseded = supersede_existing_artifact(out)
+    write_preflight_not_run(probe_status, reason, out)  # type: ignore[arg-type]
+    print(f"preflight {verb} before any request: {reason}", file=sys.stderr)
+    if superseded is not None:
+        print(f"the previous artifact was moved to {superseded} and is no longer consumable", file=sys.stderr)
+    print(f"{out} now records probe_status={probe_status!r}", file=sys.stderr)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        assert_frozen_policy(args)
+    except NonFrozenPolicyError as exc:
+        _record_not_run(PROBE_REFUSED, f"NonFrozenPolicyError: {exc}", args.out, "refused")
+        return 3
+
+    try:
+        creds = credentials_from_env(os.environ)
+    except MissingCredentialError as exc:
+        _record_not_run(PROBE_ABORTED, f"MissingCredentialError: {exc}", args.out, "aborted")
+        return 2
+
+    secrets = [creds.api_key, creds.secret_key, creds.passphrase]
+    try:
+        result = asyncio.run(_probe(creds, args))
+        selection = select_combo(result, min_trials=args.min_trials)
+    except Exception as exc:  # noqa: BLE001 - every failure must reach the artifact, not just known ones
+        reason = redact(f"{type(exc).__name__}: {exc}", secrets)
+        write_preflight_failure(reason, args.out)
+        print(f"preflight FAILED: {reason}", file=sys.stderr)
+        print(f"failure artifact written to {args.out}", file=sys.stderr)
+        return 1
+
+    print(render_summary(selection, result))
+    write_preflight_result(selection, result, args.out)
+    print(f"\npreflight artifact written to {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
