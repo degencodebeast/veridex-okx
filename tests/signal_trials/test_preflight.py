@@ -87,9 +87,7 @@ COOLDOWN_MS = 14_400_000
 
 def _matrix(items, *, ok=True):
     """Build a MatrixProbeResult from an explicit ORDERED sequence of (chain, bar, count[, reasons])."""
-    counts = tuple(
-        ComboCount(item[0], item[1], item[2], dict(item[3]) if len(item) > 3 else {}) for item in items
-    )
+    counts = tuple(ComboCount(item[0], item[1], item[2], dict(item[3]) if len(item) > 3 else {}) for item in items)
     return MatrixProbeResult(counts, ok)
 
 
@@ -221,15 +219,36 @@ def test_law_settlement_function_surface_is_pinned():
     assert hints["return"] == (Candle | None)
 
 
-def test_the_probe_references_exactly_one_law_owned_symbol():
+LAW_OWNED_MODULES = ("spot_markout", "scoring", "leaderboard", "rank_guards")
+
+
+def test_the_owned_files_reference_exactly_one_law_owned_symbol():
     """The recorded blast radius, asserted rather than described.
 
-    If a later edit imports a second symbol from a Law-owned module, this fails and the C22 record
-    above has to be updated deliberately - which is the point of recording it.
+    Scans BOTH owned source files and matches ANY reference form - `from X import y`,
+    `import X`, `from veridex.signal_trials import spot_markout` - not one import form in one file.
+    The narrower earlier version was correct about today's radius while leaving three ways to widen
+    it silently (SPEC MINOR-7).
     """
-    source = inspect.getsource(preflight)
-    law_imports = re.findall(r"^from veridex\.signal_trials\.spot_markout import (.+)$", source, re.MULTILINE)
-    assert law_imports == ["select_settlement_candle"]
+    sources = {
+        "veridex/signal_trials/preflight.py": inspect.getsource(preflight),
+        "scripts/signal_trials/run_preflight.py": _run_preflight_path().read_text(),
+    }
+    references = []
+    for filename, source in sources.items():
+        for module in LAW_OWNED_MODULES:
+            for line in source.splitlines():
+                stripped = line.strip()
+                if not (stripped.startswith("import ") or stripped.startswith("from ")):
+                    continue
+                if re.search(rf"\b{module}\b", stripped):
+                    references.append((filename, stripped))
+    assert references == [
+        (
+            "veridex/signal_trials/preflight.py",
+            "from veridex.signal_trials.spot_markout import select_settlement_candle",
+        )
+    ]
 
 
 # ==================================================================================================
@@ -361,9 +380,7 @@ def test_selection_is_invariant_under_every_ordering_of_counts():
         [("501", "1H", 30), ("196", "1H", 17), ("501", "1m", 39), ("196", "1m", 12)],
         [("196", "1H", 17), ("196", "1m", 12), ("501", "1H", 30), ("501", "1m", 39)],
     ]
-    answers = {
-        (select_combo(_matrix(order)).chain_index, select_combo(_matrix(order)).bar) for order in orderings
-    }
+    answers = {(select_combo(_matrix(order)).chain_index, select_combo(_matrix(order)).bar) for order in orderings}
     assert answers == {("501", "1m")}
 
 
@@ -661,6 +678,30 @@ def test_a_failure_write_also_leaves_no_temporary_file_behind(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["preflight_result.json"]
 
 
+def test_the_artifact_is_replaced_atomically_not_written_in_place(tmp_path):
+    """The mechanism behind the ABSENCE state, pinned DIRECTLY rather than via "no temp file left".
+
+    "No temp file left behind" is satisfied by a plain in-place write too, so replacing the
+    mkstemp-and-os.replace with one survived the suite (SPEC G19, recorded under MINOR-6). A
+    read-only destination discriminates them: os.replace onto it SUCCEEDS, because POSIX rename
+    permission depends on the containing DIRECTORY, while opening it "w" in place raises
+    PermissionError. Measured both ways before this test was written.
+
+    What is actually at stake: an in-place write TRUNCATES the previous artifact before it can fail,
+    which manufactures a fourth state - a half-written file that reads as a corrupt version of one of
+    the three, with no way for a reader to tell.
+    """
+    out = tmp_path / "preflight_result.json"
+    first = _full(41, 0, 0, 0)
+    write_preflight_result(select_combo(first), first, out)
+    out.chmod(0o444)
+
+    second = _full(12, 39, 17, 30)
+    write_preflight_result(select_combo(second), second, out)
+    assert _read(out)["season_status"] == "exploratory"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["preflight_result.json"]
+
+
 def test_the_writer_creates_missing_parent_directories(tmp_path):
     out = tmp_path / "nested" / "deeper" / "preflight_result.json"
     matrix = _full(41, 0, 0, 0)
@@ -812,7 +853,9 @@ class FakeMarketClient:
     async def get_candles(self, chain_index, token, bar, *, before_ms=None, limit=100):
         if self.fail_on == "get_candles":
             raise OKXAPIError("51000", "Invalid parameter")
-        self.candle_calls.append((chain_index, token, bar))
+        # `limit` and `before_ms` are RECORDED, not ignored: CANDLE_LIMIT sets the depth of the
+        # retention answer and no fake observed it until SPEC's G1 mutant survived (MINOR-4).
+        self.candle_calls.append((chain_index, token, bar, limit, before_ms))
         return self.series_by_key.get((chain_index, token, bar), CandleSeries(bar, BAR_MS[bar], ()))
 
 
@@ -1024,15 +1067,82 @@ async def test_dedup_is_scoped_to_one_token():
 
 
 async def test_dedup_is_scoped_to_one_chain():
-    """The same token address on two chains is two markets, never one trial."""
+    """The same token address on two chains is two markets, never one trial.
+
+    The two chains' series carry DIFFERENT closes. Byte-identical fixtures would make this vector
+    blind to a chain-blind candle cache - it would reuse one chain's series for the other and still
+    report 1 and 1 (SPEC MAJOR-1). The distinguishing pin is
+    test_the_candle_cache_is_keyed_by_market_identity below; this one no longer holds the series
+    content constant across the dimension its own name says it varies.
+    """
     pages = {
         "196": [_page([_sig(chain="196", token="SAME")])],
         "501": [_page([_sig(chain="501", token="SAME")])],
     }
-    series = {**_both_bars("196", "SAME", BASE_MS), **_both_bars("501", "SAME", BASE_MS)}
+    series = {**_both_bars("196", "SAME", BASE_MS, close=2.5), **_both_bars("501", "SAME", BASE_MS, close=7.5)}
     result = await run_matrix_probe(FakeMarketClient(pages, series), _filters())
     assert _count_for(result, "196", "1H").eligible_settleable == 1
     assert _count_for(result, "501", "1H").eligible_settleable == 1
+
+
+# --- MAJOR-1 (SPEC at 06f5269): market identity on the counting path -------------------------------
+#
+# `cache_key = (chain_index, token, bar)`. Dropping `chain_index` survived the ENTIRE suite: the test
+# above had the right idea - one token address on both chains - but built byte-identical series for
+# each, so reusing one for the other produced the same settlement and the vector could not tell a
+# chain-scoped cache from a chain-blind one.
+#
+# This is the packet's own named sharpest failure mode - "settle every trial of the season against
+# the wrong market, with counts that look entirely plausible" - recurring at the cache layer, and it
+# is the C18 constancy defect: the fixture held constant the very thing the test's name varies.
+
+
+async def test_the_candle_cache_is_keyed_by_market_identity():
+    """One token address, two chains, candles for 501 ONLY. A chain-blind cache mis-settles.
+
+    196 is probed first and caches its EMPTY series under the token+bar alone; 501 then reuses it and
+    its genuinely settleable trial vanishes. HEAD: (501,1m)=1. Chain-blind: (501,1m)=0.
+    """
+    pages = {
+        "196": [_page([_sig(chain="196", token="SAME")])],
+        "501": [_page([_sig(chain="501", token="SAME")])],
+    }
+    series = _both_bars("501", "SAME", BASE_MS)  # nothing for 196 at all
+    result = await run_matrix_probe(FakeMarketClient(pages, series), _filters())
+    assert _count_for(result, "501", "1m").eligible_settleable == 1
+    assert _count_for(result, "501", "1H").eligible_settleable == 1
+    assert _count_for(result, "196", "1m").eligible_settleable == 0
+    assert _count_for(result, "196", "1H").eligible_settleable == 0
+
+
+async def test_the_candle_cache_does_not_lend_one_chains_candles_to_another():
+    """The mirror direction: candles for 196 ONLY. A chain-blind cache OVER-counts 501 off 196's
+    series. Both directions are pinned because either one settles against the wrong market."""
+    pages = {
+        "196": [_page([_sig(chain="196", token="SAME")])],
+        "501": [_page([_sig(chain="501", token="SAME")])],
+    }
+    series = _both_bars("196", "SAME", BASE_MS)  # nothing for 501 at all
+    result = await run_matrix_probe(FakeMarketClient(pages, series), _filters())
+    assert _count_for(result, "196", "1H").eligible_settleable == 1
+    assert _count_for(result, "501", "1H").eligible_settleable == 0
+    assert _count_for(result, "501", "1H").rejection_reasons == {"no_candles_returned": 1}
+
+
+async def test_each_chain_is_fetched_its_own_candles():
+    """The cache must not suppress the second chain's fetch. Recorded calls name both chains."""
+    pages = {
+        "196": [_page([_sig(chain="196", token="SAME")])],
+        "501": [_page([_sig(chain="501", token="SAME")])],
+    }
+    client = FakeMarketClient(pages, {**_both_bars("196", "SAME", BASE_MS), **_both_bars("501", "SAME", BASE_MS)})
+    await run_matrix_probe(client, _filters())
+    assert sorted({(chain, token, bar) for chain, token, bar, _, _ in client.candle_calls}) == [
+        ("196", "SAME", "1H"),
+        ("196", "SAME", "1m"),
+        ("501", "SAME", "1H"),
+        ("501", "SAME", "1m"),
+    ]
 
 
 # --- the horizon ----------------------------------------------------------------------------------
@@ -1292,6 +1402,19 @@ async def test_a_signal_missing_the_filtered_wallet_type_is_rejected(wallet_type
     assert _count_for(result, "501", "1m").rejection_reasons == {"wallet_type_filter": 1}
 
 
+async def test_a_wallet_type_code_that_merely_contains_the_filter_is_rejected():
+    """`walletType="11"` must not satisfy a filter of `"1"`.
+
+    Membership is over comma-separated CODES, not substrings. SPEC argued a substring match
+    equivalent because §5.1 pins single-digit codes, so the collision is unreachable on the
+    documented domain - a sound argument that expires the day OKX emits a two-digit code. Pinning it
+    costs one vector and makes the argument unnecessary.
+    """
+    pages = {"501": [_page([_sig(wallet_type="11")])]}
+    result = await run_matrix_probe(FakeMarketClient(pages), _filters())
+    assert _count_for(result, "501", "1m").rejection_reasons == {"wallet_type_filter": 1}
+
+
 async def test_a_multi_category_wallet_type_that_includes_the_filter_is_kept():
     pages = {"501": [_page([_sig(wallet_type="1,2")])]}
     client = FakeMarketClient(pages, _both_bars("501", "TOK", BASE_MS))
@@ -1349,7 +1472,27 @@ async def test_candles_are_fetched_once_per_token_and_bar():
     pages = {"501": [_page([_sig(t0=BASE_MS), _sig(t0=BASE_MS + COOLDOWN_MS)])]}
     client = FakeMarketClient(pages, _both_bars("501", "TOK", BASE_MS))
     await run_matrix_probe(client, _filters())
-    assert sorted(client.candle_calls) == [("501", "TOK", "1H"), ("501", "TOK", "1m")]
+    assert sorted((c, t, b) for c, t, b, _, _ in client.candle_calls) == [("501", "TOK", "1H"), ("501", "TOK", "1m")]
+
+
+async def test_the_frozen_candle_limit_reaches_the_client():
+    """CANDLE_LIMIT sets the DEPTH of the live retention answer, and no fake observed it.
+
+    Mutating it 100 -> 5 survived the whole suite (SPEC MINOR-4). The module's own docstring calls
+    the resulting window "the retention observation §5.1 asks for" and that answer decides H6.1, so
+    one number carries it. Asserted against a LITERAL as well as the constant: a vector derived from
+    the constant under test cannot detect that constant moving.
+    """
+    client = FakeMarketClient({"501": [_page([_sig()])]}, _both_bars("501", "TOK", BASE_MS))
+    await run_matrix_probe(client, _filters())
+    assert client.candle_calls, "no candle was fetched - this vector does not exercise the boundary"
+    for _, _, _, limit, before_ms in client.candle_calls:
+        assert limit == 100
+        # `before_ms` is deliberately never passed: its wire semantics are not pinned by the frozen
+        # contract, and guessing a pagination direction would skew every close_ts. Pinned so the
+        # deliberate omission cannot become an accidental inclusion.
+        assert before_ms is None
+    assert preflight.CANDLE_LIMIT == 100
 
 
 async def test_a_client_error_is_never_absorbed_into_an_empty_probe():
@@ -1382,11 +1525,60 @@ async def test_a_single_non_buy_signal_unconfirms_the_whole_probe(direction):
     assert result.direction_semantics_confirmed is False
 
 
-async def test_contradictory_direction_markers_unconfirm_the_probe():
-    """`direction="buy"` beside `side="sell"` says we do not understand the schema. Reading only the
-    first marker found would confirm buy semantics off a payload that contradicts itself."""
-    pages = {"501": [_page([{**_sig(direction="buy"), "side": "sell"}])]}
-    result = await run_matrix_probe(FakeMarketClient(pages), _filters())
+@pytest.mark.parametrize(
+    ("buy_key", "sell_key"),
+    [("direction", "side"), ("side", "signalType"), ("signalType", "tradeDirection"), ("tradeDirection", "direction")],
+)
+async def test_contradictory_direction_markers_unconfirm_the_probe(buy_key, sell_key):
+    """A payload contradicting itself says we do not understand its schema.
+
+    Parametrized across all four keys rather than the `direction`/`side` pair alone: with only that
+    pair exercised, deleting `signalType` or `tradeDirection` from _DIRECTION_KEYS survived the whole
+    suite, and under that mutant a payload contradicting under the deleted key would CONFIRM buy
+    polarity - fail-open on the polarity surface (SPEC MINOR-3).
+    """
+    raw = {**_sig(drop=("direction",)), buy_key: "buy", sell_key: "sell"}
+    result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
+    assert result.direction_semantics_confirmed is False
+
+
+@pytest.mark.parametrize("key", ["direction", "side", "signalType", "tradeDirection"])
+async def test_every_direction_key_is_actually_consulted(key):
+    """Each of the four keys in _DIRECTION_KEYS must be read, in BOTH directions.
+
+    Removing any one from the tuple makes a payload labelled only under it read as "no marker
+    present": the buy case then yields False (fail-closed, caught here) and a contradiction under it
+    yields True (fail-OPEN, caught by the test above). The tuple's declared REACH is the property.
+    """
+    buy = {**_sig(drop=("direction",)), key: "buy"}
+    confirmed = await run_matrix_probe(FakeMarketClient({"501": [_page([buy])]}), _filters())
+    assert confirmed.direction_semantics_confirmed is True
+
+    sell = {**_sig(drop=("direction",)), key: "sell"}
+    contradicted = await run_matrix_probe(FakeMarketClient({"501": [_page([sell])]}), _filters())
+    assert contradicted.direction_semantics_confirmed is False
+
+
+@pytest.mark.parametrize("marker", ["buy", "b", "long", "BUY", "Long", "  buy  "])
+async def test_every_recognized_buy_marker_confirms(marker):
+    """Each member of _BUY_MARKERS, plus the case-folding and stripping the reader applies.
+
+    Only lowercase `"buy"` was exercised, so removing `"long"` or `"b"` from the set survived, and so
+    did dropping `.casefold()` - `"BUY"` would then read as unrecognized. Both fail CLOSED, which is
+    why they rank below the fail-open gap above, but an unpinned marker set is still an unpinned
+    constant that enumeration category (a) claims to cover.
+    """
+    raw = {**_sig(drop=("direction",)), "direction": marker}
+    result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
+    assert result.direction_semantics_confirmed is True
+
+
+@pytest.mark.parametrize("marker", ["sell", "short", "1", "0", "buy_maybe", ""])
+async def test_no_unrecognized_marker_is_read_as_a_buy(marker):
+    """The closed half of the same constant: nothing outside the set may confirm polarity. `"1"` and
+    `"0"` are here deliberately - a numeric side code is an ENCODING GUESS and must never confirm."""
+    raw = {**_sig(drop=("direction",)), "direction": marker}
+    result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
     assert result.direction_semantics_confirmed is False
 
 
@@ -1421,9 +1613,7 @@ async def test_an_unconfirmed_direction_survives_a_fully_qualified_matrix():
     """End-to-end: real counts, unreadable polarity, no season."""
     tokens = [f"T{i}" for i in range(3)]
     pages = {
-        "501": [
-            _page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, drop=("direction",)) for i, t in enumerate(tokens)])
-        ]
+        "501": [_page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, drop=("direction",)) for i, t in enumerate(tokens)])]
     }
     series = {}
     for i, token in enumerate(tokens):
@@ -1444,8 +1634,12 @@ def test_the_preflight_module_imports_no_http_client():
     assert not re.search(r"^\s*(import|from)\s+(httpx|requests|aiohttp|urllib)\b", source, re.MULTILINE)
 
 
+def _run_preflight_path():
+    return Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+
+
 def _load_run_preflight():
-    script = Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    script = _run_preflight_path()
     assert script.exists(), f"operator script missing at {script}"
     spec = importlib_util.spec_from_file_location("run_preflight_under_test", script)
     module = importlib_util.module_from_spec(spec)
