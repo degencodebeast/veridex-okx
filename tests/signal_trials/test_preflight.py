@@ -2126,7 +2126,7 @@ def _set_sentinel_credentials(monkeypatch):
     monkeypatch.setenv("OKX_PASSPHRASE", "SENTINEL-PASS-DO-NOT-LEAK")
 
 
-def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script, tmp_path, capsys):
+def test_main_aborts_without_credentials_and_RECORDS_the_abort(operator_script, tmp_path, capsys):
     """ABSENCE is decided HERE, and this is the only place in the codebase where it is decided.
 
     Both reviewers verified carry-forward 5 as SATISFIED and were right at the level they measured:
@@ -2137,9 +2137,15 @@ def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script,
     """
     out = tmp_path / "preflight_result.json"
     assert operator_script.main(["--out", str(out)]) == 2
-    # ABSENCE is a property of the FILESYSTEM, not of a return value.
-    assert not out.exists(), "an aborted run must leave ABSENCE, not a failure artifact"
-    assert list(tmp_path.iterdir()) == []
+    # CONTRACT CHANGED at this head, and the earlier assertion (`not out.exists()`) encoded the
+    # milestone MAJOR-1: writing nothing leaves whatever a PREVIOUS run left, and H2.4 reads the
+    # artifact and never sees the terminal. The path must describe THIS invocation.
+    assert out.exists()
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] == "aborted"
+    assert payload["season_status"] is None
+    assert payload["counts"] == []
+    assert "MissingCredentialError" in payload["failure_reason"]
     # STANDING LESSON 62: a guard firing is not the guard under test. Exit 2 alone cannot say WHICH
     # guard produced it, so identify the cause - the message must name every missing variable.
     stderr = capsys.readouterr().err
@@ -2221,6 +2227,93 @@ def test_main_does_not_swallow_an_operator_interrupt(operator_script, tmp_path, 
     assert not out.exists(), "an interrupted run must not claim the probe FAILED"
 
 
+def _seed_qualified_artifact(path):
+    """Put a genuinely consumable, qualified artifact at `path` - what a previous good run leaves."""
+    matrix = _full(41, 0, 0, 0)
+    write_preflight_result(select_combo(matrix), matrix, path)
+    seeded = json.loads(path.read_text())
+    assert seeded["probe_status"] == "completed" and seeded["season_status"] == "qualified"
+    return seeded
+
+
+@pytest.mark.parametrize(
+    ("argv_extra", "exit_code", "status"),
+    [(["--min-trials", "1"], 3, "refused"), ([], 2, "aborted")],
+    ids=["policy-refusal-exit-3", "credential-abort-exit-2"],
+)
+def test_a_pre_probe_stop_makes_a_PREVIOUS_artifact_unconsumable(
+    operator_script, tmp_path, monkeypatch, argv_extra, exit_code, status
+):
+    """MILESTONE MAJOR-1. Re-running the fixed `--out preflight_result.json` command is NORMAL, so
+    an artifact from the last run is normally already sitting there.
+
+    Every earlier vector started from an ABSENT path, which is the condition that hides this: the
+    fixture held "no prior artifact exists" constant, so `not out.exists()` passed for a reason that
+    had nothing to do with the refusal. Here the path starts with a genuinely QUALIFIED artifact -
+    exactly what H2.4 would consume - and the refusal must make it unconsumable.
+    """
+    if exit_code == 3:
+        _set_sentinel_credentials(monkeypatch)
+    out = tmp_path / "preflight_result.json"
+    seeded = _seed_qualified_artifact(out)
+
+    reached = []
+
+    async def probe(creds, args):
+        reached.append(args)
+        return _full(41, 0, 0, 0)
+
+    monkeypatch.setattr(operator_script, "_probe", probe)
+    assert operator_script.main(["--out", str(out), *argv_extra]) == exit_code
+    assert reached == [], "no probe may run on a pre-probe stop"
+
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] == status, "the authoritative path still describes the OLD run"
+    assert payload["season_status"] is None, "a stopped run must make no season claim"
+    assert payload["counts"] == []
+    assert payload != seeded
+
+    # The previous artifact is preserved but MOVED, so nothing consumable was destroyed and nothing
+    # stale remains at the path H2.4 reads.
+    superseded = out.with_name(out.name + ".superseded")
+    assert superseded.exists()
+    assert json.loads(superseded.read_text()) == seeded
+
+
+@pytest.mark.parametrize(
+    ("argv_extra", "status"), [(["--min-trials", "1"], "refused"), ([], "aborted")],
+    ids=["refused", "aborted"],
+)
+def test_a_stopped_run_is_not_consumable_as_a_completed_one(operator_script, tmp_path, monkeypatch, argv_extra, status):
+    """The property H2.4 actually depends on, asserted as H2.4 would test it."""
+    if status == "refused":
+        _set_sentinel_credentials(monkeypatch)
+    out = tmp_path / "preflight_result.json"
+    _seed_qualified_artifact(out)
+    operator_script.main(["--out", str(out), *argv_extra])
+
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] not in ("completed",), "a stopped run must never read as completed"
+    assert payload["probe_status"] in preflight.NOT_RUN_STATUSES
+    assert list(payload) == RESULT_KEYS, "a stopped run uses the SAME schema - no KeyError for a reader"
+
+
+def test_write_preflight_not_run_refuses_a_status_that_means_a_probe_RAN(tmp_path):
+    """`completed` and `failed` describe a probe that ran; this writer is for one that did not."""
+    out = tmp_path / "x.json"
+    for bad in ("completed", "failed"):
+        with pytest.raises(PreflightError, match="is for a run that never probed"):
+            preflight.write_preflight_not_run(bad, "reason", out)
+    assert not out.exists()
+
+
+def test_superseding_is_a_no_op_when_nothing_was_there(tmp_path):
+    """A first-ever run must not manufacture a superseded file out of nothing."""
+    out = tmp_path / "preflight_result.json"
+    assert preflight.supersede_existing_artifact(out) is None
+    assert not out.with_name(out.name + ".superseded").exists()
+
+
 def test_main_writes_a_completed_artifact_on_success(operator_script, tmp_path, monkeypatch):
     """The COMPLETED state and exit 0. Deleting the write, or returning 1, left 463 tests green."""
     _set_sentinel_credentials(monkeypatch)
@@ -2269,8 +2362,11 @@ def test_main_REFUSES_a_non_frozen_season_policy(operator_script, tmp_path, monk
     out = tmp_path / "preflight_result.json"
     assert operator_script.main(["--out", str(out), flag, value]) == 3
 
-    assert not out.exists(), "a refused run must leave ABSENCE, not an artifact"
     assert reached == [], "the probe must not run at all under a non-frozen policy"
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] == "refused"
+    assert payload["season_status"] is None
+    assert payload["counts"] == []
     stderr = capsys.readouterr().err
     assert "refused before any request" in stderr
     assert flag in stderr and str(frozen) in stderr and value in stderr
@@ -2371,7 +2467,7 @@ def test_main_returns_a_distinct_exit_code_per_outcome(
     # identifies WHICH path produced it, so a wrong-guard pass is impossible.
     stderr = capsys.readouterr().err
     if scenario == "abort":
-        assert not out.exists()
+        assert json.loads(out.read_text())["probe_status"] == "aborted"
         assert "OKX_API_KEY" in stderr
     elif scenario == "failure":
         assert json.loads(out.read_text())["failure_reason"].startswith("RuntimeError: boom")

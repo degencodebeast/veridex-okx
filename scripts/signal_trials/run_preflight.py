@@ -49,12 +49,16 @@ from veridex.signal_trials.preflight import (
     FROZEN_COOLDOWN_MS,
     FROZEN_HORIZON_MS,
     FROZEN_MIN_TRIALS,
+    PROBE_ABORTED,
+    PROBE_REFUSED,
     SIGNAL_SOURCE_DIRECTION,
     ComboSelection,
     MatrixProbeResult,
     run_matrix_probe,
     select_combo,
+    supersede_existing_artifact,
     write_preflight_failure,
+    write_preflight_not_run,
     write_preflight_result,
 )
 
@@ -284,22 +288,38 @@ async def _probe(creds: OKXCredentials, args: argparse.Namespace) -> MatrixProbe
         )
 
 
+def _record_not_run(probe_status: str, reason: str, out: Path, verb: str) -> None:
+    """Leave the authoritative path describing THIS invocation, not a previous one.
+
+    An earlier revision wrote nothing here, reasoning that a run which probed nothing should leave
+    ABSENCE. That reasoning was right about the state and wrong about how to express it: absence is
+    only honest when the path is genuinely absent, and re-running the fixed
+    `--out preflight_result.json` command means an artifact from the LAST run is normally sitting
+    there. A refusal that writes nothing therefore leaves H2.4 a stale combo it cannot tell apart
+    from this run's result, because H2.4 reads the artifact and never sees the terminal.
+
+    So: move any previous artifact aside, then record what actually happened.
+    """
+    superseded = supersede_existing_artifact(out)
+    write_preflight_not_run(probe_status, reason, out)  # type: ignore[arg-type]
+    print(f"preflight {verb} before any request: {reason}", file=sys.stderr)
+    if superseded is not None:
+        print(f"the previous artifact was moved to {superseded} and is no longer consumable", file=sys.stderr)
+    print(f"{out} now records probe_status={probe_status!r}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         assert_frozen_policy(args)
     except NonFrozenPolicyError as exc:
-        # No artifact: a refused run probed nothing, so ABSENCE is the honest state, and writing a
-        # failure record would claim an attempt that never happened.
-        print(f"preflight refused before any request: {exc}", file=sys.stderr)
+        _record_not_run(PROBE_REFUSED, f"NonFrozenPolicyError: {exc}", args.out, "refused")
         return 3
 
     try:
         creds = credentials_from_env(os.environ)
     except MissingCredentialError as exc:
-        # No artifact: nothing was probed, so ABSENCE is the honest state. Writing a failure record
-        # here would claim a probe was attempted.
-        print(f"preflight aborted before any request: {exc}", file=sys.stderr)
+        _record_not_run(PROBE_ABORTED, f"MissingCredentialError: {exc}", args.out, "aborted")
         return 2
 
     secrets = [creds.api_key, creds.secret_key, creds.passphrase]

@@ -83,9 +83,24 @@ COMBO_ORDER: tuple[tuple[str, str], ...] = (("196", "1m"), ("501", "1m"), ("196"
 SeasonStatus = Literal["qualified", "exploratory", "no_season"]
 _SEASON_STATUSES: frozenset[str] = frozenset({"qualified", "exploratory", "no_season"})
 
-ProbeStatus = Literal["completed", "failed"]
+# FOUR probe statuses, because the output path must ALWAYS describe the invocation that just ran.
+# `completed` and `failed` are outcomes of a probe that ran. `refused` and `aborted` are outcomes of
+# a run that stopped BEFORE the probe - a non-frozen season policy, and missing credentials. They are
+# kept distinct rather than collapsed into one "not run" value because collapsing distinguishable
+# states is the defect this task has now hit four times.
+ProbeStatus = Literal["completed", "failed", "refused", "aborted"]
 PROBE_COMPLETED: ProbeStatus = "completed"
 PROBE_FAILED: ProbeStatus = "failed"
+PROBE_REFUSED: ProbeStatus = "refused"
+PROBE_ABORTED: ProbeStatus = "aborted"
+
+# Statuses that mean NO PROBE RAN. H2.4 must not consume an artifact carrying one.
+NOT_RUN_STATUSES: frozenset[str] = frozenset({PROBE_REFUSED, PROBE_ABORTED})
+
+# Where a superseded artifact is moved when a pre-probe refusal replaces it. A single slot, so a
+# second refusal overwrites the first - the operator keeps the most recent prior artifact, and the
+# name is deterministic so a test can assert it rather than glob for a timestamp.
+SUPERSEDED_SUFFIX = ".superseded"
 
 # Runaway guard on cursor pagination. Hitting it RAISES rather than returning what was collected:
 # §5.1 requires per-combo counts to be auditable, and a truncated count reported as THE count is a
@@ -766,6 +781,61 @@ def write_preflight_result(sel: ComboSelection, result: MatrixProbeResult, path:
             rejection_reasons=aggregate,
             direction_semantics_confirmed=result.direction_semantics_confirmed,
             failure_reason=None,
+        ),
+    )
+
+
+def supersede_existing_artifact(path: Path) -> Path | None:
+    """Move any artifact already at ``path`` aside, atomically, and return where it went.
+
+    A pre-probe refusal must leave nothing CONSUMABLE at the authoritative path, but destroying a
+    legitimate earlier result because an operator mistyped a flag would be its own defect. Renaming
+    satisfies both: the previous bytes survive under a name H2.4 does not read, and the authoritative
+    path is free for a record of the run that actually just happened.
+
+    Returns:
+        The path the previous artifact was moved to, or ``None`` if there was nothing there.
+    """
+    if not path.exists():
+        return None
+    superseded = path.with_name(path.name + SUPERSEDED_SUFFIX)
+    os.replace(path, superseded)
+    return superseded
+
+
+def write_preflight_not_run(probe_status: ProbeStatus, reason: str, path: Path) -> None:
+    """Record that a run stopped BEFORE the probe, at the authoritative path.
+
+    This exists because ABSENCE is only honest when the path is genuinely absent. A refused run that
+    writes nothing leaves whatever a PREVIOUS run left behind, and H2.4 - which reads the artifact
+    and cannot see the terminal - would consume a stale combo as though it were this invocation's
+    result. The machine-readable contract exists precisely so correctness does not depend on
+    terminal history.
+
+    ``season_status`` is null and ``counts`` is empty for the same reason they are on a failure: no
+    observation was made, and four zeroes would be a claim.
+
+    Raises:
+        PreflightError: If ``probe_status`` is not a not-run status, or ``reason`` is blank.
+    """
+    if probe_status not in NOT_RUN_STATUSES:
+        raise PreflightError(
+            f"write_preflight_not_run is for a run that never probed; got probe_status "
+            f"{probe_status!r}, expected one of {sorted(NOT_RUN_STATUSES)}"
+        )
+    if not reason.strip():
+        raise PreflightError("failure_reason must be non-empty: a refusal with no reason is not a record")
+    _write_atomic(
+        path,
+        _artifact(
+            probe_status=probe_status,
+            season_status=None,
+            chain_index=None,
+            bar=None,
+            counts=[],
+            rejection_reasons={},
+            direction_semantics_confirmed=False,
+            failure_reason=reason,
         ),
     )
 
