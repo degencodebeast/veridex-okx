@@ -184,6 +184,12 @@ def test_rejected_commit_price_is_never_echoed():
     assert "13.37" not in str(exc.value) and "bogus" not in str(exc.value)
 
 
+def test_enabled_development_config_still_validates_the_price():
+    """Enabled-and-not-production can charge, and is exactly what the stock 402 layer runs."""
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_PRICE"):
+        load_x402_settings({**DEV_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": "free"})
+
+
 def test_disabled_development_config_tolerates_an_unusable_price():
     """No gate mounts, so a junk price is inert and must not block startup."""
     s = load_x402_settings({"APP_ENV": "development", "X402_ENABLED": "false", "SIGNAL_TRIALS_COMMIT_PRICE": "free"})

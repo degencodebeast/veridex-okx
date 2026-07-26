@@ -2,7 +2,8 @@
 
 Fail-closed by construction: a production ``APP_ENV`` may not run with x402
 disabled, without a valid payout address, or against the in-memory
-:class:`FakeFacilitator`.
+:class:`FakeFacilitator`; and no configuration that can charge — production or
+merely enabled — may carry an invalid commit price.
 """
 
 from __future__ import annotations
@@ -280,14 +281,24 @@ class FakeFacilitatorClientAdapter:
 
 
 def _is_test_double(facilitator: object) -> bool:
-    """Report whether ``facilitator`` is the fake or anything wrapping it.
+    """Report whether ``facilitator`` is the fake, its adapter, or a direct holder of a bare fake.
 
     An ``isinstance(facilitator, FakeFacilitator)`` check alone stopped being
     sufficient the moment an adapter existed: the adapter is not a
     ``FakeFacilitator``, so passing it directly would launder the fake straight
-    past the production guard. The final clause is structural rather than
-    nominal — anything holding a fake is refused on what it *contains*, so a
-    future wrapper cannot slip through by simply being a new class.
+    past the production guard.
+
+    The final clause adds exactly one further shape — an attribute literally
+    named ``fake`` holding a **bare** ``FakeFacilitator``. Subclasses of either
+    type are covered too, since ``isinstance`` follows inheritance.
+
+    Known residual, accepted for H1.1: the check is name-dependent and one level
+    deep. A wrapper that stores the fake under any other name (``_fake``,
+    ``inner``, inside a list, captured in a closure) is NOT refused, and neither
+    is ``self.fake = FakeFacilitatorClientAdapter(...)`` — the attribute name is
+    right but an adapter is not a ``FakeFacilitator``. No production path builds
+    such a wrapper; reaching the gap takes authoring a novel class in-repo and
+    passing ``is_production=True``.
     """
     if isinstance(facilitator, FakeFacilitator | FakeFacilitatorClientAdapter):
         return True
