@@ -37,12 +37,19 @@ from typing import Any
 
 import httpx
 
-from veridex.signal_trials.okx_client import OKXCredentials, OKXMarketClient, SignalFilters
+from veridex.signal_trials.okx_client import (
+    CandleSeries,
+    OKXCredentials,
+    OKXMarketClient,
+    SignalFilters,
+    SignalPage,
+)
 from veridex.signal_trials.preflight import (
     COMBO_ORDER,
     FROZEN_COOLDOWN_MS,
     FROZEN_HORIZON_MS,
     FROZEN_MIN_TRIALS,
+    SIGNAL_SOURCE_DIRECTION,
     ComboSelection,
     MatrixProbeResult,
     run_matrix_probe,
@@ -109,6 +116,41 @@ class HttpxTransport:
         if not isinstance(payload, dict):
             raise TypeError(f"OKX response must be a JSON object, got {type(payload).__name__}")
         return payload
+
+
+class FrozenSignalListSource:
+    """Binds an OKX client to the frozen Signal List endpoint AND attests that endpoint's polarity.
+
+    Polarity is a property of the endpoint, so the only party that can attest it is whoever bound
+    the client to one — which is this file, and only this file. `POST /api/v6/dex/market/signal/list`
+    is documented as "Get latest buy-direction token signals", and its documented rows carry no
+    direction member at all, so no row-level check can establish what the endpoint already
+    guarantees.
+
+    The attestation is deliberately NOT on `OKXMarketClient` itself: that class is a generic reader
+    which will happily be pointed at another path, and it is outside this task's ownership. Putting
+    the declaration on the binding rather than on the reader is what makes a future generalisation
+    fail closed instead of silently inheriting a guarantee it no longer has.
+    """
+
+    signal_source_direction = SIGNAL_SOURCE_DIRECTION
+
+    def __init__(self, client: OKXMarketClient) -> None:
+        self._client = client
+
+    async def list_signals(self, f: SignalFilters, cursor: str | None = None) -> SignalPage:
+        return await self._client.list_signals(f, cursor)
+
+    async def get_candles(
+        self,
+        chain_index: str,
+        token: str,
+        bar: str,
+        *,
+        before_ms: int | None = None,
+        limit: int = 100,
+    ) -> CandleSeries:
+        return await self._client.get_candles(chain_index, token, bar, before_ms=before_ms, limit=limit)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -232,9 +274,9 @@ def render_summary(sel: ComboSelection, result: MatrixProbeResult) -> str:
 async def _probe(creds: OKXCredentials, args: argparse.Namespace) -> MatrixProbeResult:
     """Construct the live transport and run the probe. The only network path in this repository."""
     async with httpx.AsyncClient(base_url=creds.base_url, timeout=REQUEST_TIMEOUT_SECONDS) as http:
-        client = OKXMarketClient(HttpxTransport(http), creds)
+        source = FrozenSignalListSource(OKXMarketClient(HttpxTransport(http), creds))
         return await run_matrix_probe(
-            client,
+            source,
             filters_by_chain(),
             cooldown_ms=args.cooldown_ms,
             horizon_ms=args.horizon_ms,

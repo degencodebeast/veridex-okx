@@ -901,7 +901,14 @@ def test_the_writer_refuses_a_malformed_matrix(tmp_path):
 
 
 class FakeMarketClient:
-    """In-memory stand-in for OKXMarketClient. Holds literal payloads; performs no I/O of any kind."""
+    """In-memory stand-in for the frozen Signal List source. Holds literal payloads; no I/O at all.
+
+    It DECLARES `signal_source_direction` because that is what it is standing in for: a client bound
+    to the documented buy-direction endpoint. A fake that forgets the declaration fails closed, which
+    is the point - the declaration is the thing being relied on, so a stand-in has to state it too.
+    """
+
+    signal_source_direction = "buy"
 
     def __init__(self, pages_by_chain=None, series_by_key=None, *, fail_on=None):
         self.pages_by_chain = pages_by_chain or {}
@@ -1584,6 +1591,8 @@ async def test_probe_follows_the_cursor_across_pages():
 class EndlessCursorClient:
     """Always answers with another cursor, so pagination never terminates on its own."""
 
+    signal_source_direction = "buy"
+
     def __init__(self):
         self.pages_served = 0
 
@@ -1717,6 +1726,62 @@ async def test_no_unrecognized_marker_is_read_as_a_buy(marker):
     `"0"` are here deliberately - a numeric side code is an ENCODING GUESS and must never confirm."""
     raw = {**_sig(), "direction": marker}
     result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
+    assert result.direction_semantics_confirmed is False
+
+
+# The documented Signal List response schema, transcribed field-for-field from
+# .agents/skills/okx-dex-market/references/signal-cli-reference.md section 3 "Return fields".
+# NOTHING is added. This list is the thing the fixture is checked against, and it is written out
+# rather than derived from the fixture - a vector derived from the thing under test cannot detect
+# that thing drifting.
+DOCUMENTED_SIGNAL_ROW_FIELDS = {
+    "timestamp", "chainIndex", "price", "walletType", "triggerWalletCount",
+    "triggerWalletAddress", "amountUsd", "soldRatioPercent", "cursor", "token",
+}
+DOCUMENTED_SIGNAL_TOKEN_FIELDS = {
+    "tokenAddress", "symbol", "name", "logo", "marketCapUsd", "holders", "top10HolderPercent",
+}
+
+
+def test_the_fixture_matches_the_DOCUMENTED_upstream_schema_field_for_field():
+    """STANDING LESSON 94. At least one vector must be the documented row with nothing invented.
+
+    The previous fixture injected a synthetic `direction` key, so every vector in this file held
+    "a direction field is present" CONSTANT - and the dimension never varied was what a real row
+    looks like. This assertion is what would have caught the milestone MAJOR-1, and it is written
+    as an exact set comparison so an invented member cannot be added without failing here.
+    """
+    row = _sig()
+    assert set(row) == DOCUMENTED_SIGNAL_ROW_FIELDS
+    assert set(row["token"]) == DOCUMENTED_SIGNAL_TOKEN_FIELDS
+    for invented in ("direction", "side", "signalType", "tradeDirection"):
+        assert invented not in row, f"the default fixture invented a {invented!r} member"
+
+
+class UndeclaredSource(FakeMarketClient):
+    """A source that does NOT attest its contractual polarity."""
+
+    signal_source_direction = None
+
+
+class SellSideSource(FakeMarketClient):
+    """A source that attests a polarity other than the frozen buy contract."""
+
+    signal_source_direction = "sell"
+
+
+@pytest.mark.parametrize("source_cls", [UndeclaredSource, SellSideSource], ids=["undeclared", "declares-sell"])
+async def test_a_source_that_does_not_attest_the_buy_contract_FAILS_CLOSED(source_cls):
+    """THE THIRD OUTCOME. Confirmation comes from the source's contract, never from clean rows.
+
+    Absence of a marker under a DECLARED buy-direction source is confirmation by contract;
+    a contradicting marker is refusal; and an UNDECLARED source is refusal too. These rows are
+    byte-identical to the ones that confirm in the test below - the ONLY difference is whether the
+    source attests what endpoint it is bound to. Without this, generalising the client to a source
+    whose polarity is not contractually fixed would silently inherit a guarantee it no longer has.
+    """
+    pages = {"501": [_page([_sig()])]}
+    result = await run_matrix_probe(source_cls(pages), _filters())
     assert result.direction_semantics_confirmed is False
 
 
@@ -2299,6 +2364,60 @@ async def test_the_transport_preserves_param_iteration_order(operator_script):
     )
     assert list(http.calls[0]["params"]) == ["chainIndex", "tokenContractAddress", "bar", "limit"]
     assert http.calls[0]["headers"] == {"OK-ACCESS-KEY": "k"}
+
+
+async def test_the_probe_hands_run_matrix_probe_the_ATTESTING_binding(operator_script, monkeypatch):
+    """The wiring, not just the wrapper. Unwrapping the client would make the LIVE Gate B run fail
+    closed - every conforming response unconfirmed, no season - and nothing in the suite noticed.
+
+    No live request is possible here: httpx.AsyncClient is replaced by a stub that does nothing, and
+    run_matrix_probe is intercepted before it can read anything.
+    """
+    captured = {}
+
+    class StubAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def capture(client, filters_by_chain, **kwargs):
+        captured["client"] = client
+        return _full(41, 0, 0, 0)
+
+    monkeypatch.setattr(operator_script.httpx, "AsyncClient", StubAsyncClient)
+    monkeypatch.setattr(operator_script, "run_matrix_probe", capture)
+
+    creds = operator_script.OKXCredentials("k", "s", "p")
+    await operator_script._probe(creds, operator_script.parse_args(["--out", "x.json"]))
+
+    assert "client" in captured, "run_matrix_probe was never reached - this vector proves nothing"
+    assert isinstance(captured["client"], operator_script.FrozenSignalListSource)
+    assert captured["client"].signal_source_direction == preflight.SIGNAL_SOURCE_DIRECTION
+
+
+async def test_the_operator_binding_attests_the_frozen_endpoint_contract(operator_script):
+    """The ONE place that can attest polarity: whoever bound the client to an endpoint.
+
+    The attestation lives on the BINDING, not on OKXMarketClient - that class is a generic reader
+    that will happily be pointed elsewhere, and it is outside this task's ownership. If the real
+    run stopped going through this wrapper, the probe would fail closed rather than inherit a
+    guarantee it no longer has.
+    """
+    assert operator_script.FrozenSignalListSource.signal_source_direction == "buy"
+    assert operator_script.FrozenSignalListSource.signal_source_direction == preflight.SIGNAL_SOURCE_DIRECTION
+
+    inner = FakeMarketClient({"501": [_page([_sig()])]}, _both_bars("501", "TOK", BASE_MS))
+    bound = operator_script.FrozenSignalListSource(inner)
+    page = await bound.list_signals(SignalFilters(chain_index="501"))
+    assert len(page.signals) == 1
+    series = await bound.get_candles("501", "TOK", "1H")
+    assert series.bar == "1H"
+    assert inner.candle_calls == [("501", "TOK", "1H", 100, None)]
 
 
 def test_the_operator_filters_cover_every_chain_in_the_frozen_matrix(operator_script):

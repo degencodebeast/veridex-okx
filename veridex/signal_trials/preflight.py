@@ -39,7 +39,11 @@ Four responsibilities, and each one exists because of a specific way this can go
    counts at all, which is not. Both writers emit the same key set in the same order, so a reader
    can always reach ``probe_status`` without a ``KeyError``.
 
-**Polarity is a property of the ENDPOINT, not of a row.** The frozen source is documented as "latest
+**Polarity is a property of the ENDPOINT, not of a row.** THREE outcomes, not two: a source that
+DECLARES the frozen buy-direction contract and returns rows that do not contradict it is CONFIRMED;
+a row carrying a marker that is not a recognized buy is a REFUSAL; and a source that declares no
+contractual polarity is a REFUSAL as well, however clean its rows look.
+ The frozen source is documented as "latest
 buy-direction token signals" and its documented rows carry no direction member whatsoever, so the
 probe confirms buy semantics when it has READ rows from that source and nothing in them contradicts
 the contract. It still fails closed: zero rows confirm nothing, and any row that volunteers a marker
@@ -155,9 +159,19 @@ class PreflightError(ValueError):
 class MarketClient(Protocol):
     """The read surface ``run_matrix_probe`` needs — structural, so no concrete client is imported.
 
-    ``OKXMarketClient`` satisfies it; so does an in-memory fake. This is the seam that makes it
-    impossible for a test to issue a live request without deliberately constructing a transport.
+    ``signal_source_direction`` is the SOURCE'S DECLARATION of its own contractual polarity, and it
+    is what makes confirmation possible at all. Polarity is a property of the endpoint, so the only
+    party that can attest it is whoever bound the client to an endpoint. A source that declares
+    nothing — or declares something other than the frozen buy contract — CANNOT have its polarity
+    confirmed, and the probe fails closed on it. That is the third outcome: absence of a marker
+    under a DECLARED buy-direction source is confirmation by contract, a contradicting marker is
+    refusal, and an UNDECLARED source is refusal too.
+
+    This is the seam that makes it impossible for a test to issue a live request without
+    deliberately constructing a transport.
     """
+
+    signal_source_direction: str
 
     async def list_signals(self, f: SignalFilters, cursor: str | None = None) -> SignalPage: ...
 
@@ -509,6 +523,12 @@ async def run_matrix_probe(
     if horizon_ms < 1:
         raise PreflightError(f"horizon_ms must be positive, got {horizon_ms!r}")
 
+    # Confirmation comes from the SOURCE'S CONTRACT, never from a row. A source that does not
+    # declare the frozen buy-direction contract cannot have its polarity confirmed at all, however
+    # clean its rows look — the third outcome, and the one that keeps this fail-closed if the client
+    # is ever generalised to a source whose polarity is not contractually fixed.
+    source_declares_buy = getattr(client, "signal_source_direction", None) == SIGNAL_SOURCE_DIRECTION
+
     chains = _probe_chains()
     for chain_index in chains:
         filters = filters_by_chain.get(chain_index)
@@ -575,7 +595,7 @@ async def run_matrix_probe(
             ComboCount(chain_index, bar, counts[(chain_index, bar)], dict(reasons[(chain_index, bar)]))
             for chain_index, bar in COMBO_ORDER
         ),
-        direction_semantics_confirmed=observed > 0 and contradicting == 0,
+        direction_semantics_confirmed=source_declares_buy and observed > 0 and contradicting == 0,
     )
 
 
