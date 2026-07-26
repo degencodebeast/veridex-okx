@@ -1,7 +1,10 @@
+import math
+
 import pytest
 
 from veridex.signal_trials.okx_client import (
     BAR_MS,
+    CANDLE_FIELD_COUNT,
     CandleSeries,
     OKXAPIError,
     OKXCredentials,
@@ -524,3 +527,309 @@ async def test_list_signals_over_correction_control_absence_is_still_lawful():
     final_page = await no_cursor.list_signals(SignalFilters(chain_index="501"))
     assert final_page.signals == (last_row,)
     assert final_page.next_cursor is None
+
+
+# --- H2.6-FINITE (PKT-DEC-C28 ruling 1). A NON-FINITE parsed candle number must be REFUSED here, at
+# the wire boundary, rather than entering `Candle` as a price.
+#
+# `float("1e400")` is not a parse error. It is `inf` — an ordinary-looking decimal that OVERFLOWS —
+# and before this guard that `inf` became `Candle.close`. MEASURED at canonical 39cd310, not assumed:
+# a series whose p0 close parsed as `+inf` made Law's `compute_ext` return `1`, a CONFIDENT
+# "already extended" verdict manufactured from a value that should never have been parsed.
+#
+# The same measurement refined the claim, and the refinement is recorded rather than smoothed over:
+# `-inf` and `NaN` already reach `None` downstream, because `compute_ext` spells its positivity
+# check `not price > 0` precisely so `NaN` cannot slip through. `+inf` is the class that gets a
+# confident answer. That does NOT narrow this guard to `+inf`: all three are off-contract for a
+# candle number, and the reason the guard lands at the parse boundary is exactly that no consumer
+# should have to reason about a value it should never have received. One boundary, every consumer.
+#
+# SCOPE, per C28, is narrow and binding: parsed candle numbers at THIS boundary only. This is NOT a
+# general cross-module finiteness law, and it is NOT a positivity law — §5.3's `p0, p1 > 0` is Law's
+# rule, and the NEGATIVE-value control below exists to keep that boundary from drifting into this
+# module. `Candle`/`CandleSeries` public shape is untouched (C17-R2).
+
+# The documented upstream wire record, column for column, in order, with nothing added (standing
+# lesson 94). Source: `.agents/skills/okx-dex-market/references/market-cli-reference.md`, which
+# documents the API's raw array as `[ts,o,h,l,c,vol,volUsd,confirm]`. Vectors are built FROM this
+# tuple rather than hand-written, so a suite whose fixtures drift from the wire fails rather than
+# quietly testing a schema OKX does not serve.
+DOCUMENTED_CANDLE_COLUMNS = ("ts", "o", "h", "l", "c", "vol", "volUsd", "confirm")
+
+# The six columns parsed with `float()`, mapped to the `Candle` field each must land in. `ts` is
+# parsed with `int()`, which cannot yield a non-finite value (`int("1e400")` raises), and `confirm`
+# is compared as a string — so neither is subject to this guard and neither is listed.
+NUMERIC_COLUMN_TO_FIELD = {
+    "o": "open",
+    "h": "high",
+    "l": "low",
+    "c": "close",
+    "vol": "vol",
+    "volUsd": "vol_usd",
+}
+
+# The three off-contract classes, in the spellings a wire can actually carry. Both `+inf` spellings
+# matter and they fail differently TO A READER: "1e400" contains no hint of infinity at all, while
+# "inf"/"Infinity" are literal. A guard written against the literal spellings — a substring check,
+# say — would pass the overflow straight through, and the overflow is the vector C28 measured.
+NON_FINITE_WIRE_VALUES = ["1e400", "inf", "Infinity", "-1e400", "-inf", "-Infinity", "nan", "NaN"]
+
+# Distinct finite defaults, so a vector that overrides ONE column cannot be mistaken for one that
+# overrode another and a transposition stays visible.
+_FINITE_CANDLE = {
+    "ts": "1753400000000",
+    "o": "11.0",
+    "h": "22.0",
+    "l": "3.0",
+    "c": "14.0",
+    "vol": "55.0",
+    "volUsd": "66.0",
+    "confirm": "1",
+}
+
+
+def _candle_row(**overrides: str) -> list[str]:
+    """One wire candle row, assembled in DOCUMENTED column order with the named columns replaced.
+
+    The unknown-column check is not defensive noise: a typo'd override would otherwise produce a
+    fully finite row, and a rejection test handed a finite row fails as `DID NOT RAISE` — which
+    reads as a defect in the guard rather than a defect in the vector.
+    """
+    unknown = sorted(set(overrides) - set(_FINITE_CANDLE))
+    if unknown:
+        raise AssertionError(f"unknown candle column(s) {unknown}; documented: {list(_FINITE_CANDLE)}")
+    row = {**_FINITE_CANDLE, **overrides}
+    return [row[column] for column in DOCUMENTED_CANDLE_COLUMNS]
+
+
+def _candles_client(rows: list[object]) -> tuple[OKXMarketClient, RecordingFake]:
+    fake = RecordingFake({"code": "0", "data": rows})
+    return OKXMarketClient(fake, OKXCredentials("k", "s", "p")), fake
+
+
+@pytest.mark.parametrize("column", list(NUMERIC_COLUMN_TO_FIELD))
+@pytest.mark.parametrize("raw", NON_FINITE_WIRE_VALUES)
+async def test_get_candles_rejects_a_non_finite_value_in_EVERY_numeric_column(column: str, raw: str):
+    """The full cross product: WHICH column x WHICH off-contract class. Both dimensions vary.
+
+    Holding either constant is the defect class this lane has paid for repeatedly — a vector that
+    always put the bad value in `close`, or always used `nan`, would leave a guard covering one
+    column or one class indistinguishable from one covering all six and all three. Each vector here
+    carries a FINITE value in the other five numeric columns, so the rejection is attributable to
+    the column named in the test id and to no other.
+    """
+    client, _ = _candles_client([_candle_row(**{column: raw})])
+
+    # PKT-DEC-C25: a rejection pin on a settlement path carries `match=`. Bare `pytest.raises` does
+    # not discriminate identity, and `OKXResponseError` is raised by the envelope guard and both
+    # row-shape guards inside this very call — any of which would satisfy an unmatched raises.
+    with pytest.raises(OKXResponseError, match="must be a finite number") as excinfo:
+        await client.get_candles("501", "So1", "1m")
+
+    message = str(excinfo.value)
+    # The message must name the column it rejected. Six columns share one guard, and "something in
+    # this row was wrong" is not a diagnostic. QUOTED, because an unquoted `vol` is a substring of
+    # `volUsd` and would report agreement between the two columns most easily confused.
+    assert f"'{column}'" in message
+    assert f"Candle.{NUMERIC_COLUMN_TO_FIELD[column]}" in message
+    # And the value it saw. Failing loudly means saying what arrived, not only that it was refused.
+    assert repr(raw) in message
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+async def test_get_candles_rejects_a_non_finite_value_in_ANY_ROW_position(position: int):
+    """The guard runs per ROW, not once per series.
+
+    Every other vector in this section holds a single-row series, where a guard applied only to
+    `data[0]` is indistinguishable from one applied to every row. A settlement window is fetched a
+    hundred rows at a time, so position 0 is the LEAST likely place for a bad row to appear — the
+    same reasoning that made the last-row signal vector the silent one in the MAJOR-1 pin above.
+    """
+    timestamps = ("1753400000000", "1753400060000", "1753400120000")
+    rows: list[object] = [_candle_row(ts=ts) for ts in timestamps]
+    rows[position] = _candle_row(ts=timestamps[position], c="1e400")
+
+    # Guards the FIXTURE: the other two rows must be finite, or this would pass for the wrong reason.
+    assert len(rows) == 3
+    assert sum(1 for row in rows if "1e400" in row) == 1
+
+    client, _ = _candles_client(rows)
+
+    with pytest.raises(OKXResponseError, match="must be a finite number") as excinfo:
+        await client.get_candles("501", "So1", "1m")
+
+    assert "'c'" in str(excinfo.value)
+
+
+async def test_the_C28_defect_vector_can_no_longer_become_a_confident_price():
+    """The exact vector PKT-DEC-C28 ruling 1 measured, named so the regression stays findable (C26).
+
+    Recorded as an executed premise rather than a prose claim: `float("1e400")` IS `inf`, so this is
+    not a malformed number the parser rejects — it is a well-formed decimal that overflows silently.
+    Downstream, that `inf` produced `compute_ext -> 1`: a confident "already extended" verdict, not
+    an error. This module is where that stops, and it stops by REFUSING the row, not by repairing it.
+    """
+    assert float("1e400") == float("inf")
+    assert not math.isfinite(float("1e400"))
+
+    client, _ = _candles_client([_candle_row(c="1e400")])
+
+    with pytest.raises(OKXResponseError, match="must be a finite number"):
+        await client.get_candles("501", "So1", "1m")
+
+
+def test_the_non_finite_vectors_are_actually_non_finite_and_cover_all_THREE_classes():
+    """Guards the FIXTURE, not the client — PKT-DEC-C28 ruling 3.
+
+    Every vector above asserts a REJECTION, and a rejection assertion is satisfied by any input the
+    guard happens to refuse. If a later edit made "1e400" into "1e40" the vector would become an
+    ordinary finite price and those assertions would silently stop being about finiteness at all.
+    PREDICATE: `math.isfinite` over each PARSED vector — not a spelling match, which is what the
+    two overflow vectors exist to defeat. EXAMINED: every element of `NON_FINITE_WIRE_VALUES`,
+    counted below rather than assumed.
+    """
+    parsed = [float(raw) for raw in NON_FINITE_WIRE_VALUES]
+    assert len(parsed) == len(NON_FINITE_WIRE_VALUES) == 8
+    assert [math.isfinite(value) for value in parsed] == [False] * 8
+
+    # The three classes must EACH have a vector, because they fail differently. `+inf` and `-inf` are
+    # ordered and compare equal to themselves; `NaN` is neither.
+    assert sum(1 for value in parsed if math.isinf(value) and value > 0) == 3
+    assert sum(1 for value in parsed if math.isinf(value) and value < 0) == 3
+    assert sum(1 for value in parsed if math.isnan(value)) == 2
+
+    # `NaN != NaN`, executed rather than asserted in prose: it is the reason a guard shaped like an
+    # equality or a comparison would have missed this class entirely.
+    not_a_number = float("nan")
+    assert not_a_number != not_a_number
+
+    # At least one vector per SIGN must carry no literal infinity marker, so a substring-shaped guard
+    # cannot pass this suite. Named explicitly — dropping them is exactly the silent regression.
+    literal_free = [raw for raw in NON_FINITE_WIRE_VALUES if "inf" not in raw.lower() and "nan" not in raw.lower()]
+    assert literal_free == ["1e400", "-1e400"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0", 0.0),  # zero — finite, and the first thing an over-eager guard rejects
+        ("-1.5", -1.5),  # NEGATIVE and finite: §5.3's positivity rule is LAW's, not this boundary's
+        ("1e-308", 1e-308),  # tiny, still finite
+        ("1e308", 1e308),  # the largest power of ten that does NOT overflow
+        ("0.000000001", 1e-9),
+        ("14", 14.0),  # integral spelling, no decimal point
+    ],
+)
+async def test_get_candles_still_accepts_EVERY_finite_value_including_negative_and_extreme(raw: str, expected: float):
+    """The over-correction control. A guard that rejected legitimate values would break the
+    settlement law in the opposite direction from the defect it fixed.
+
+    The negative vector is the load-bearing one: it pins that this boundary refuses NON-FINITENESS
+    and nothing else. Inventing a positivity rule here would change a settlement answer from a
+    number to a refusal without authority — which is the CF-1 hazard PKT-DEC-C28 names by name, and
+    which the frozen spec assigns to Law's `compute_ext`, not to this module.
+
+    The value is placed in ALL SIX numeric columns at once, so no column is exempted from the
+    control the way a single-column vector would exempt five.
+    """
+    client, _ = _candles_client([_candle_row(**dict.fromkeys(NUMERIC_COLUMN_TO_FIELD, raw))])
+
+    series = await client.get_candles("501", "So1", "1m")
+
+    # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1): a `None` return would raise AttributeError below.
+    assert isinstance(series, CandleSeries)
+    assert len(series.candles) == 1
+    candle = series.candles[0]
+    assert [candle.open, candle.high, candle.low, candle.close, candle.vol, candle.vol_usd] == [expected] * 6
+    assert all(math.isfinite(value) for value in (candle.open, candle.high, candle.low, candle.close))
+
+
+async def test_the_boundary_is_the_double_OVERFLOW_and_both_sides_of_it_are_exercised():
+    """PKT-DEC-C28 ruling 3: an assertion claiming to exercise a boundary must use an input whose
+    UNGUARDED value differs from the asserted one.
+
+    `1e308` and `1e309` are one exponent apart and neither is remarkable to read. What separates
+    them is measured here, not asserted: `float("1e309")` IS `inf` while `float("1e308")` is an
+    ordinary finite double. Measuring it in the test means the pin cannot silently stop straddling
+    the boundary if a later edit changes either literal.
+    """
+    assert math.isfinite(float("1e308"))
+    assert math.isinf(float("1e309"))
+
+    accepted, _ = _candles_client([_candle_row(c="1e308")])
+    series = await accepted.get_candles("501", "So1", "1m")
+    assert isinstance(series, CandleSeries)
+    assert series.candles[0].close == 1e308
+
+    rejected, _ = _candles_client([_candle_row(c="1e309")])
+    with pytest.raises(OKXResponseError, match="must be a finite number"):
+        await rejected.get_candles("501", "So1", "1m")
+
+
+async def test_the_candle_vector_matches_the_DOCUMENTED_upstream_schema_field_for_field():
+    """Standing lesson 94 — at least one vector pinned to the documented upstream schema, in order,
+    with nothing added.
+
+    Source: `.agents/skills/okx-dex-market/references/market-cli-reference.md`, which documents the
+    raw array as `[ts,o,h,l,c,vol,volUsd,confirm]`. Compared as an EXACT SET as well as an ordered
+    tuple: containment would not see an ADDED column, and a synthetic column held constant across
+    every vector is precisely the drift this lane has already been bitten by once.
+    """
+    assert DOCUMENTED_CANDLE_COLUMNS == ("ts", "o", "h", "l", "c", "vol", "volUsd", "confirm")
+    assert len(DOCUMENTED_CANDLE_COLUMNS) == CANDLE_FIELD_COUNT == 8
+    assert len(set(DOCUMENTED_CANDLE_COLUMNS)) == CANDLE_FIELD_COUNT  # no duplicate column name
+    # The vector is built from the documented tuple and carries NOTHING else.
+    assert set(_FINITE_CANDLE) == set(DOCUMENTED_CANDLE_COLUMNS)
+    assert tuple(_FINITE_CANDLE) == DOCUMENTED_CANDLE_COLUMNS
+    # The finiteness guard covers the six numeric columns and exactly those: `ts` and `confirm` are
+    # not `float()`-parsed, so exempting them is correct rather than an omission.
+    assert set(DOCUMENTED_CANDLE_COLUMNS) - set(NUMERIC_COLUMN_TO_FIELD) == {"ts", "confirm"}
+
+    row = _candle_row()
+    assert len(row) == CANDLE_FIELD_COUNT
+    client, _ = _candles_client([row])
+
+    series = await client.get_candles("501", "So1", "1m")
+
+    assert isinstance(series, CandleSeries)  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
+    assert len(series.candles) == 1
+    candle = series.candles[0]
+    # Every documented numeric column lands in its own field, read back through the SAME mapping the
+    # rejection vectors are indexed by — so the two cannot disagree about what `volUsd` means.
+    for column, field in NUMERIC_COLUMN_TO_FIELD.items():
+        assert getattr(candle, field) == float(_FINITE_CANDLE[column])
+    assert candle.ts_open_ms == int(_FINITE_CANDLE["ts"])
+    assert candle.confirmed is True
+
+
+async def test_the_refusal_NAMES_the_column_it_refused_and_names_no_other():
+    """The DIAGNOSTIC is a property in its own right, and PKT-DEC-C26 is why it gets its own name.
+
+    The rejection vectors above already assert message content, but their NAME describes
+    rejection-per-column, not the naming of the column IN the refusal. Measured, not supposed: a
+    mutant that dropped the column from the message, and one that made `vol` and `volUsd` label each
+    other, were both killed only by tests whose names do not describe what was mutated — the exact
+    shape C26 calls an unpinned property. This pins it under a name that says what it pins.
+
+    `vol` and `volUsd` are the pair that matters: one is a substring of the other, so a refusal
+    naming the wrong one still 'contains' the right word. The field form is compared PARENTHESISED
+    for the same reason — `Candle.vol` is a substring of `Candle.vol_usd`, `(Candle.vol)` is not.
+    """
+    messages = {}
+    for column in NUMERIC_COLUMN_TO_FIELD:
+        client, _ = _candles_client([_candle_row(**{column: "1e400"})])
+        with pytest.raises(OKXResponseError, match="must be a finite number") as excinfo:
+            await client.get_candles("501", "So1", "1m")
+        messages[column] = str(excinfo.value)
+
+    assert len(messages) == 6
+    for column, field in NUMERIC_COLUMN_TO_FIELD.items():
+        # Names its OWN column and its OWN field...
+        assert f"candle column '{column}'" in messages[column]
+        assert f"(Candle.{field})" in messages[column]
+        # ...and no OTHER column's field. This is the half a substring check cannot do.
+        for other_field in set(NUMERIC_COLUMN_TO_FIELD.values()) - {field}:
+            assert f"(Candle.{other_field})" not in messages[column]
+    # All six refusals are distinguishable from one another. Stated directly rather than left to
+    # follow from the assertions above: one generic message for all six columns is the failure mode.
+    assert len(set(messages.values())) == 6
