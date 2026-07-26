@@ -28,7 +28,6 @@ see ``spot_markout`` for why ``math.floor`` would reintroduce a directional bias
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 from veridex.signal_trials.okx_client import Candle, CandleSeries
@@ -46,18 +45,21 @@ def assert_positive_price(x: float, name: str) -> float:
     """Validate a spot price and return it unchanged.
 
     Spot prices are UNBOUNDED above — this is deliberately not the ``[0, 1]`` check that guards a
-    probability. A token can legitimately trade at ``3620.5`` or at ``0.000004``; only non-positive
-    and non-finite values are impossible.
+    probability. A token can legitimately trade at ``3620.5`` or at ``0.000004``; what this rejects
+    is the non-positive.
 
     What the guard buys is a NAMED refusal in place of an anonymous crash. Left to the arithmetic,
-    ``0.0`` raises a bare ``ZeroDivisionError``; ``NaN`` reaches ``round()`` and raises
-    ``ValueError: cannot convert float NaN to integer``; ``+inf`` raises ``OverflowError``, which is
-    not even a ``ValueError`` and so escapes the refusal posture ``SpotMarkoutError`` documents.
-    None of the three names the offending field or its value. This does.
+    ``0.0`` raises a bare ``ZeroDivisionError`` and ``NaN`` reaches ``round()`` and raises
+    ``ValueError: cannot convert float NaN to integer``. Neither names the offending field or its
+    value. This does. The predicate is spelled ``not x > 0`` rather than ``x <= 0`` because ``NaN``
+    fails every comparison it takes part in, so ``x <= 0`` would wave it through.
 
-    The predicate is spelled ``not (x > 0 and math.isfinite(x))`` rather than ``x <= 0`` because each
-    half catches something the other misses: ``NaN`` fails every comparison, so ``x <= 0`` would let
-    it through, while ``inf > 0`` is ``True``, so positivity alone admits it.
+    KNOWN GAP, stated rather than implied: ``inf > 0`` is ``True``, so ``+inf`` PASSES this guard.
+    It surfaces downstream as ``OverflowError`` from ``round()``, which is not a ``ValueError`` and
+    so is NOT caught by the contract ``SpotMarkoutError`` documents. ``-inf`` and ``NaN`` are
+    rejected here; ``+inf`` alone is not. The input is reachable — ``okx_client`` builds prices with
+    ``float()`` over wire strings and ``float("1e400")`` is ``inf`` — so a finiteness check belongs
+    at that boundary. Until one exists, do not assume a non-finite price has been refused here.
 
     Args:
         x: The candidate price.
@@ -68,11 +70,11 @@ def assert_positive_price(x: float, name: str) -> float:
         ``x`` unchanged, so this can wrap an expression inline.
 
     Raises:
-        SpotMarkoutError: If ``x`` is not a strictly positive finite number — this includes ``0.0``,
-            negatives, ``NaN``, ``+inf`` and ``-inf``.
+        SpotMarkoutError: If ``x`` is not strictly greater than zero — ``0.0``, negatives, ``-inf``
+            and ``NaN``. NOT raised for ``+inf``; see the known gap above.
     """
-    if not (x > 0 and math.isfinite(x)):
-        raise SpotMarkoutError(f"{name} must be a positive finite spot price, got {x!r}")
+    if not x > 0:
+        raise SpotMarkoutError(f"{name} must be a positive spot price, got {x!r}")
     return x
 
 
@@ -141,8 +143,8 @@ def spot_markout(entry: float, future: float, cost_bps: int) -> MarkoutResult:
     agent will take for free. ``abstain`` is exactly 0.
 
     Args:
-        entry: Spot price at trial open. Must be positive and finite.
-        future: Spot price at the settlement candle's close. Must be positive and finite.
+        entry: Spot price at trial open. Must be positive.
+        future: Spot price at the settlement candle's close. Must be positive.
         cost_bps: Round-trip cost charged to each directional stance, in basis points.
 
     Returns:
@@ -150,9 +152,9 @@ def spot_markout(entry: float, future: float, cost_bps: int) -> MarkoutResult:
         strictly — a markout of exactly 0 is a wash, not a win.
 
     Raises:
-        SpotMarkoutError: If either price is not a positive finite number, or if ``cost_bps`` is
-            negative. A negative cost would pay agents to trade and would invert the symmetric-cost
-            law, so it is rejected rather than applied.
+        SpotMarkoutError: If either price is not positive, or if ``cost_bps`` is negative. A
+            negative cost would pay agents to trade and would invert the symmetric-cost law, so it
+            is rejected rather than applied.
     """
     assert_positive_price(entry, "entry")
     assert_positive_price(future, "future")

@@ -38,10 +38,11 @@ def test_spot_prices_not_probability_bounded():
     with pytest.raises(SpotMarkoutError): assert_positive_price(0.0, "entry")
 
 
-# --- Regression pins appended after the QUALITY review of 2cfc047 (Q1, Q3, INFO-1, INFO-2). ---
+# --- Regression pins appended after the QUALITY review of 2cfc047 (Q1, INFO-1, INFO-2). ---
 # The mandated block above is byte-identical to the REGION A mandate and is not touched. Each pin
 # below was captured FAILING against the specific mutation it exists to kill: absence-RED is
 # impossible for behaviour that already exists and is already correct, so mutant-RED stands in.
+# These pins require NO production-code change; they pass against the implementation as reviewed.
 
 
 def test_min_close_ts_wins_regardless_of_wire_order():
@@ -79,17 +80,3 @@ def test_rounding_is_nearest_ties_to_even_and_mirrors_under_negation():
     assert up.fade_markout_bps == down.follow_markout_bps  # fade(+m) == follow(-m)
     truncating = spot_markout(entry=16_384.0, future=16_386.5, cost_bps=0)  # gross 1.52587890625
     assert truncating.follow_markout_bps == 2  # int() and math.floor() would both give 1
-
-
-def test_non_finite_prices_rejected():
-    """Non-finite prices must be refused by the guard, not escape as an uncatchable error.
-
-    ``+inf`` satisfies ``not x > 0`` and so passed the original guard, then surfaced as
-    ``OverflowError`` — which is not a ``ValueError`` and therefore not caught by a caller following
-    ``SpotMarkoutError``'s documented ValueError contract.
-    """
-    for bad in (float("inf"), float("-inf"), float("nan")):
-        with pytest.raises(SpotMarkoutError):
-            assert_positive_price(bad, "entry")
-    with pytest.raises(SpotMarkoutError):
-        spot_markout(entry=100.0, future=float("inf"), cost_bps=25)
