@@ -1,3 +1,7 @@
+import base64
+import json
+from decimal import Decimal
+
 import httpx
 import pytest
 from starlette.applications import Starlette
@@ -12,6 +16,7 @@ from veridex.signal_trials.payments import (
     FAKE_PAYER,
     FAKE_TX_HASH,
     GATED_METHODS,
+    MAX_COMMIT_PRICE,
     X_LAYER_MAINNET,
     FakeFacilitator,
     FakeFacilitatorClientAdapter,
@@ -32,6 +37,46 @@ DEV_ENV = {
     "X402_ENABLED": "true",
     "PAY_TO_ADDRESS": "0x" + "a" * 40,
 }
+UINT256_MAX = 2**256 - 1
+AT_CEILING = f"${MAX_COMMIT_PRICE}"
+JUST_ABOVE_CEILING = f"${MAX_COMMIT_PRICE + Decimal('0.000001')}"
+# The shape that produced a 407-digit atomic amount from the stock middleware.
+OVERSIZED_PRICE = "$" + "9" * 400
+
+
+def _settings_priced(price):
+    """A directly constructed X402Settings — the path that never sees the loader."""
+    return X402Settings(enabled=True, pay_to="0x" + "a" * 40, price=price, network=X_LAYER_MAINNET, sync_settle=True)
+
+
+def _expected_atomic(price):
+    """Atomic units by exact integer arithmetic; Decimal arithmetic would round at this scale."""
+    whole, _, frac = price.lstrip("$").partition(".")
+    return int(whole + frac.ljust(6, "0"))
+
+
+async def _advertised_atomic_amount(settings):
+    """Atomic amount the stock 402 challenge advertises, via the in-process C11 adapter.
+
+    No network client is constructed anywhere in this path.
+    """
+    server = build_resource_server(settings, FakeFacilitator(), is_production=False)
+    server.register(X_LAYER_MAINNET, ExactEvmScheme())
+
+    async def endpoint(request):
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route(COMMIT_PATH, endpoint, methods=list(GATED_METHODS))])
+    app.add_middleware(
+        PaymentMiddlewareASGI,
+        routes={f"{m} {COMMIT_PATH}": {"accepts": [build_commit_price(settings)]} for m in GATED_METHODS},
+        server=server,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://boundary") as client:
+        response = await client.request("GET", COMMIT_PATH)
+    assert response.status_code == 402
+    challenge = json.loads(base64.b64decode(response.headers["payment-required"]))
+    return challenge["accepts"][0]["amount"]
 
 
 def test_production_requires_enabled_and_payto():
@@ -211,6 +256,62 @@ def test_disabled_development_config_tolerates_an_unusable_price():
     """No gate mounts, so a junk price is inert and must not block startup."""
     s = load_x402_settings({"APP_ENV": "development", "X402_ENABLED": "false", "SIGNAL_TRIALS_COMMIT_PRICE": "free"})
     assert s.enabled is False and s.price == "free"
+
+
+# --- magnitude bound: an amount the EVM gate cannot represent must never be advertised ---
+
+
+@pytest.mark.parametrize("price", ["$00.01", "$01", "$000000.01", "$0000"])
+def test_redundant_leading_zeros_are_refused(price):
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_PRICE"):
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
+
+
+def test_canonical_leading_zero_before_the_point_is_still_accepted():
+    """Rejecting redundant zeros must not reject the default price."""
+    assert load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": "$0.01"}).price == "$0.01"
+
+
+@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
+def test_price_above_the_ceiling_is_refused_by_the_loader(price):
+    with pytest.raises(ValueError, match="ceiling"):
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
+
+
+@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
+def test_price_above_the_ceiling_is_refused_at_construction(price):
+    """The loader is not the only way in; the ceiling binds on the construction path too."""
+    with pytest.raises(ValueError, match="ceiling"):
+        build_commit_price(_settings_priced(price))
+
+
+def test_rejected_oversized_price_is_never_echoed():
+    """C6's redaction rule binds here too: a rejected value stays out of the message."""
+    for raises in (
+        lambda: load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": OVERSIZED_PRICE}),
+        lambda: build_commit_price(_settings_priced(OVERSIZED_PRICE)),
+        lambda: load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": JUST_ABOVE_CEILING}),
+    ):
+        with pytest.raises(ValueError) as exc:
+            raises()
+        message = str(exc.value)
+        assert "9999" not in message
+        assert OVERSIZED_PRICE not in message and JUST_ABOVE_CEILING.lstrip("$") not in message
+
+
+@pytest.mark.parametrize("price", ["$0.000001", "$0.01", "$1", "$999999.999999", AT_CEILING])
+async def test_accepted_boundary_prices_advertise_a_representable_atomic_amount(price):
+    """Every price the validator accepts must survive the SDK as an exact uint256 amount.
+
+    Guards the defect directly: the 400-digit price reached this middleware and was
+    advertised as a 407-digit atomic amount that no EVM uint256 can hold.
+    """
+    settings = load_x402_settings({**DEV_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
+    amount = await _advertised_atomic_amount(settings)
+
+    assert amount.isdigit(), f"non-integer atomic amount advertised: {amount[:40]}"
+    assert int(amount) == _expected_atomic(price), "atomic amount was silently rounded"
+    assert 0 < int(amount) <= UINT256_MAX
 
 
 # --- the frozen fake's own surface (properties its comments call load-bearing) ---

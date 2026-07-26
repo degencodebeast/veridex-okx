@@ -37,6 +37,16 @@ X_LAYER_MAINNET = "eip155:196"
 DEFAULT_COMMIT_PRICE = "$0.01"
 COMMIT_MAX_TIMEOUT_SECONDS = 300
 
+# Documented product ceiling for a single commit, enforced before the price ever
+# reaches the SDK. Two measured limits sit above it and neither fails loudly:
+# the SDK's parser rounds silently past 28 significant digits, and above roughly
+# 1e309 it goes through ``float`` and yields infinity — which the stock middleware
+# then advertises as a 407-digit atomic amount no EVM ``uint256`` can hold. A
+# ceiling of one million dollars keeps the atomic amount at 13 digits: 15 digits
+# inside the rounding frontier and 65 inside ``uint256``, while still being a
+# hundred million times the default price, so it constrains no real configuration.
+MAX_COMMIT_PRICE = Decimal("1000000")
+
 # Deterministic stand-ins returned by FakeFacilitator. Synthetic constants, not
 # credentials: no real payer ever has this address and no chain has this hash.
 FAKE_PAYER = "0x" + "b" * 40
@@ -51,10 +61,12 @@ _NON_PRODUCTION_APP_ENVS = frozenset({"development", "dev", "test", "local"})
 _ALLOWED_NETWORKS = frozenset({X_LAYER_MAINNET})
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _EVM_ADDRESS = re.compile(r"\A0x[0-9a-fA-F]{40}\Z")
-# Canonical USD price: a leading ``$``, plain base-10 digits, at most six
-# fractional places. Exponent notation, ``NaN``, ``Infinity``, signs, separators
-# and excess precision all fail to match rather than being parsed and inspected.
-_COMMIT_PRICE = re.compile(r"\A\$\d+(?:\.\d{1,6})?\Z")
+# Canonical USD price: a leading ``$``, an integer part with no redundant leading
+# zero, and at most six fractional places. Exponent notation, ``NaN``,
+# ``Infinity``, signs, separators and excess precision all fail to match rather
+# than being parsed and inspected. ``[0-9]`` rather than ``\d`` so non-ASCII
+# decimal digits are excluded too — "plain base-10" is meant literally.
+_COMMIT_PRICE = re.compile(r"\A\$(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?\Z")
 
 
 @dataclass(frozen=True)
@@ -96,14 +108,21 @@ def _redact(value: str) -> str:
 
 
 def _validate_commit_price(price: str) -> None:
-    """Refuse any price that is not a positive, canonical USD amount.
+    """Refuse any price that is not a positive, canonical, in-range USD amount.
 
     The SDK parses prices through ``float``, so left unchecked it accepts values
     that quietly break the gate rather than failing: ``"$0"`` mounts a route that
     charges nothing but reports itself paid, ``"-1"`` yields a negative charge,
-    and ``"NaN"``/``"Infinity"`` become float values instead of errors. Matching
-    a strict pattern first, then comparing as :class:`~decimal.Decimal`, means
-    none of those states is ever constructed — no float ever sees this value.
+    ``"NaN"``/``"Infinity"`` become float values instead of errors, and a
+    400-digit price becomes infinity, which the stock middleware then advertises
+    as a 407-digit atomic amount no EVM ``uint256`` can hold. Matching a strict
+    pattern first, then comparing as :class:`~decimal.Decimal`, means none of
+    those states is ever constructed — no float ever sees this value.
+
+    The magnitude check compares rather than multiplies on purpose.
+    ``Decimal(str)`` *construction* is exact regardless of context, but arithmetic
+    is not: ``Decimal(price) * 10**6`` on a 70-digit amount would silently round
+    under the default 28-digit context and could report a rounded value as exact.
 
     Called from two places on purpose. :func:`load_x402_settings` guards the
     *configuration* an operator supplies; :func:`build_commit_price` guards
@@ -114,15 +133,22 @@ def _validate_commit_price(price: str) -> None:
         price: The configured price string.
 
     Raises:
-        ValueError: ``price`` is not a positive canonical USD amount.
+        ValueError: ``price`` is not a positive canonical USD amount, or it
+            exceeds :data:`MAX_COMMIT_PRICE`.
     """
-    # The value is deliberately absent from the message, exactly as _redact keeps
-    # a rejected PAY_TO_ADDRESS out of it: a rejected config value should not be
+    # Neither message names the offending value, exactly as _redact keeps a
+    # rejected PAY_TO_ADDRESS out of it: a rejected config value should not be
     # copied into an exception, a log, or a crash report.
     if not _COMMIT_PRICE.match(price) or Decimal(price[1:]) <= 0:
         raise ValueError(
             "X402 requires a valid SIGNAL_TRIALS_COMMIT_PRICE: a positive USD amount in plain "
-            'decimal notation with at most six decimal places, for example "$0.01". '
+            'decimal notation, no leading zeros, at most six decimal places, for example "$0.01". '
+            "The configured value is withheld from this message."
+        )
+    if Decimal(price[1:]) > MAX_COMMIT_PRICE:
+        raise ValueError(
+            f"X402 refuses a SIGNAL_TRIALS_COMMIT_PRICE above the ${MAX_COMMIT_PRICE} ceiling, which keeps "
+            "the atomic amount exactly representable by the six-decimal asset. "
             "The configured value is withheld from this message."
         )
 
