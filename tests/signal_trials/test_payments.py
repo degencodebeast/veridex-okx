@@ -38,8 +38,16 @@ DEV_ENV = {
     "PAY_TO_ADDRESS": "0x" + "a" * 40,
 }
 UINT256_MAX = 2**256 - 1
+# Derived from the constant they bound: these pin that WHATEVER ceiling is chosen is
+# inclusive and exactly representable. They cannot see the ceiling move, because they
+# move with it — a vector derived from the constant under test agrees with it by
+# construction. The LITERAL_ twins below pin the ceiling's LOCATION. Both are needed:
+# the derived pair kills a ceiling raised past the SDK's exactness frontier, the literal
+# pair kills a ceiling that has simply been moved.
 AT_CEILING = f"${MAX_COMMIT_PRICE}"
 JUST_ABOVE_CEILING = f"${MAX_COMMIT_PRICE + Decimal('0.000001')}"
+LITERAL_AT_CEILING = "$1000000"
+LITERAL_JUST_ABOVE_CEILING = "$1000000.000001"
 # The shape that produced a 407-digit atomic amount from the stock middleware.
 OVERSIZED_PRICE = "$" + "9" * 400
 
@@ -291,6 +299,18 @@ def test_canonical_leading_zero_before_the_point_is_still_accepted():
     assert load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": "$0.01"}).price == "$0.01"
 
 
+def test_the_ceiling_is_where_it_is_documented_to_be():
+    """Pins the ceiling's LOCATION, which the derived vectors structurally cannot.
+
+    ``AT_CEILING`` and ``JUST_ABOVE_CEILING`` are computed from ``MAX_COMMIT_PRICE``, so
+    they follow it wherever it goes and agree with it by construction. Moving the ceiling
+    is a product decision; this asserts it against a literal so the move cannot be silent.
+    """
+    assert Decimal(LITERAL_AT_CEILING.lstrip("$")) == MAX_COMMIT_PRICE
+    assert AT_CEILING == LITERAL_AT_CEILING
+    assert JUST_ABOVE_CEILING == LITERAL_JUST_ABOVE_CEILING
+
+
 def test_the_ceiling_is_inclusive_on_both_paths():
     """The ACCEPT side of the boundary, banked as an assertion rather than as the absence of a crash.
 
@@ -325,13 +345,13 @@ def test_non_ascii_decimal_digits_are_refused(price):
     assert "SIGNAL_TRIALS_COMMIT_PRICE" in str(refusal)
 
 
-@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
+@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, LITERAL_JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
 def test_price_above_the_ceiling_is_refused_by_the_loader(price):
     with pytest.raises(ValueError, match="ceiling"):
         load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
 
 
-@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
+@pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, LITERAL_JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
 def test_price_above_the_ceiling_is_refused_at_construction(price):
     """The loader is not the only way in; the ceiling binds on the construction path too."""
     with pytest.raises(ValueError, match="ceiling"):
@@ -339,7 +359,13 @@ def test_price_above_the_ceiling_is_refused_at_construction(price):
 
 
 def test_rejected_oversized_price_is_never_echoed():
-    """C6's redaction rule binds here too: a rejected value stays out of the message."""
+    """C6's redaction rule binds here too: a rejected value stays out of the message.
+
+    The leak probe is a 20-digit run, not ``"9999"``. The ceiling message interpolates
+    ``MAX_COMMIT_PRICE``, so a short digit run couples this test to the ceiling's VALUE:
+    moving the ceiling to ``1000000.999999`` fired this assertion while nothing had leaked.
+    A run that long cannot come from any plausible ceiling, only from echoing the input.
+    """
     for raises in (
         lambda: load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": OVERSIZED_PRICE}),
         lambda: build_commit_price(_settings_priced(OVERSIZED_PRICE)),
@@ -348,11 +374,11 @@ def test_rejected_oversized_price_is_never_echoed():
         with pytest.raises(ValueError) as exc:
             raises()
         message = str(exc.value)
-        assert "9999" not in message
+        assert "9" * 20 not in message
         assert OVERSIZED_PRICE not in message and JUST_ABOVE_CEILING.lstrip("$") not in message
 
 
-@pytest.mark.parametrize("price", ["$0.000001", "$0.01", "$1", "$999999.999999", AT_CEILING])
+@pytest.mark.parametrize("price", ["$0.000001", "$0.01", "$1", "$999999.999999", AT_CEILING, LITERAL_AT_CEILING])
 async def test_accepted_boundary_prices_advertise_a_representable_atomic_amount(price):
     """Every price the validator accepts must survive the SDK as an exact uint256 amount.
 

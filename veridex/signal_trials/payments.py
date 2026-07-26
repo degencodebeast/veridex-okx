@@ -115,15 +115,22 @@ def _redact(value: str) -> str:
 def _validate_commit_price(price: str) -> None:
     """Refuse any price that is not a positive, canonical, in-range USD amount.
 
-    The SDK parses prices through ``float``, so left unchecked it accepts values
-    that quietly break the gate rather than failing: ``"$0"`` mounts a route that
-    charges nothing but reports itself paid, ``"-1"`` yields a negative charge,
-    ``"NaN"``/``"Infinity"`` become float values instead of errors, and a
-    400-digit price is advertised as a 407-digit atomic amount no EVM ``uint256``
-    can hold — that one comes from the SDK's Decimal path rounding at 28
-    significant digits, not from the float overflow far above it. Matching a
-    strict pattern first, then comparing as :class:`~decimal.Decimal`, means none
-    of those states is ever constructed.
+    Left unchecked, the SDK mishandles these four in two different ways, and the
+    difference matters to anyone reasoning about it later.
+
+    Two break the gate *quietly*: ``"$0"`` mounts a route that charges nothing but
+    reports itself paid, and ``"-1"`` becomes an atomic ``-1000000``. A third is
+    quiet and much larger — a 400-digit price is advertised as a 407-digit atomic
+    amount no EVM ``uint256`` can hold, from the SDK's Decimal path rounding at 28
+    significant digits, not from the float overflow far above it.
+
+    ``"NaN"`` and ``"Infinity"`` do NOT break it quietly: they raise on that same
+    Decimal path, at ``parse_amount`` (``ValueError`` and ``OverflowError``). They
+    are still refused here because a startup refusal beats raising per-request
+    while the route is already serving 402s.
+
+    Matching a strict pattern first, then comparing as
+    :class:`~decimal.Decimal`, means none of those states is ever constructed.
 
     The magnitude check compares rather than multiplies. At this ceiling the two
     forms are equivalent — no input distinguishes them — so that is defensive
