@@ -289,15 +289,37 @@ async def test_the_route_refuses_an_asserted_season_whose_payload_is_missing(tmp
             await c.get("/signal-trials/season")
 
 
-def test_a_payload_from_another_generation_is_refused_not_served(tmp_path):
+@pytest.mark.parametrize(
+    ("payload", "state"),
+    [
+        (SEASON_A, "exploratory"),  # payload over-claims: qualified doc under an exploratory state
+        (SEASON_B, "qualified"),  # payload under-claims: exploratory doc under a qualified state
+    ],
+    ids=["qualified-payload-exploratory-state", "exploratory-payload-qualified-state"],
+)
+def test_a_payload_from_another_generation_is_refused_not_served(tmp_path, payload, state):
     """A payload whose own status contradicts the state is cross-generation. Fail closed.
 
     Not absent and not corrupt — structurally valid, and wrong. Serving it would report
     an exploratory season as qualified, or the reverse, which is the badge the frozen
     spec attaches a skill claim to.
+
+    BOTH DIRECTIONS, because a one-sided guard passes a one-sided test. With only the
+    over-claiming vector, ``state == "exploratory" and payload_status != state`` and
+    ``payload_status == "qualified" and state != "qualified"`` both survive the whole
+    suite — and the second is the form someone would plausibly write, reasoning "guard
+    against the payload over-claiming". Under it a qualified state SERVES an exploratory
+    payload, which is the direction a team's badge actually moves. The same reasoning is
+    already applied to the two sibling properties in this file; it simply had not reached
+    this one.
+
+    ``match=`` is not decoration: a bare ``pytest.raises(ValueError)`` would accept a
+    refusal for the wrong reason, since this module has three other ways to reject a read
+    (PKT-DEC-C25 ruling 2 — identity must be asserted on a trust-path rejection).
     """
-    write_season(tmp_path, SEASON_A)  # season_status == "qualified"
-    write_state(tmp_path, "exploratory", {})
+    write_season(tmp_path, payload)
+    write_state(tmp_path, state, {})
+    assert payload["season_status"] != state  # the vector really is cross-generation
     with pytest.raises(ValueError, match="cross-generation"):
         read_season(tmp_path)
 
