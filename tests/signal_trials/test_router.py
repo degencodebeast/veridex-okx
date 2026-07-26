@@ -528,7 +528,16 @@ def _served(env=None, *, settings=None, facilitator=None):
 
 
 def _challenge(response) -> dict:
-    """Decode the base64 x402 challenge carried in the ``payment-required`` header."""
+    """Decode the base64 x402 challenge carried in the ``payment-required`` header.
+
+    Both assertions precede the decode deliberately. A mutant that stops the challenge
+    being emitted leaves the header absent, and reaching into it first raises KeyError
+    from inside httpx — an incidental exception the false-kill corollary correctly
+    refuses to count as a kill. Discriminating first turns the same mutant into an
+    honest AssertionError. Do not "tidy" these away (PKT-DEC-C20 rule 1).
+    """
+    assert response.status_code == 402, f"expected a 402 challenge, got {response.status_code}"
+    assert "payment-required" in {name.lower() for name in response.headers}, "402 carried no challenge header"
     return json.loads(base64.b64decode(response.headers["payment-required"]))
 
 
@@ -690,6 +699,33 @@ def test_production_without_okx_credentials_refuses_to_start():
     """
     with pytest.raises(ValueError, match="OKX"):
         create_server_app(env=_PROD_ENV, settings=_prod_settings())
+
+
+def test_production_builds_the_real_facilitator_from_the_documented_env_names():
+    """Pins the three credential env names against a silent rename.
+
+    The refusal test above cannot do this on its own: read the credentials from the
+    WRONG names and they are simply absent, so it still raises and still passes. Only
+    supplying them under the documented names and requiring success distinguishes the
+    two. Construction performs no network call — the SDK fetches supported kinds
+    lazily, on the first protected request.
+    """
+    env = {**_PROD_ENV, "OKX_API_KEY": "key", "OKX_SECRET": "secret", "OKX_PASSPHRASE": "pass"}
+    assert create_server_app(env=env, settings=_prod_settings()) is not None
+
+
+@pytest.mark.parametrize("ambiguous", ["maybe", "yes please", "TRUE-ish", "2"])
+def test_an_unrecognized_x402_enabled_value_mounts_no_gate(ambiguous):
+    """The lenient import pre-check and the strict loader disagree on purpose.
+
+    ``_x402_may_be_configured`` treats anything not plainly false as "maybe", so the
+    optional SDK gets imported; ``load_x402_settings`` then accepts only 1/true/yes/on.
+    The early return on a disabled configuration is the seam between the two parsers.
+    Without it an unrecognized value would raise for want of a facilitator instead of
+    booting honestly ungated — a typo in ``X402_ENABLED`` would take the app down.
+    """
+    guard = create_server_app(env={**_X402_ENV, "X402_ENABLED": ambiguous}, settings=_dev_settings())
+    assert guard is not None
 
 
 def test_the_refusal_never_echoes_the_configured_payout_address():
