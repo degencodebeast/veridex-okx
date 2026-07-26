@@ -1,0 +1,493 @@
+import pytest
+
+from veridex.signal_trials import challenge_spec
+from veridex.signal_trials.challenge_spec import (
+    FORBIDDEN_EVIDENCE_FIELDS,
+    LeakageError,
+    assert_no_future_fields,
+    evidence_hash,
+    normalize_signal,
+    visible_at_decision,
+)
+
+REST = {"timestamp": "1753400000000", "price": "0.042", "chainIndex": "501", "amountUsd": "1500",
+        "triggerWalletCount": "3", "walletType": "1", "triggerWalletAddress": "0xa",
+        "soldRatioPercent": "12.5",
+        "token": {"tokenAddress": "So1", "symbol": "TOK", "name": "Tok", "marketCapUsd": "2000000",
+                   "holders": "900", "top10HolderPercent": "31.5"}}
+WS = dict(REST); WS["soldRatioPercentage"] = WS.pop("soldRatioPercent")
+WS["token"] = dict(REST["token"]); WS["token"]["top10HolderPercentage"] = WS["token"].pop("top10HolderPercent")
+
+def test_rest_and_ws_normalize_to_byte_identical_evidence_hash():
+    assert evidence_hash(normalize_signal(REST, "rest")) == evidence_hash(normalize_signal(WS, "ws"))
+
+def test_sold_ratio_never_reaches_evidence():
+    ev = visible_at_decision(normalize_signal(REST, "rest"))
+    assert "sold_ratio_percent" not in ev and "soldRatioPercent" not in ev
+
+def test_liquidity_and_future_fields_raise():
+    with pytest.raises(LeakageError): assert_no_future_fields({"liquidity_usd": 37412.0})
+    with pytest.raises(LeakageError): assert_no_future_fields({"close": 1.1})
+
+
+# --- PKT-DEC-C15 + its A1 addendum: `liquidityUsd` and `clvBps`, the camelCase twins of
+# `liquidity_usd` and `clv_bps`. Each alias gets its own rejection test and its own mutation test,
+# deliberately not parametrized into one: the two guarantees are independent, and a single case
+# covering both could stay green while only one of them was actually load-bearing.
+# Additions below this line are not frozen content; the bodies above are, and are untouched.
+
+
+def test_liquidity_usd_camel_case_refused_top_level_and_nested() -> None:
+    """The camelCase spelling must be refused wherever it sits, not only at the top level.
+
+    `okx_client.py` serializes `minLiquidityUsd`, so camelCase is the live wire convention. While
+    the set carried only the snake_case spelling, both of these payloads passed the guard. Nested
+    is asserted separately from top level because the nested shape (`{"token": {...}}`) is the one
+    this pipeline actually assembles, so a guard green only at the top level would read as passing
+    over precisely the case it exists to reject.
+    """
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"liquidityUsd": 500000})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"token": {"liquidityUsd": 500000}})
+
+
+def test_clv_bps_camel_case_refused_top_level_and_nested() -> None:
+    """Same guarantee for CLV, whose snake_case spelling the plan author already chose to guard.
+
+    `clvBps` is not a new guard: `clv_bps` was already in the frozen set, so the camel spelling
+    walking through was the guard being half-applied rather than a gap in what it covers. CLV is
+    outright post-decision data — it is priced against a settlement the decision cannot have seen.
+    """
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"clvBps": 42})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"scoring": {"clvBps": 42}})
+
+
+def test_liquidity_usd_entry_is_load_bearing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation drill, in-suite: remove ONLY `liquidityUsd` and prove the guard goes blind to it.
+
+    The rejection test above is what BREAKS if the entry is dropped. This one shows WHY it breaks —
+    that the refusal is produced by that specific entry and not by some other rule that happens to
+    cover the same payloads. Without it, a green assertion could be riding on a guard that was
+    never doing the work.
+    """
+    monkeypatch.setattr(
+        challenge_spec,
+        "FORBIDDEN_EVIDENCE_FIELDS",
+        FORBIDDEN_EVIDENCE_FIELDS - {"liquidityUsd"},
+    )
+    # Drop the one entry and the guard accepts both payloads it is required to refuse.
+    assert_no_future_fields({"liquidityUsd": 500000})
+    assert_no_future_fields({"token": {"liquidityUsd": 500000}})
+    # Everything else still bites — including the OTHER new alias, which is what makes this proof
+    # independent of the clvBps one rather than the two sharing a single outcome.
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"liquidity_usd": 500000})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"clvBps": 42})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"soldRatioPercent": 12.5})
+
+
+def test_clv_bps_entry_is_load_bearing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same drill for `clvBps`, run as its own proof rather than folded into the one above.
+
+    Two aliases landed in one change, so one mutation covering both would leave it possible for a
+    single entry to be carrying both assertions. Removing each independently is what establishes
+    that each is separately load-bearing.
+    """
+    monkeypatch.setattr(
+        challenge_spec,
+        "FORBIDDEN_EVIDENCE_FIELDS",
+        FORBIDDEN_EVIDENCE_FIELDS - {"clvBps"},
+    )
+    assert_no_future_fields({"clvBps": 42})
+    assert_no_future_fields({"scoring": {"clvBps": 42}})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"clv_bps": 42})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"liquidityUsd": 500000})
+    with pytest.raises(LeakageError):
+        assert_no_future_fields({"soldRatioPercent": 12.5})
+
+
+def test_forbidden_set_retains_every_previously_listed_spelling() -> None:
+    """C15 and A1 are ADDITIONS. Nothing already guarded may be lost to them, or to a later one.
+
+    Containment, not equality: this assertion pins the pre-C15 nine and should never need editing,
+    so a REMOVAL fails here no matter which later change caused it. The exact-membership test below
+    is the other half — this one is deliberately blind to additions so that it keeps meaning the
+    same thing over time.
+    """
+    assert {
+        "sold_ratio_percent",
+        "soldRatioPercent",
+        "soldRatioPercentage",
+        "liquidity",
+        "liquidity_usd",
+        "settlement",
+        "future",
+        "close",
+        "clv_bps",
+    } <= FORBIDDEN_EVIDENCE_FIELDS
+
+
+def test_forbidden_set_is_exactly_the_authorized_eleven() -> None:
+    """Widening this frozen guard must be a deliberate, decision-backed edit — so pin it exactly.
+
+    `minLiquidityUsd` is asserted OUT by name: it is a REQUEST filter key (`okx_client.py`), never
+    a key in an evidence payload, and it is the most plausible next speculative addition precisely
+    because it is where the camelCase evidence came from. A future authorized alias has to edit
+    this list, which is the intended cost — an unauthorized one fails here instead of landing quietly.
+    """
+    authorized = {
+        "sold_ratio_percent",
+        "soldRatioPercent",
+        "soldRatioPercentage",
+        "liquidity",
+        "liquidity_usd",
+        "liquidityUsd",
+        "settlement",
+        "future",
+        "close",
+        "clv_bps",
+        "clvBps",
+    }
+    assert authorized == FORBIDDEN_EVIDENCE_FIELDS
+    assert len(FORBIDDEN_EVIDENCE_FIELDS) == 11
+    assert "minLiquidityUsd" not in FORBIDDEN_EVIDENCE_FIELDS
+
+
+# --- PKT-MILESTONE-DATA-CODEX-da5b59a MAJOR: `wallet_type` cross-transport canonicalization.
+#
+# Frozen spec §5.2 (`docs/superpowers/specs/2026-07-23-veridex-signal-trials-design.md:76`) requires
+# ONE canonical schema across transports and names this dimension explicitly:
+#     `wallet_type` <- REST numeric/named vs WS comma-separated numerics
+#
+# The frozen fixture holds `walletType` at the string "1" on BOTH sides, so the mandated
+# hash-equality test never varied the one dimension the spec says differs between transports. Every
+# line ran; the value was simply constant. The pairs below vary it, and each asserts BOTH canonical
+# field equality and evidence-hash equality — asserting only the hashes would reproduce the very
+# blindness being closed here.
+#
+# Canonical form (see `_canonical_wallet_type`): comma-separated numeric codes, deduplicated and
+# sorted ascending. `walletType=1` is Smart Money per §5.1, so "1" stays "1" and the frozen
+# fixture's hash is unchanged — pinned below.
+
+
+def test_wallet_type_named_rest_and_numeric_ws_share_evidence_identity() -> None:
+    """The required cross-transport pair whose RAW `walletType` values differ.
+
+    REST carries the named form, WS the numeric form, for the same logical wallet category. Before
+    the fix these produced `'Smart Money'` and `'1'` and therefore two different evidence hashes —
+    different receipt identity for one market event across the replay and live-exhibition paths.
+    """
+    rest = {**REST, "walletType": "Smart Money"}
+    ws = {**WS, "walletType": "1"}
+    assert rest["walletType"] != ws["walletType"]
+
+    rest_sig = normalize_signal(rest, "rest")
+    ws_sig = normalize_signal(ws, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type == "1"
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+
+def test_wallet_type_numeric_rest_is_accepted_and_matches_its_string_twin() -> None:
+    """A numeric REST `walletType` must enter the pack at all.
+
+    H2.1 carries raw rows through untouched, so an int on the wire reached `_as_str` and raised —
+    a valid row could not be normalized. The int and its string twin must also agree, or the same
+    row would hash differently depending on the JSON decoder's typing.
+    """
+    numeric = normalize_signal({**REST, "walletType": 1}, "rest")
+    stringy = normalize_signal({**REST, "walletType": "1"}, "rest")
+    assert numeric.wallet_type == stringy.wallet_type == "1"
+    assert evidence_hash(numeric) == evidence_hash(stringy)
+
+
+def test_wallet_type_ws_list_is_order_and_duplicate_invariant() -> None:
+    """A wallet-type set is unordered, so its serialization must not carry order into the hash.
+
+    WS emits comma-separated numerics. `"2,1"` and `"1,2"` denote the same set; if wire order
+    survived into the canonical value, two identical observations would take different receipt
+    identities purely from field ordering. Duplicates collapse for the same reason.
+    """
+    for raw in ("1,2", "2,1", "1,2,1", " 2 , 1 ", "01,2"):
+        assert normalize_signal({**WS, "walletType": raw}, "ws").wallet_type == "1,2"
+
+    ordered = normalize_signal({**WS, "walletType": "1,2"}, "ws")
+    reversed_ = normalize_signal({**WS, "walletType": "2,1"}, "ws")
+    assert evidence_hash(ordered) == evidence_hash(reversed_)
+
+
+def test_wallet_type_mixed_named_and_numeric_list_crosses_transports() -> None:
+    """The named and list forms compose: a named element inside a list resolves like a bare name.
+
+    This is the second cross-transport pair with differing raw values, covering the case where the
+    REST named form and the WS numeric-list form describe the same two-category set.
+    """
+    rest = {**REST, "walletType": "Smart Money,2"}
+    ws = {**WS, "walletType": "2,1"}
+    assert rest["walletType"] != ws["walletType"]
+
+    rest_sig = normalize_signal(rest, "rest")
+    ws_sig = normalize_signal(ws, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type == "1,2"
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+
+def test_frozen_fixture_evidence_hash_is_unchanged_by_this_correction() -> None:
+    """Over-correction lock: a payload already handled correctly must hash exactly as before.
+
+    This literal was captured from the frozen REST fixture at `da5b59a`, BEFORE any wallet-type
+    canonicalization existed. `walletType` there is the string `"1"`, which is already the canonical
+    form, so the correction must be a no-op for it. If this value ever moves, the change altered
+    evidence identity for previously-correct data — a finding, not a fix.
+    """
+    assert normalize_signal(REST, "rest").wallet_type == "1"
+    assert (
+        evidence_hash(normalize_signal(REST, "rest"))
+        == "6c803bc40c8bda82825ef62d0c1f01030e1337f6674695435e982f9cbbe5ede0"
+    )
+
+
+def test_wallet_type_refuses_unknown_names_and_malformed_lists() -> None:
+    """Canonicalizing must not become a licence to accept anything.
+
+    §5.1 authorizes exactly one name (`walletType=1`, Smart Money). An unrecognized name has no
+    known code, so mapping it would be a guess and passing it through would re-open the divergence
+    this correction closes — it raises instead. The malformed list forms raise for the same reason:
+    silently dropping an empty element would let `"1,,2"` and `"1,2"` share an identity they have
+    not earned.
+    """
+    for bad in ("Whale", "", "   ", "1,", ",1", "1,,2", "1,Whale", "-1", "1.5", "one"):
+        with pytest.raises(ValueError):
+            normalize_signal({**REST, "walletType": bad}, "rest")
+
+    # bool is an int subclass; True must not slip through as the code 1.
+    with pytest.raises(ValueError):
+        normalize_signal({**REST, "walletType": True}, "rest")
+    with pytest.raises(ValueError):
+        normalize_signal({**REST, "walletType": 1.5}, "rest")
+
+
+# --- PKT-REV-H2-2-QUALITY-R2-4aeb68f: three GUARDS that survived a ten-mutation battery at 46/46.
+#
+# The reviewer's diagnosis is the brief for these three: this suite pins OUTCOMES densely and GUARDS
+# not at all. Every mutation it caught changes the canonical value of an input some test already
+# supplies; every mutation that survived only matters for an input NO test supplies. So the question
+# each test below is written against is not "does this pass" but "which line could I delete and still
+# be green" — and each therefore also asserts the property that makes its own vector discriminating,
+# so the vector cannot later be weakened into agreement without a failure.
+#
+# NOTE on the fixture, deliberately observed: `{**REST, ...}` is a SHALLOW spread, so the nested
+# `token` dict stays shared BY REFERENCE with the frozen fixture. Every test below only REPLACES the
+# top-level `walletType` key and never writes into `token`. A single mutation of `sig["token"]` here
+# would corrupt the frozen fixture for every test that ran after it, and the failing test would not
+# be the one that caused it.
+#
+# That comment is now BACKED BY A GUARD (below). It was previously the only thing standing between
+# this file and silent shared-state corruption, and a comment detects nothing.
+
+
+def _fixture_snapshot(fixture: object) -> str:
+    """A total, order-sensitive rendering of a fixture, including its nested dicts.
+
+    `repr` rather than a hash: the fixtures are small, and when this guard fires the operator wants
+    to see WHAT changed, not that two digests differ. Order-sensitive on purpose — reordering keys
+    is a mutation of shared state even when the set of keys is unchanged.
+
+    Typed `object` rather than `dict[str, ...]` deliberately: `dict` is invariant in its value type,
+    so a concrete annotation makes `mypy --strict` reject the real fixtures, and the covariant
+    `Mapping` would need an import — which would shift every line number in this file, including the
+    frozen block's, for no benefit. Nothing here needs more than `repr`.
+    """
+    return repr(fixture)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_fixture_integrity(request: pytest.FixtureRequest) -> None:
+    """Fail any test that mutates the shared REST or WS fixture, wherever it sits in the file.
+
+    Both fixtures are module-level and both are reachable by aliasing: `{**REST, ...}` shares REST's
+    nested `token` dict by reference, and `{**WS, ...}` shares WS's own — a distinct dict, since line
+    19 does `WS["token"] = dict(REST["token"])`, but shared across every WS-derived payload all the
+    same. So a write through either spread corrupts state for every test that runs afterwards, and
+    the failure surfaces in some later test rather than the one that caused it.
+
+    A golden-hash lock cannot cover this. It hashes REST only, it is a single test at a fixed
+    position, and it is therefore blind to WS entirely and to anything added after it. That last
+    point is what makes this guard necessary rather than merely nice: the specification ruling that
+    every future gap in this file must be closed BY ADDITION guarantees that every future addition
+    lands BELOW the lock — precisely where the lock cannot reach. The rule protecting the frozen
+    fixture routes all future work into the lock's blind spot, and H2.5 adds to this file.
+
+    Autouse and teardown-based, so it is position-independent: it checks after EVERY test, including
+    ones written years from now by someone who never reads this docstring.
+
+    Note for whoever sees this fire: pytest reports a teardown assertion as an ERROR rather than a
+    FAILURE. The exit status is non-zero either way; the test that errors is the test that mutated.
+    """
+    before = (_fixture_snapshot(REST), _fixture_snapshot(WS))
+
+    def _verify_unchanged() -> None:
+        after = (_fixture_snapshot(REST), _fixture_snapshot(WS))
+        assert after == before, (
+            "a test mutated the shared REST/WS fixture. Both are module-level and aliased by the "
+            "{**REST, ...} / {**WS, ...} spread, so the corruption is visible to every later test "
+            "and the test that FAILS will not be the test that caused it. Copy before writing."
+        )
+
+    request.addfinalizer(_verify_unchanged)
+
+
+def test_fixture_snapshot_is_load_bearing() -> None:
+    """Mutation drill, in-suite: the integrity guard is only as good as this primitive.
+
+    Same shape as `test_liquidity_usd_entry_is_load_bearing` above, and for the same reason: the
+    guard is what BREAKS if the primitive stops discriminating, but nothing shows that the refusal
+    is produced by THIS function rather than by something else that happens to cover the same cases.
+
+    That gap is not theoretical. Replacing the body with `return ""` — one plausible "simplification"
+    by someone who does not know what it is for — leaves the whole suite green AND silently restores
+    the entire MINOR-7 hazard, because every snapshot then compares equal to every other. The guard
+    still runs, still compares, and can no longer detect anything. This is now protection
+    infrastructure the file depends on, so it needs a proof of life.
+
+    Each assertion below independently kills a constant-returning primitive. The first also kills a
+    non-deterministic one, which matters because a guard that fired on every test would be
+    "fixed" by deleting it.
+
+    Everything operates on `deepcopy` of the fixture, never the fixture itself. A drill that mutated
+    shared state to prove the guard catches mutation would be self-defeating in the most literal way
+    — and the autouse guard above independently verifies at teardown that this test did not, so if
+    the copying were wrong, this test would error rather than quietly corrupting every later one.
+    """
+    from copy import deepcopy  # local by necessity: a top-level import would shift every line
+    # number in this file, including the frozen block's, and the C8 check is a byte offset
+    # (`sed -n '13,30p'`). The import lives here so that check keeps working.
+
+    baseline = _fixture_snapshot(REST)
+
+    # Deterministic, and sensitive to nothing but content: an identical copy renders identically.
+    assert _fixture_snapshot(deepcopy(REST)) == baseline
+
+    # NESTED content, with the top-level key set unchanged. This is the aliasing hazard's real
+    # shape, and it is what a primitive rendering only top-level keys would miss.
+    nested = deepcopy(REST)
+    nested["token"] = {"tokenAddress": "So1", "symbol": "MUTATED"}
+    assert _fixture_snapshot(nested) != baseline
+
+    # A top-level VALUE change.
+    top_level = deepcopy(REST)
+    top_level["walletType"] = "9"
+    assert _fixture_snapshot(top_level) != baseline
+
+    # A removed key.
+    removed = deepcopy(REST)
+    del removed["price"]
+    assert _fixture_snapshot(removed) != baseline
+
+    # The drill itself left the fixture alone.
+    assert _fixture_snapshot(REST) == baseline
+
+
+def test_wallet_type_list_sorts_numerically_not_lexicographically() -> None:
+    """Codes sort as NUMBERS. Every other list vector uses 1 and 2, where the two orders agree.
+
+    A `sorted({str(c) for c in codes})` refactor is green across this entire suite while
+    canonicalizing `"10,2"` to `'10,2'`. Two-digit codes are the only inputs that can tell the two
+    apart, and nothing else in the file supplies one — so the invariant is stated by the code and
+    defended by nothing. Wire order surviving into the canonical value splits receipt identity for
+    one logical observation, which is the exact failure this dimension exists to prevent.
+    """
+    # (raw wire value, required canonical form).
+    vectors = (("10,2", "2,10"), ("9,10", "9,10"), ("2,10", "2,10"))
+
+    for raw, canonical in vectors:
+        # DERIVED self-guard, computed FROM the vector it protects and checked before that vector is
+        # used. A vector can only detect a lexicographic sort while numeric and lexicographic
+        # ordering DISAGREE on its codes, so rewriting any of these to codes like "1,2" fails HERE
+        # instead of silently blinding the assertion below it.
+        #
+        # The previous version of this guard asserted the same property over hardcoded literals
+        # alongside the vectors. That is structurally independent of them: weakening the vectors
+        # left the guard passing and the test blind. A self-guard works only when DERIVED from the
+        # vector, never when merely asserted next to it.
+        parts = raw.split(",")
+        assert sorted(parts, key=int) != sorted(parts), (
+            f"vector {raw!r} no longer discriminates: numeric and lexicographic order agree on it, "
+            "so this test can no longer detect a lexicographic sort"
+        )
+        assert normalize_signal({**WS, "walletType": raw}, "ws").wallet_type == canonical
+
+    # Cross-transport, SELECTED FROM the guarded vectors rather than written out again: two distinct
+    # wire spellings of one set, which must land on one canonical value and one evidence hash.
+    # Derived for the same reason as above — a hardcoded pair here could drift away from the vectors
+    # that are actually guarded.
+    same_set = [(a, b) for a, ca in vectors for b, cb in vectors if a != b and ca == cb]
+    assert same_set, "vectors no longer contain two distinct spellings of the same set"
+    rest_raw, ws_raw = same_set[0]
+
+    rest_sig = normalize_signal({**REST, "walletType": rest_raw}, "rest")
+    ws_sig = normalize_signal({**WS, "walletType": ws_raw}, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+
+def test_wallet_type_refuses_non_ascii_digits_that_would_collide_onto_one_code() -> None:
+    """The `isascii()` guard on the digit test, which nothing exercised.
+
+    These three all satisfy `isdigit()` AND convert cleanly under `int()`, so without the ASCII
+    guard each becomes the code 1 — three byte-different wire values silently sharing ONE receipt
+    identity. That is the mirror image of the cross-transport defect this module was built to fix:
+    that one SPLIT a single identity across transports, this one COLLIDES distinct values into one.
+    Both are silent, and both are evidence-identity failures.
+
+    The refusal loop above has ten inputs and not one non-ASCII digit. `'²'` — the character the
+    source docstring cites — is NOT a collision vector, because `int('²')` raises; it would reach the
+    name lookup and fail loudly either way. The dangerous characters are the ones `int()` accepts.
+    """
+    collide_onto_one = (
+        "١",  # ARABIC-INDIC DIGIT ONE
+        "۱",  # EXTENDED ARABIC-INDIC DIGIT ONE
+        "１",  # FULLWIDTH DIGIT ONE
+    )
+    for char in collide_onto_one:
+        # Guards the vector: each must genuinely be a collision risk, or this test proves nothing.
+        assert char.isdigit()
+        assert not char.isascii()
+        assert int(char) == 1
+        with pytest.raises(ValueError):
+            normalize_signal({**REST, "walletType": char}, "rest")
+
+    # The value they would have collided ONTO is a legitimate, accepted input — which is precisely
+    # why the collision would be invisible downstream.
+    assert normalize_signal({**REST, "walletType": "1"}, "rest").wallet_type == "1"
+
+
+def test_wallet_type_refuses_a_negative_integer_code() -> None:
+    """The sign guard on the INT path, which the refusal loop reads as covering but never reaches.
+
+    `"-1"` is in that loop and does raise — but through the NAME lookup, because `"-1".isdigit()` is
+    False, so it never reaches the sign guard at all. The loop reads as covering this dimension while
+    leaving it entirely undefended: drop the guard and the int `-1` canonicalizes to `'-1'` while the
+    string `"-1"` still raises. That is int/str disagreement on the same logical value — the property
+    the numeric-twin test pins, but pins only at `1`.
+    """
+    with pytest.raises(ValueError) as int_exc:
+        normalize_signal({**REST, "walletType": -1}, "rest")
+    assert "non-negative" in str(int_exc.value)
+
+    # The trap, asserted rather than described: the string form takes a DIFFERENT path to a
+    # different error, so a bare `raises(ValueError)` on the string cannot stand in for this.
+    assert not "-1".isdigit()
+    with pytest.raises(ValueError) as str_exc:
+        normalize_signal({**REST, "walletType": "-1"}, "rest")
+    assert "unrecognized wallet type" in str(str_exc.value)
+    assert "non-negative" not in str(str_exc.value)
+
+    # Over-correction control: 0 is non-negative and must not be swept up by the guard.
+    assert normalize_signal({**REST, "walletType": 0}, "rest").wallet_type == "0"
