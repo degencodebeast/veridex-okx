@@ -40,11 +40,12 @@ Everything above it is this lane's own and is held to the normal gates.
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -58,8 +59,13 @@ from x402.mechanisms.evm.exact.server import ExactEvmScheme  # type: ignore[impo
 from x402.schemas.payments import PaymentPayload  # type: ignore[import-untyped]
 
 from veridex.api.signal_trials_router import register_signal_trials_routes
-from veridex.api.signal_trials_schemas import CommitRequest
-from veridex.signal_trials.challenge_spec import CanonicalSignal
+from veridex.api.signal_trials_schemas import CommitRequest, OpenTrialResponse
+from veridex.signal_trials.challenge_spec import (
+    CanonicalSignal,
+    evidence_hash,
+    normalize_signal,
+    visible_at_decision,
+)
 from veridex.signal_trials.live import LiveTrial, LiveTrialRepository, handle_commit, open_live_trial
 from veridex.signal_trials.payments import (
     COMMIT_PATH,
@@ -492,7 +498,14 @@ async def test_challenge_advertises_the_CONFIGURED_payout_address(x402_app_facto
         challenge = await _challenge(client, _body(0.6))
     advertised = decode_payment_required_header(challenge.headers["payment-required"]).accepts[0]
     assert advertised.pay_to == pay_to
-    assert advertised.pay_to in (PAY_TO_A, PAY_TO_B) and PAY_TO_A != PAY_TO_B
+    # The OTHER address must be absent, which is the half that catches a hard-coding: asserting
+    # only that the advertised value equals this parametrization's own input would also pass an
+    # implementation returning a constant on the run where that constant IS the input. A previous
+    # revision of this line asserted `advertised.pay_to in (PAY_TO_A, PAY_TO_B)` and that the two
+    # differ — both true of every implementation, including a hard-coded one, and therefore
+    # nothing.
+    other = PAY_TO_B if pay_to == PAY_TO_A else PAY_TO_A
+    assert advertised.pay_to != other
 
 
 @pytest.mark.parametrize("pay_to", [PAY_TO_A, PAY_TO_B])
@@ -509,6 +522,11 @@ async def test_SETTLEMENT_is_requested_against_the_configured_payout_address(x40
     assert response.status_code == 200 and fac.settle_calls == 1
     assert fac.last_settled_requirements is not None, "the fake recorded no settlement requirements"
     assert fac.last_settled_requirements.pay_to == pay_to
+    # As at the challenge, the discriminating half: equality with this run's own input would also
+    # hold for an implementation returning a constant, on whichever run that constant matches.
+    # What rules a hard-coding out is that the OTHER configured address never appears.
+    other = PAY_TO_B if pay_to == PAY_TO_A else PAY_TO_A
+    assert fac.last_settled_requirements.pay_to != other
 
 
 async def test_wrapper_REFUSES_an_asynchronous_settlement_configuration(x402_app_factory):
@@ -634,19 +652,25 @@ async def test_reconcile_RELEASES_a_stale_in_flight_slot_and_retains_the_others(
     assert store.slot_state("0xkept", "t-kept") == "finalized"
 
 
-async def test_the_advertised_amount_is_the_configured_price_in_atomic_units(x402_app_factory):
-    """The price reaches the wire as the configured amount, through the H1.1-validated path.
+async def test_the_default_price_reaches_the_wire_through_the_H1_1_validated_path(x402_app_factory):
+    """The default price is advertised as its atomic amount, via ``build_commit_price``.
 
-    Expected value derived by integer arithmetic rather than by calling the same SDK helper the
-    wrapper uses: a comparison where both sides run the same conversion reports agreement, not
-    correctness.
+    Hard-coded expected value rather than one recomputed through the same SDK helper the wrapper
+    uses: a comparison where both sides run the same conversion reports agreement, not
+    correctness. The ceiling and the malformed-price refusals are H1.1's and are pinned in
+    ``test_payments.py``; this asserts only that the wrapper routes the price through that
+    already-validated path rather than formatting an amount itself.
     """
     app, _store, _fac = x402_app_factory(facilitator=FakeFacilitator())
     async with _client(app) as client:
         challenge = await _challenge(client, _body(0.6))
     advertised = decode_payment_required_header(challenge.headers["payment-required"]).accepts[0]
     assert advertised.amount == "10000"  # $0.01 at six decimals
-    assert build_commit_price(_settings()).price == "$0.01"
+    # The option the wrapper actually builds, not a restatement of the fixture's own input: this
+    # is the object handed to build_payment_requirements, so its network and timeout are part of
+    # what the payer is offered.
+    option = build_commit_price(_settings())
+    assert option.network == X_LAYER_MAINNET and option.max_timeout_seconds == 300
 
 
 async def test_a_refusal_never_echoes_a_configured_value(x402_app_factory):
@@ -803,6 +827,10 @@ async def test_TWO_DIFFERENT_payers_may_commit_to_ONE_trial(x402_app_factory):
     other agent, turning a benchmark into a race.
     """
     other_payer = "0x" + "e" * 40
+    # A vacuity GUARD, not a property of the code: if these two ever became equal this test would
+    # silently degrade into a single-payer test that passes against a payer-blind slot key. It
+    # compares two constants on purpose, so a future edit to either one fails here rather than
+    # quietly removing the coverage.
     assert other_payer != FAKE_PAYER
     store = _FaultInjectingStore(_fresh_root())
     trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
@@ -1138,3 +1166,162 @@ async def test_a_CORRUPT_finalized_row_is_never_counted_as_servable(x402_app_fac
         store.count_all_public()
     with pytest.raises(ValueError, match="not readable JSON"):
         store.public_records(FAKE_PAYER)
+
+
+# ----------------------------------------------------------------------------------------
+# C22 CROSS-LANE SURFACE PINS — pin the SURFACE, not the blob.
+#
+# This lane CONSUMES three modules it does not own, all read-only. Reading another lane's
+# public surface is permitted and is not a blocking dependency; only EDITING one would be. What
+# C22 requires in exchange is that the dependent lane record the surface it consumes and assert
+# it mechanically, because a blob difference is never a finding and a surface difference always
+# is.
+#
+#   veridex/signal_trials/challenge_spec.py   (DATA-owned)
+#       CanonicalSignal, normalize_signal, visible_at_decision, evidence_hash
+#   veridex/api/signal_trials_schemas.py
+#       CommitRequest (the wire contract this lane validates), OpenTrialResponse (constructed
+#       by the router)
+#   veridex/signal_trials/published.py
+#       read_season, read_state — inherited from H1.2, untouched here
+#
+# Candle and CandleSeries are deliberately NOT pinned here: neither symbol appears anywhere in
+# this lane's owned set, so asserting their shape would be an assertion that reads as
+# discharging an obligation while testing something this lane never touches. That is the
+# vacuous-assertion shape, and the honest answer to "does H4.1 depend on Candle" is no.
+#
+# SCOPE LIMIT, stated so these pins are not over-credited. Surface identity answers "is the
+# DEPENDENT lane affected by the owner's change". It does NOT answer "is the owner correct" —
+# a canonicalizer that mapped a wire field to the wrong attribute would leave every surface
+# below identical, and that pin belongs in Data's own suite.
+#
+# And per C17-R2-A1, field ORDER is the property that breaks SILENTLY where names, arity and
+# types break loudly. This lane's exposure to order is genuinely LOW and it is worth being
+# precise rather than claiming credit: every construction here is by KEYWORD
+# (`CanonicalSignal(**fields)`, `OpenTrialResponse(trial_id=...)`), never positional, so a
+# reorder cannot silently transpose values the way Law's positional eight-argument construction
+# could. Order is asserted anyway — it is cheap, it is what C22 requires, and the reason it is
+# safe here is a property of THIS code that a future edit could remove.
+# ----------------------------------------------------------------------------------------
+
+#: The surface consumed from DATA-owned ``challenge_spec.py``. Names IN ORDER, with types.
+CANONICAL_SIGNAL_SURFACE = (
+    ("t0_ms", int),
+    ("chain_index", str),
+    ("token_address", str),
+    ("symbol", str),
+    ("name", str),
+    ("market_cap_usd", float),
+    ("holders", int),
+    ("top10_holder_percent", float),
+    ("trigger_price", float),
+    ("wallet_type", str),
+    ("trigger_wallet_count", int),
+    ("trigger_wallet_address", str),
+    ("amount_usd", float),
+)
+
+#: The wire contract this lane validates every paid commit against.
+COMMIT_REQUEST_SURFACE = (("trial_id", str), ("p_follow_profitable", float), ("methodology_version", str | None))
+
+#: The discovery payload the router constructs for a known or open trial.
+OPEN_TRIAL_RESPONSE_SURFACE = ("trial_id", "trial_mode", "t0_ms", "commit_deadline_ms", "evidence", "evidence_hash")
+
+
+def test_C22_canonical_signal_surface_is_unchanged():
+    """The DATA-owned evidence model this lane binds receipts to, asserted mechanically.
+
+    Arity first, then names in order, then types. Arity is the assertion that actually protects
+    this lane: ``LiveTrialRepository._load`` rebuilds a signal with ``CanonicalSignal(**stored)``,
+    so a field ADDED without a default makes every previously published trial unloadable, and a
+    field REMOVED makes every stored document invalid. Both are loud, and both would otherwise
+    surface as a runtime failure in the API rather than as a gate finding.
+    """
+    fields = CanonicalSignal.model_fields
+    assert len(fields) == len(CANONICAL_SIGNAL_SURFACE) == 13
+    assert tuple(fields) == tuple(name for name, _t in CANONICAL_SIGNAL_SURFACE)
+    assert {n: f.annotation for n, f in fields.items()} == dict(CANONICAL_SIGNAL_SURFACE)
+    # Frozen is load-bearing, not incidental: this object is the input to evidence_hash, so a
+    # mutable one would let a receipt and the evidence it attests to drift apart silently.
+    assert CanonicalSignal.model_config.get("frozen") is True
+    # `sold_ratio_percent` is absent BY CONSTRUCTION, in both wire spellings. Its absence from
+    # the model, not a filter downstream, is what makes the leak impossible.
+    assert "sold_ratio_percent" not in fields and "soldRatioPercent" not in fields
+
+
+def test_C22_the_three_consumed_callables_exist_with_the_expected_arity():
+    """``normalize_signal``, ``visible_at_decision`` and ``evidence_hash``, as this lane calls them.
+
+    Asserted by INSPECTING the signatures rather than by calling them, so this fails on a
+    contract change even when a call would still happen to succeed — a parameter renamed from
+    ``source`` to something else keeps ``normalize_signal(raw, source=...)`` working nowhere but
+    breaks the operator script, which passes it by keyword.
+    """
+    assert list(inspect.signature(normalize_signal).parameters) == ["raw", "source"]
+    assert list(inspect.signature(visible_at_decision).parameters) == ["sig"]
+    assert list(inspect.signature(evidence_hash).parameters) == ["sig"]
+    # And the two this lane reads through LiveTrial properties agree with each other: the hash
+    # must bind the SAME payload that is served, or discovery and verification describe
+    # different snapshots.
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    assert trial.evidence == visible_at_decision(trial.sig)
+    assert trial.evidence_hash == evidence_hash(trial.sig)
+
+
+def test_C22_commit_request_surface_and_its_probability_bound():
+    """The wire contract, including the bound this lane RELIES ON pydantic to enforce.
+
+    The bound is part of the surface, not decoration. This lane's 422 on an out-of-range
+    probability at the HTTP boundary comes from ``CommitRequest`` rejecting it, so a relaxed
+    bound in an unowned file would silently move validation off the wire and onto
+    ``handle_commit``'s defensive check alone. Asserted as metadata rather than by feeding a bad
+    value, so it fails on the CONSTRAINT changing rather than on the behaviour of one input.
+    """
+    fields = CommitRequest.model_fields
+    assert len(fields) == 3
+    assert tuple(fields) == tuple(name for name, _t in COMMIT_REQUEST_SURFACE)
+    assert {n: f.annotation for n, f in fields.items()} == dict(COMMIT_REQUEST_SURFACE)
+    bounds = {type(m).__name__: m for m in fields["p_follow_profitable"].metadata}
+    assert bounds["Ge"].ge == 0 and bounds["Le"].le == 1
+    assert fields["methodology_version"].is_required() is False
+
+
+def test_C22_open_trial_response_surface_is_what_the_router_constructs():
+    """Constructed by keyword in ``_open_trial_response``, so its field NAMES are the contract.
+
+    ``trial_mode`` is a ``Literal["live"]``: the router passes the literal string rather than the
+    trial's own mode, and that is deliberate — a replay trial must not be constructible as a
+    discovery payload at all, so the type refuses it instead of the router remembering to.
+    """
+    assert tuple(OpenTrialResponse.model_fields) == OPEN_TRIAL_RESPONSE_SURFACE
+    assert OpenTrialResponse.model_fields["trial_mode"].annotation == Literal["live"]
+
+
+# ----------------------------------------------------------------------------------------
+# NON-VACUOUS BOUNDARY PINS — the widening direction.
+#
+# The inclusive-bounds test above proves p=0 and p=1 are ACCEPTED, which kills a bound
+# TIGHTENED to an open interval. It says nothing about a bound WIDENED: `<= 1.0` changed to
+# `<= 2.0` accepts every value those vectors use, and 1.7 (the only out-of-range value tested
+# elsewhere) is so far outside that it cannot distinguish a bound at 1.0 from one at 1.5.
+#
+# A boundary assertion whose input already sits inside the bound proves nothing about the
+# comparison. These use values immediately OUTSIDE it, through `model_construct` so pydantic
+# does not answer first — which is the only way to reach handle_commit's own check.
+# ----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("just_outside", [1.0000001, 1.5, -0.0000001, -0.5])
+def test_the_probability_bound_refuses_values_JUST_outside_it(just_outside):
+    """A probability a hair outside [0, 1] is refused, in both directions.
+
+    Paired with the inclusive test: together they pin the bound's LOCATION rather than merely
+    its existence. Tightening the interval kills the inclusive test; widening it in either
+    direction kills this one. Neither test alone constrains where the bound sits.
+    """
+    store = ReceiptStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    unvalidated = CommitRequest.model_construct(trial_id=LIVE_TRIAL_ID, p_follow_profitable=just_outside)
+    outcome = handle_commit(unvalidated, trial=trial, payer=PAY_TO_A, now_ms=NOW_MS, store=store)
+    assert outcome.status == 422 and outcome.error == "invalid_probability"
+    assert store.count_all() == 0 and store.slot_count() == 0
