@@ -195,7 +195,20 @@ def _finite_candle_number(raw: Any, wire_column: str, field: str) -> float:
         The parsed value, guaranteed finite.
 
     Raises:
-        OKXResponseError: The value parsed to ``+inf``, ``-inf`` or ``NaN``.
+        OKXResponseError: ``raw`` parsed successfully but to ``+inf``, ``-inf`` or ``NaN``. This is
+            the only exception this function itself raises.
+        ValueError: ``float()`` could not parse ``raw`` at all — ``"abc"``, ``""``. Propagates from
+            ``float()`` unconverted, exactly as it did before this guard existed. Listed because a
+            ``Raises`` section that names only the new failure reads as though it were the only one.
+            Note ``OKXResponseError`` is itself a ``ValueError`` subclass, so a caller catching
+            ``ValueError`` catches both — and a test that wants to tell them apart must assert the
+            EXACT type rather than use ``isinstance``.
+        TypeError: ``raw`` was not a type ``float()`` accepts — ``None``. Same provenance.
+
+    The ``ValueError``/``TypeError`` paths PREDATE this guard and are deliberately left alone.
+    Converting them to ``OKXResponseError`` would be tidier and is out of scope: PKT-DEC-C28
+    authorizes rejecting NON-FINITE values here, which is a different change from rejecting
+    UNPARSEABLE ones. Documented rather than silently widened.
     """
     parsed = float(raw)
     if not math.isfinite(parsed):

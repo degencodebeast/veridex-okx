@@ -602,9 +602,16 @@ def _candle_row(**overrides: str) -> list[str]:
     return [row[column] for column in DOCUMENTED_CANDLE_COLUMNS]
 
 
-def _candles_client(rows: list[object]) -> tuple[OKXMarketClient, RecordingFake]:
-    fake = RecordingFake({"code": "0", "data": rows})
-    return OKXMarketClient(fake, OKXCredentials("k", "s", "p")), fake
+def _candles_client(rows: list[object]) -> OKXMarketClient:
+    """A client whose transport answers with ``rows`` inside a success envelope.
+
+    Returns the CLIENT ALONE. This used to hand back ``(client, fake)`` and all eight call sites
+    discarded the fake with ``, _``: a returned value that nothing consumes reads as though it might
+    matter, so the next person adding a vector has to check whether it does. None of these vectors
+    asserts on the REQUEST — the request surface is pinned by the C18/C21 pins above, which build
+    their own fakes precisely because they need to inspect them.
+    """
+    return OKXMarketClient(RecordingFake({"code": "0", "data": rows}), OKXCredentials("k", "s", "p"))
 
 
 @pytest.mark.parametrize("column", list(NUMERIC_COLUMN_TO_FIELD))
@@ -618,7 +625,7 @@ async def test_get_candles_rejects_a_non_finite_value_in_EVERY_numeric_column(co
     carries a FINITE value in the other five numeric columns, so the rejection is attributable to
     the column named in the test id and to no other.
     """
-    client, _ = _candles_client([_candle_row(**{column: raw})])
+    client = _candles_client([_candle_row(**{column: raw})])
 
     # PKT-DEC-C25: a rejection pin on a settlement path carries `match=`. Bare `pytest.raises` does
     # not discriminate identity, and `OKXResponseError` is raised by the envelope guard and both
@@ -653,7 +660,7 @@ async def test_get_candles_rejects_a_non_finite_value_in_ANY_ROW_position(positi
     assert len(rows) == 3
     assert sum(1 for row in rows if "1e400" in row) == 1
 
-    client, _ = _candles_client(rows)
+    client = _candles_client(rows)
 
     with pytest.raises(OKXResponseError, match="must be a finite number") as excinfo:
         await client.get_candles("501", "So1", "1m")
@@ -672,7 +679,7 @@ async def test_the_C28_defect_vector_can_no_longer_become_a_confident_price():
     assert float("1e400") == float("inf")
     assert not math.isfinite(float("1e400"))
 
-    client, _ = _candles_client([_candle_row(c="1e400")])
+    client = _candles_client([_candle_row(c="1e400")])
 
     with pytest.raises(OKXResponseError, match="must be a finite number"):
         await client.get_candles("501", "So1", "1m")
@@ -732,7 +739,7 @@ async def test_get_candles_still_accepts_EVERY_finite_value_including_negative_a
     The value is placed in ALL SIX numeric columns at once, so no column is exempted from the
     control the way a single-column vector would exempt five.
     """
-    client, _ = _candles_client([_candle_row(**dict.fromkeys(NUMERIC_COLUMN_TO_FIELD, raw))])
+    client = _candles_client([_candle_row(**dict.fromkeys(NUMERIC_COLUMN_TO_FIELD, raw))])
 
     series = await client.get_candles("501", "So1", "1m")
 
@@ -756,12 +763,12 @@ async def test_the_boundary_is_the_double_OVERFLOW_and_both_sides_of_it_are_exer
     assert math.isfinite(float("1e308"))
     assert math.isinf(float("1e309"))
 
-    accepted, _ = _candles_client([_candle_row(c="1e308")])
+    accepted = _candles_client([_candle_row(c="1e308")])
     series = await accepted.get_candles("501", "So1", "1m")
     assert isinstance(series, CandleSeries)
     assert series.candles[0].close == 1e308
 
-    rejected, _ = _candles_client([_candle_row(c="1e309")])
+    rejected = _candles_client([_candle_row(c="1e309")])
     with pytest.raises(OKXResponseError, match="must be a finite number"):
         await rejected.get_candles("501", "So1", "1m")
 
@@ -787,7 +794,7 @@ async def test_the_candle_vector_matches_the_DOCUMENTED_upstream_schema_field_fo
 
     row = _candle_row()
     assert len(row) == CANDLE_FIELD_COUNT
-    client, _ = _candles_client([row])
+    client = _candles_client([row])
 
     series = await client.get_candles("501", "So1", "1m")
 
@@ -817,7 +824,7 @@ async def test_the_refusal_NAMES_the_column_it_refused_and_names_no_other():
     """
     messages = {}
     for column in NUMERIC_COLUMN_TO_FIELD:
-        client, _ = _candles_client([_candle_row(**{column: "1e400"})])
+        client = _candles_client([_candle_row(**{column: "1e400"})])
         with pytest.raises(OKXResponseError, match="must be a finite number") as excinfo:
             await client.get_candles("501", "So1", "1m")
         messages[column] = str(excinfo.value)
@@ -833,3 +840,83 @@ async def test_the_refusal_NAMES_the_column_it_refused_and_names_no_other():
     # All six refusals are distinguishable from one another. Stated directly rather than left to
     # follow from the assertions above: one generic message for all six columns is the failure mode.
     assert len(set(messages.values())) == 6
+
+
+def test_the_finite_candle_defaults_are_distinct_AS_PARSED_VALUES():
+    """Guards the FIXTURE, not the client — the invariant `_FINITE_CANDLE`'s own comment CLAIMS.
+
+    That comment says the defaults are distinct "so a vector that overrides ONE column cannot be
+    mistaken for one that overrode another and a transposition stays visible". Nothing asserted it.
+    The model was already in this file: the C21 mapping pin carries exactly this guard, and its
+    comment predicts this failure — "if a later edit made two of these values equal, the pin would
+    silently stop detecting a swap between them while every assertion above still passed". H2.6
+    cloned that pin's six values AND its rationale comment, but not its guard. That is standing
+    lesson 130 exactly: cloning copies the body and leaves the tests behind, because attention
+    follows novelty.
+
+    PARSED, NOT RAW. The fixture holds strings. A set over the STRINGS would call "11.0" and "11.00"
+    distinct while `float()` collapses them to one number — so a string-level invariant would pass
+    while the property it claims to protect was already violated. The claim is about VALUES, so the
+    assertion parses.
+
+    BOUNDED HONESTLY: no production defect escapes today. The rejection vectors discriminate on the
+    non-finite override, not on their finite neighbours, and the C21 mapping pin independently keeps
+    its own distinct values. This closes one of three detection layers, not a live hole.
+    """
+    numeric_defaults = {column: _FINITE_CANDLE[column] for column in NUMERIC_COLUMN_TO_FIELD}
+    # EXAMINED count named beside its predicate rather than left implicit. Six NUMERIC columns: `ts`
+    # is parsed by `int()` and `confirm` is compared as a string, so neither can take part in a
+    # float transposition and neither is in scope for this invariant.
+    assert len(numeric_defaults) == 6
+    assert set(numeric_defaults) == set(NUMERIC_COLUMN_TO_FIELD)
+
+    parsed = [float(raw) for raw in numeric_defaults.values()]
+    assert len(parsed) == 6
+    assert len(set(parsed)) == 6, f"finite candle defaults are not distinct AS VALUES: {numeric_defaults}"
+
+    # DEMONSTRATION, not a guard on the fixture — this pair passes for ANY fixture and is labelled
+    # so rather than left to look like a check. It makes the reason the assertion above parses
+    # executable instead of a comment, because the next person tempted to "simplify" it into a set
+    # over the raw strings reads this first.
+    assert "11.0" != "11.00"
+    assert float("11.0") == float("11.00")
+
+
+async def test_UNPARSEABLE_wire_values_still_propagate_their_ORIGINAL_exception_type():
+    """PIN OF PRE-EXISTING BEHAVIOUR. THIS IS NOT A RED — it passed the instant it was written.
+
+    Saying so is the point. Presenting a test that never failed as captured RED is the
+    vacuous-evidence class this lane has already been burned by, and a docstring is not executable,
+    so the MINOR it accompanies has no RED to capture.
+
+    `float()` raises before the finiteness guard is ever consulted, so `"abc"` and `""` surface a
+    built-in `ValueError` and `None` a `TypeError`, all through the public `get_candles` path. That
+    predates H2.6 and PKT-DEC-C28 does not authorize changing it: this task rejects NON-FINITE
+    values, which is a different change from rejecting UNPARSEABLE ones. The pin exists so the
+    boundary is a RECORDED DECISION — a later task that does convert these must do it deliberately,
+    against a failing test, rather than by tidying.
+
+    EXACT TYPE, NOT `isinstance`. `OKXResponseError` subclasses `ValueError`, so
+    `pytest.raises(ValueError)` passes on the finiteness rejection too and would discriminate
+    nothing at all. `type(...) is ValueError` is what separates "float() could not parse this" from
+    "this module refused it", and that distinction is the entire content of this pin.
+    """
+    open_index = DOCUMENTED_CANDLE_COLUMNS.index("o")
+    for raw, expected in (("abc", ValueError), ("", ValueError), (None, TypeError)):
+        row: list[object] = list(_candle_row())
+        row[open_index] = raw
+        client = _candles_client([row])
+
+        with pytest.raises(expected) as excinfo:
+            await client.get_candles("501", "So1", "1m")
+
+        assert type(excinfo.value) is expected
+        assert not isinstance(excinfo.value, OKXResponseError)
+
+    # ACCEPTANCE CONTROL (standing lesson 212). A suite that only asserts refusal passes identically
+    # when the subject refuses EVERYTHING — including when the harness is broken and refusing the
+    # finite baseline too. Same column, same helper, one parseable value: it must go through.
+    control = _candles_client([_candle_row(o="11.0")])
+    series = await control.get_candles("501", "So1", "1m")
+    assert isinstance(series, CandleSeries)
+    assert series.candles[0].open == 11.0
