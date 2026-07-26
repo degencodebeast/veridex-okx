@@ -14,6 +14,10 @@ Two trust-relevant properties this module is responsible for:
    ``bar``/``bar_ms`` to be persisted in every receipt, and a season must never mix bars.
 2. **Credential secrecy.** ``OKXCredentials`` has a redacting ``__repr__`` so a traceback or a
    log line can never echo the secret key or passphrase. This module performs no logging at all.
+3. **Fail closed, never quietly empty.** An error envelope or an off-contract candle row raises
+   (``OKXAPIError`` / ``OKXResponseError``) instead of degrading into an empty page or series.
+   §7 permits an empty settlement result only for genuine absence, so a swallowed API failure
+   would masquerade as a lawful ``UNSCORED`` — a false provenance claim rather than a diagnostic.
 
 Normalization of the raw signal dicts is task H2.2 and deliberately does NOT happen here —
 ``SignalPage.signals`` carries the wire dicts untouched.
@@ -33,10 +37,43 @@ from urllib.parse import urlencode
 SIGNAL_LIST_PATH = "/api/v6/dex/market/signal/list"
 HISTORICAL_CANDLES_PATH = "/api/v6/dex/market/historical-candles"
 
+# OKX signals application errors in the envelope `code`, not in the HTTP status, so an
+# `raise_for_status` in the transport cannot stand in for this check.
+OKX_SUCCESS_CODE = "0"
+
+# The frozen candle wire record: [ts, o, h, l, c, vol, volUsd, confirm] (implementation-plan.md:51).
+CANDLE_FIELD_COUNT = 8
+
 # Bar width in milliseconds. The (chain x bar) preference matrix (§5.1) selects one bar for the
 # whole season: `1m` preferred, `1H` the fallback. Anything else is rejected rather than guessed,
 # because a wrong bar width silently corrupts the §7 close-boundary law.
 BAR_MS: dict[str, int] = {"1m": 60_000, "1H": 3_600_000}
+
+
+class OKXClientError(Exception):
+    """Base for every OKX response this client refuses to convert into a result."""
+
+
+class OKXAPIError(OKXClientError):
+    """OKX returned a non-success envelope ``code``.
+
+    This must never be absorbed into an empty page or series: §7 reserves an empty settlement
+    result for genuine absence (``UNSCORED``), so silently swallowing an auth/parameter/API
+    failure would turn a diagnostic failure into a false provenance claim.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"OKX returned non-success code {code!r}: {msg or '<no msg>'}")
+        self.code = code
+        self.msg = msg
+
+
+class OKXResponseError(OKXClientError, ValueError):
+    """A response did not match the frozen wire contract (bad envelope shape or candle row).
+
+    Also a ``ValueError`` so that callers written against H2.1's documented malformed-row
+    behaviour keep working.
+    """
 
 
 class Transport(Protocol):
@@ -73,10 +110,7 @@ class OKXCredentials:
     base_url: str = "https://web3.okx.com"
 
     def __repr__(self) -> str:
-        return (
-            "OKXCredentials(api_key='***', secret_key='***', passphrase='***', "
-            f"base_url={self.base_url!r})"
-        )
+        return f"OKXCredentials(api_key='***', secret_key='***', passphrase='***', base_url={self.base_url!r})"
 
 
 @dataclass(frozen=True)
@@ -130,8 +164,23 @@ def _timestamp() -> str:
 
 
 def _rows(payload: dict[str, Any]) -> list[Any]:
+    """Return the envelope's ``data`` list, failing closed on anything that is not a success.
+
+    Only a success ``code`` with a list ``data`` may produce an empty result. Everything else
+    raises, because an empty page/series is a *claim* — that OKX had nothing to report — and an
+    error envelope is not evidence for that claim.
+    """
+    if not isinstance(payload, dict):
+        raise OKXResponseError(f"OKX response must be a JSON object, got {type(payload).__name__}")
+    if "code" not in payload:
+        raise OKXResponseError("OKX response is missing the envelope 'code' field")
+    code = str(payload["code"])
+    if code != OKX_SUCCESS_CODE:
+        raise OKXAPIError(code, str(payload.get("msg", "")))
     data = payload.get("data")
-    return list(data) if isinstance(data, list) else []
+    if not isinstance(data, list):
+        raise OKXResponseError(f"OKX response 'data' must be a list, got {type(data).__name__}")
+    return list(data)
 
 
 class OKXMarketClient:
@@ -168,9 +217,7 @@ class OKXMarketClient:
             filters["cursor"] = cursor
         body = [filters]
         headers = self._headers("POST", SIGNAL_LIST_PATH, json.dumps(body, separators=(",", ":")))
-        payload = await self._transport.request(
-            "POST", SIGNAL_LIST_PATH, params=None, json_body=body, headers=headers
-        )
+        payload = await self._transport.request("POST", SIGNAL_LIST_PATH, params=None, json_body=body, headers=headers)
 
         rows = _rows(payload)
         next_cursor: str | None = None
@@ -192,7 +239,9 @@ class OKXMarketClient:
         """Historical candles for one token — the §7 settlement source.
 
         Raises ``ValueError`` for a bar this client has no width for; guessing one would silently
-        skew every ``close_ts`` derived from the series.
+        skew every ``close_ts`` derived from the series. Raises ``OKXAPIError`` /
+        ``OKXResponseError`` rather than returning a partial or empty series for an error
+        envelope or a row that is not the frozen wire record.
         """
         if bar not in BAR_MS:
             raise ValueError(f"unsupported bar {bar!r}; supported bars: {sorted(BAR_MS)}")
@@ -212,10 +261,19 @@ class OKXMarketClient:
 
         candles: list[Candle] = []
         for row in _rows(payload):
-            fields = list(row)
-            if len(fields) < 8:
-                raise ValueError(f"malformed candle row: expected 8 fields, got {len(fields)}")
-            ts, open_, high, low, close, vol, vol_usd, confirm = fields[:8]
+            # Validate the container BEFORE converting: `list("12345678")` would explode a string
+            # into eight characters and yield a complete, plausible-looking candle.
+            if not isinstance(row, (list, tuple)):
+                raise OKXResponseError(f"candle row must be a list or tuple, got {type(row).__name__}")
+            # Exact arity, never truncation. Taking the first 8 of a longer row reads some other
+            # column as `confirm`, and the settlement selector keys eligibility on `confirmed` —
+            # so a silent schema drift would make every trial look genuinely unsettleable.
+            if len(row) != CANDLE_FIELD_COUNT:
+                raise OKXResponseError(
+                    f"candle row must have exactly {CANDLE_FIELD_COUNT} fields "
+                    f"[ts,o,h,l,c,vol,volUsd,confirm], got {len(row)}"
+                )
+            ts, open_, high, low, close, vol, vol_usd, confirm = row
             candles.append(
                 Candle(
                     ts_open_ms=int(ts),  # OKX `ts` is the candle OPEN time (§7).
