@@ -1735,11 +1735,25 @@ async def test_no_unrecognized_marker_is_read_as_a_buy(marker):
 # rather than derived from the fixture - a vector derived from the thing under test cannot detect
 # that thing drifting.
 DOCUMENTED_SIGNAL_ROW_FIELDS = {
-    "timestamp", "chainIndex", "price", "walletType", "triggerWalletCount",
-    "triggerWalletAddress", "amountUsd", "soldRatioPercent", "cursor", "token",
+    "timestamp",
+    "chainIndex",
+    "price",
+    "walletType",
+    "triggerWalletCount",
+    "triggerWalletAddress",
+    "amountUsd",
+    "soldRatioPercent",
+    "cursor",
+    "token",
 }
 DOCUMENTED_SIGNAL_TOKEN_FIELDS = {
-    "tokenAddress", "symbol", "name", "logo", "marketCapUsd", "holders", "top10HolderPercent",
+    "tokenAddress",
+    "symbol",
+    "name",
+    "logo",
+    "marketCapUsd",
+    "holders",
+    "top10HolderPercent",
 }
 
 
@@ -1758,8 +1772,28 @@ def test_the_fixture_matches_the_DOCUMENTED_upstream_schema_field_for_field():
         assert invented not in row, f"the default fixture invented a {invented!r} member"
 
 
-class UndeclaredSource(FakeMarketClient):
-    """A source that does NOT attest its contractual polarity."""
+class BareSource:
+    """A source that OMITS the attestation attribute entirely - the realistic non-declaring shape.
+
+    Deliberately NOT a FakeMarketClient subclass: inheriting would inherit the attestation, which is
+    exactly how the two cases below missed the `getattr` DEFAULT. `OKXMarketClient` carries no such
+    attribute either (0 hits), which is the whole reason FrozenSignalListSource exists - so an object
+    with no attribute is what a real non-declaring source looks like, and `= None` is a shape nobody
+    would write.
+    """
+
+    def __init__(self, pages_by_chain=None, series_by_key=None, *, fail_on=None):
+        self._inner = FakeMarketClient(pages_by_chain, series_by_key, fail_on=fail_on)
+
+    async def list_signals(self, f, cursor=None):
+        return await self._inner.list_signals(f, cursor)
+
+    async def get_candles(self, chain_index, token, bar, *, before_ms=None, limit=100):
+        return await self._inner.get_candles(chain_index, token, bar, before_ms=before_ms, limit=limit)
+
+
+class AttestsNoneSource(FakeMarketClient):
+    """A source that DEFINES the attribute and sets it to None. Real, but not the realistic case."""
 
     signal_source_direction = None
 
@@ -1770,7 +1804,22 @@ class SellSideSource(FakeMarketClient):
     signal_source_direction = "sell"
 
 
-@pytest.mark.parametrize("source_cls", [UndeclaredSource, SellSideSource], ids=["undeclared", "declares-sell"])
+def test_the_bare_source_really_omits_the_attestation_attribute():
+    """The precondition the parametrized vector below depends on.
+
+    If BareSource ever grew the attribute - by inheritance or by edit - the `omits-attribute` case
+    would silently become a third copy of `attests-none`, and the getattr DEFAULT would go unpinned
+    again without any test failing. This is the assertion that would notice.
+    """
+    assert not hasattr(BareSource, "signal_source_direction")
+    assert not hasattr(BareSource(), "signal_source_direction")
+
+
+@pytest.mark.parametrize(
+    "source_cls",
+    [BareSource, AttestsNoneSource, SellSideSource],
+    ids=["omits-attribute", "attests-none", "declares-sell"],
+)
 async def test_a_source_that_does_not_attest_the_buy_contract_FAILS_CLOSED(source_cls):
     """THE THIRD OUTCOME. Confirmation comes from the source's contract, never from clean rows.
 
@@ -1779,6 +1828,13 @@ async def test_a_source_that_does_not_attest_the_buy_contract_FAILS_CLOSED(sourc
     byte-identical to the ones that confirm in the test below - the ONLY difference is whether the
     source attests what endpoint it is bound to. Without this, generalising the client to a source
     whose polarity is not contractually fixed would silently inherit a guarantee it no longer has.
+
+    THREE cases, and the first one is the one that was missing. Both original vectors DEFINED the
+    attribute, so the `getattr` DEFAULT was never consulted by any test and mutating it from None to
+    the frozen contract - making a source that declares NOTHING confirm buy polarity - survived all
+    499 tests. That is the same structural error as the milestone MAJOR-1 one level down and on the
+    fail-open side: every vector held the discriminating dimension (is the attribute DEFINED?)
+    constant, while the parametrize id claimed the dimension it did not reach.
     """
     pages = {"501": [_page([_sig()])]}
     result = await run_matrix_probe(source_cls(pages), _filters())
@@ -1855,9 +1911,7 @@ async def test_an_unconfirmed_direction_survives_a_fully_qualified_matrix():
     """End-to-end: real counts, unreadable polarity, no season."""
     tokens = [f"T{i}" for i in range(3)]
     pages = {
-        "501": [
-            _page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, direction="sell") for i, t in enumerate(tokens)])
-        ]
+        "501": [_page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, direction="sell") for i, t in enumerate(tokens)])]
     }
     series = {}
     for i, token in enumerate(tokens):
@@ -2187,8 +2241,12 @@ def test_main_writes_a_completed_artifact_on_success(operator_script, tmp_path, 
 
 @pytest.mark.parametrize(
     ("flag", "value", "frozen"),
-    [("--min-trials", "1", 40), ("--min-trials", "200", 40),
-     ("--cooldown-ms", "1000", 14_400_000), ("--horizon-ms", "60000", 3_600_000)],
+    [
+        ("--min-trials", "1", 40),
+        ("--min-trials", "200", 40),
+        ("--cooldown-ms", "1000", 14_400_000),
+        ("--horizon-ms", "60000", 3_600_000),
+    ],
     ids=["min-trials-lowered", "min-trials-raised", "cooldown", "horizon"],
 )
 def test_main_REFUSES_a_non_frozen_season_policy(operator_script, tmp_path, monkeypatch, capsys, flag, value, frozen):
@@ -2234,9 +2292,23 @@ def test_main_accepts_the_frozen_policy_stated_explicitly(operator_script, tmp_p
     assert json.loads(out.read_text())["season_status"] == "qualified"
 
 
-def test_the_artifact_declares_the_policy_it_was_produced_under(tmp_path):
-    """PROVENANCE. Without it, a run under a lowered threshold is indistinguishable downstream from
-    a conforming one and can still be labelled `qualified`."""
+def test_the_artifact_DECLARES_the_frozen_policy(tmp_path):
+    """PROVENANCE, and the name says DECLARES because that is what this asserts.
+
+    The previous name - "..._the_policy_it_was_produced_under" - claimed a RECORD of the run while
+    the assertion only ever checked a DECLARATION of the frozen constants (QUALITY MINOR-10, C26:
+    a test whose name claims more than it pins). The block is sourced from FROZEN_* and is therefore
+    true of anything the authoritative CLI can produce, because that path REFUSES a deviation before
+    the probe runs.
+
+    KNOWN LIMITATION, stated here rather than pinned by a test: on the LIBRARY path a caller can run
+    `run_matrix_probe(..., cooldown_ms=1000)` and hand the result to this writer, and the artifact
+    will declare the frozen 4h cooldown beside counts the frozen policy would never produce. The
+    writer cannot detect it - cooldown and horizon change the COUNTS, and a matrix carries no record
+    of how it was counted. Closing it needs a channel from the probe to the writer, which means a
+    production change; it is NOT pinned by a test here because a test asserting the present
+    behaviour would defend the defect against being fixed.
+    """
     matrix = _full(41, 0, 0, 0)
     out = tmp_path / "preflight_result.json"
     write_preflight_result(select_combo(matrix), matrix, out)
