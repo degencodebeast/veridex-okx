@@ -23,8 +23,12 @@ Structure:
    Every gap is closed by ADDITION. No frozen byte is edited.
 """
 
+import ast
+import functools
 import inspect
 import json
+import os
+import pathlib
 import re
 from dataclasses import fields
 from importlib import util as importlib_util
@@ -105,6 +109,27 @@ def _full(n0, n1, n2, n3, *, ok=True, reasons=None):
     )
 
 
+def _run_preflight_path():
+    return Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+
+
+@functools.lru_cache(maxsize=1)
+def _load_run_preflight():
+    """Load the operator script BY PATH, once.
+
+    By path because importing scripts.signal_trials.run_preflight would need a
+    scripts/signal_trials/__init__.py this task does not own. Cached because eleven call sites each
+    running a full exec_module is eleven executions of a module whose whole point is that importing
+    it does nothing (QUALITY NIT-1).
+    """
+    script = _run_preflight_path()
+    assert script.exists(), f"operator script missing at {script}"
+    spec = importlib_util.spec_from_file_location("run_preflight_under_test", script)
+    module = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _count_for(result, chain_index, bar):
     for count in result.counts:
         if (count.chain_index, count.bar) == (chain_index, bar):
@@ -121,6 +146,30 @@ def _count_for(result, chain_index, bar):
 def test_combo_order_is_the_frozen_predeclared_matrix():
     """Precision (1m) above nativeness (X Layer); nativeness breaks ties within a precision tier."""
     assert COMBO_ORDER == (("196", "1m"), ("501", "1m"), ("196", "1H"), ("501", "1H"))
+
+
+def test_the_polarity_constants_are_a_CLOSED_set():
+    """Membership, not just behaviour over a sample.
+
+    Both constants were exercised by parametrized families over hard-coded literals - correct per
+    C18 - but neither constant's MEMBERSHIP was asserted, so widening either survived the whole
+    suite: `_DIRECTION_KEYS += ("tradeSide",)` and `_BUY_MARKERS |= {"bid"}` both passed 463 tests
+    (QUALITY MINOR-1). That is the fail-OPEN direction on "never guess polarity", the one property
+    the module docstring elevates above all others, and the file already applies exactly this
+    discipline to COMBO_ORDER, CANDLE_LIMIT and RESULT_KEYS. Applying it unevenly is what lets a
+    fifth key land precisely where the lock does not reach.
+    """
+    assert preflight._DIRECTION_KEYS == ("direction", "side", "signalType", "tradeDirection")
+    assert frozenset({"buy", "b", "long"}) == preflight._BUY_MARKERS
+
+
+def test_the_frozen_pagination_bound_is_pinned():
+    """MAX_PAGES was the one frozen constant with no literal pin while CANDLE_LIMIT had one.
+
+    It is a runaway bound rather than a correctness constant, so the stakes are lower - but the
+    asymmetry is the same shape as MINOR-1 (QUALITY NIT-2), and it is one line.
+    """
+    assert preflight.MAX_PAGES == 100
 
 
 def test_combo_count_field_order_is_pinned():
@@ -219,7 +268,11 @@ def test_law_settlement_function_surface_is_pinned():
     assert hints["return"] == (Candle | None)
 
 
-LAW_OWNED_MODULES = ("spot_markout", "scoring", "leaderboard", "rank_guards")
+# The packet names FOUR Law surfaces: veridex/scoring.py, veridex/leaderboard.py,
+# veridex/rank_guards.py and veridex/law/** - the last of which exists in the tree with edge.py
+# and recompute.py, and was missing here. The test's NAME asserts the general property, so
+# enumerating three of four made the name overclaim (QUALITY MINOR-6).
+LAW_OWNED_MODULES = ("spot_markout", "scoring", "leaderboard", "rank_guards", "law")
 
 
 def test_the_owned_files_reference_exactly_one_law_owned_symbol():
@@ -422,8 +475,18 @@ def test_unconfirmed_direction_overrides_qualified_counts_at_a_non_default_thres
 
 @pytest.mark.parametrize("min_trials", [1, 2, 40])
 def test_all_zero_is_no_season_at_every_threshold(min_trials):
-    """With min_trials=1 a naive `count >= min_trials` scan would call combo 1 QUALIFIED at zero.
-    The all-zero gate outranks the qualification scan."""
+    """An all-zero matrix is no_season at every threshold.
+
+    CORRECTED (QUALITY MINOR-3). This docstring previously claimed that with min_trials=1 a naive
+    `count >= min_trials` scan "would call combo 1 QUALIFIED at zero". That is arithmetically FALSE -
+    `0 >= 1` is False, so such a scan falls through and returns EXPLORATORY, not qualified.
+
+    And the ordering the old name claimed is NOT pinned here, because it cannot be: given the
+    `min_trials >= 1` guard the qualification scan can never fire on an all-zero matrix, so moving
+    the all-zero gate below the scan is BEHAVIOURALLY EQUIVALENT at this head. There is no vector
+    that makes "outranks" true. Saying so is the honest resolution; the ordering becomes
+    load-bearing only if the threshold guard is ever relaxed, and that change would need its own pin.
+    """
     selection = select_combo(_full(0, 0, 0, 0), min_trials=min_trials)
     assert selection.season_status == "no_season"
     assert (selection.chain_index, selection.bar) == (None, None)
@@ -678,6 +741,12 @@ def test_a_failure_write_also_leaves_no_temporary_file_behind(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["preflight_result.json"]
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="the discriminator is the file-mode permission check on open(path, 'w'), which POSIX "
+    "defines as bypassed for euid 0 - as root the in-place mutant would succeed and this test "
+    "would pass while pinning nothing (QUALITY MINOR-8 / OBS-1)",
+)
 def test_the_artifact_is_replaced_atomically_not_written_in_place(tmp_path):
     """The mechanism behind the ABSENCE state, pinned DIRECTLY rather than via "no temp file left".
 
@@ -1415,6 +1484,58 @@ async def test_a_wallet_type_code_that_merely_contains_the_filter_is_rejected():
     assert _count_for(result, "501", "1m").rejection_reasons == {"wallet_type_filter": 1}
 
 
+async def test_the_cooldown_rejection_is_bumped_by_the_BATCH_not_by_one():
+    """The `dropped` amount is an argument, and nothing distinguished it from a hard-coded 1.
+
+    `test_rejection_reasons_accumulate_counts_rather_than_flags` pins "counts, not flags" - but with
+    three SEPARATE rejections that each bump by 1, which cannot tell an amount argument from a
+    literal. The cooldown path is the only site that bumps by a batch, and every cooldown vector in
+    the suite dropped exactly one signal, so `_bump(..., dropped)` -> `_bump(..., 1)` was invisible
+    across 463 tests (QUALITY MINOR-4). Three same-token signals inside one window drop TWO.
+
+    The number is operator-facing: it feeds the density-versus-retention answer that decides H6.1.
+    """
+    pages = {
+        "501": [
+            _page(
+                [
+                    _sig(t0=BASE_MS),
+                    _sig(t0=BASE_MS + 3_600_000),
+                    _sig(t0=BASE_MS + 7_200_000),
+                ]
+            )
+        ]
+    }
+    series = _both_bars("501", "TOK", BASE_MS)
+    result = await run_matrix_probe(FakeMarketClient(pages, series), _filters(), cooldown_ms=COOLDOWN_MS)
+    assert _count_for(result, "501", "1H").eligible_settleable == 1
+    assert _count_for(result, "501", "1H").rejection_reasons == {"same_token_cooldown": 2}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_reason"),
+    [
+        ({"price": "0", "wallet_type": "2"}, "non_positive_trigger_price"),
+        ({"wallet_type": "2", "amount": "1"}, "wallet_type_filter"),
+        ({"amount": "1", "market_cap": "1"}, "min_amount_usd"),
+        ({"chain": "196", "price": "0"}, "chain_mismatch"),
+    ],
+    ids=["price-before-wallet", "wallet-before-amount", "amount-before-marketcap", "chain-before-price"],
+)
+async def test_a_signal_breaking_two_rules_is_attributed_to_the_FIRST(kwargs, expected_reason):
+    """`_screen` documents a first-match order and no vector exercised it (SPEC G9 / QUALITY MINOR-5).
+
+    Every existing vector breaks exactly ONE rule, so hoisting the wallet_type check above the
+    non-positive-price check survived 463 tests. Counts are unaffected - the signal is rejected
+    either way - but the REASON LABEL is not, and rejection_reasons is the operator-facing number
+    that answers 5.1's density-versus-retention question. The module docstring calls the attribution
+    a responsibility: "a rejected signal is never merely dropped".
+    """
+    pages = {"501": [_page([_sig(**kwargs)])]}
+    result = await run_matrix_probe(FakeMarketClient(pages), _filters())
+    assert _count_for(result, "501", "1m").rejection_reasons == {expected_reason: 1}
+
+
 async def test_a_multi_category_wallet_type_that_includes_the_filter_is_kept():
     pages = {"501": [_page([_sig(wallet_type="1,2")])]}
     client = FakeMarketClient(pages, _both_bars("501", "TOK", BASE_MS))
@@ -1629,22 +1750,56 @@ async def test_an_unconfirmed_direction_survives_a_fully_qualified_matrix():
 # ==================================================================================================
 
 
-def test_the_preflight_module_imports_no_http_client():
-    source = inspect.getsource(preflight)
-    assert not re.search(r"^\s*(import|from)\s+(httpx|requests|aiohttp|urllib)\b", source, re.MULTILINE)
+def _imported_module_names(path):
+    """Every module name imported by `path`, parsed from its AST rather than pattern-matched."""
+    tree = ast.parse(pathlib.Path(path).read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+    return names
 
 
-def _run_preflight_path():
-    return Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+def test_the_preflight_module_imports_exactly_this_closed_set():
+    """The probe module is transport-free BY STRUCTURE - asserted as a CLOSED SET, not a denylist.
+
+    The previous guard was a four-name denylist (httpx|requests|aiohttp|urllib) behind a name that
+    asserts the general property, so `import http.client` sailed through 463 tests (QUALITY
+    MINOR-7). A closed set cannot be widened silently: any new import, HTTP or otherwise, fails
+    here and forces a deliberate decision.
+    """
+    assert _imported_module_names(preflight.__file__) == {
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "json",
+        "os",
+        "pathlib",
+        "tempfile",
+        "typing",
+        "veridex.signal_trials.challenge_spec",
+        "veridex.signal_trials.okx_client",
+        "veridex.signal_trials.spot_markout",
+    }
 
 
-def _load_run_preflight():
-    script = _run_preflight_path()
-    assert script.exists(), f"operator script missing at {script}"
-    spec = importlib_util.spec_from_file_location("run_preflight_under_test", script)
-    module = importlib_util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def test_the_operator_script_imports_exactly_this_closed_set():
+    """Same closure on the script. httpx IS expected here - this is the only file allowed a transport."""
+    assert _imported_module_names(_run_preflight_path()) == {
+        "__future__",
+        "argparse",
+        "asyncio",
+        "collections.abc",
+        "httpx",
+        "os",
+        "pathlib",
+        "sys",
+        "typing",
+        "veridex.signal_trials.okx_client",
+        "veridex.signal_trials.preflight",
+    }
 
 
 def test_the_operator_script_imports_without_credentials_or_network(monkeypatch):
@@ -1654,6 +1809,11 @@ def test_the_operator_script_imports_without_credentials_or_network(monkeypatch)
         monkeypatch.delenv(name, raising=False)
     module = _load_run_preflight()
     assert hasattr(module, "main")
+    # The docstring claims the import constructs no TRANSPORT, and the assertion above only pinned
+    # "the import did not raise" - a module-scope httpx.AsyncClient(...) passed 463 tests
+    # (QUALITY MINOR-7). Assert the claimed property directly.
+    live_clients = [name for name, value in vars(module).items() if isinstance(value, module.httpx.AsyncClient)]
+    assert live_clients == [], f"import-time transport constructed: {live_clients}"
 
 
 def test_the_operator_script_parses_the_frozen_defaults():
@@ -1736,3 +1896,216 @@ def test_redaction_ignores_empty_secrets():
     """An empty secret must not turn every character of the message into a redaction marker."""
     module = _load_run_preflight()
     assert module.redact("connection refused", ["", "   "]) == "connection refused"
+
+
+# ==================================================================================================
+# QUALITY MAJOR-1 - main() had NO test anywhere in the repository, and six mutants of it survived
+# the full 463-test suite. It is 25 lines of orchestration on the operator path, and the suite
+# covered parse_args, credentials_from_env, redact and render_summary IN ISOLATION with nothing
+# composing them. A GUARD THAT IS TESTED BUT NOT WIRED IS NOT A GUARD.
+#
+# GATE B: none of these tests executes the script as a program and none can issue a live request.
+# Verified independently before they were written, not taken on report: main() was called with the
+# credential environment cleared while BOTH httpx.AsyncClient AND socket.socket were replaced by
+# tripwires that raise on construction. Result: exit 2, no artifact, NEITHER TRIPWIRE FIRED -
+# `credentials_from_env` raises before `_probe` is ever referenced, so no transport is constructed.
+# For the failure and success paths `_probe` itself is monkeypatched, which intercepts before any
+# transport exists because main resolves it as a module global.
+# ==================================================================================================
+
+
+class _AsyncClientTripwire:
+    """Raises if anything tries to construct a live client. Armed in every main() test."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("TRIPWIRE: a real httpx.AsyncClient was constructed inside a test")
+
+
+@pytest.fixture
+def operator_script(monkeypatch):
+    """The loaded script with a live-client tripwire armed and the credential env cleared."""
+    module = _load_run_preflight()
+    monkeypatch.setattr(module.httpx, "AsyncClient", _AsyncClientTripwire)
+    for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE", "OKX_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    return module
+
+
+def _set_sentinel_credentials(monkeypatch):
+    monkeypatch.setenv("OKX_API_KEY", "SENTINEL-KEY-DO-NOT-LEAK")
+    monkeypatch.setenv("OKX_SECRET_KEY", "SENTINEL-SECRET-DO-NOT-LEAK")
+    monkeypatch.setenv("OKX_PASSPHRASE", "SENTINEL-PASS-DO-NOT-LEAK")
+
+
+def test_main_aborts_without_credentials_and_writes_NO_artifact(operator_script, tmp_path):
+    """ABSENCE is decided HERE, and this is the only place in the codebase where it is decided.
+
+    Both reviewers verified carry-forward 5 as SATISFIED and were right at the level they measured:
+    write_preflight_result and write_preflight_failure distinguish the three states cleanly. But the
+    ABSENCE decision is taken in main, and making this path write a failure artifact instead left
+    463 tests green (QUALITY MAJOR-1). The carry-forward was satisfied where it was measured and
+    unpinned where it is decided.
+    """
+    out = tmp_path / "preflight_result.json"
+    assert operator_script.main(["--out", str(out)]) == 2
+    assert not out.exists(), "an aborted run must leave ABSENCE, not a failure artifact"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_main_redacts_credentials_out_of_the_failure_artifact(operator_script, tmp_path, monkeypatch):
+    """THE credential-surface pin. redact() was well tested in isolation and NOT WIRED.
+
+    Deleting the redact() call at run_preflight.py:218 left 463 tests green, and an upstream
+    exception message that echoed a key would then be written verbatim into an artifact the operator
+    attaches to a review. The module docstring declares this call load-bearing in almost those words.
+    """
+    _set_sentinel_credentials(monkeypatch)
+
+    async def exploding_probe(creds, args):
+        raise RuntimeError("upstream auth failure for key SENTINEL-KEY-DO-NOT-LEAK and SENTINEL-PASS-DO-NOT-LEAK")
+
+    monkeypatch.setattr(operator_script, "_probe", exploding_probe)
+    out = tmp_path / "preflight_result.json"
+    assert operator_script.main(["--out", str(out)]) == 1
+
+    raw = out.read_text()
+    assert "SENTINEL" not in raw, "a credential reached the artifact"
+    payload = json.loads(raw)
+    assert payload["probe_status"] == "failed"
+    assert payload["season_status"] is None
+    assert "RuntimeError" in payload["failure_reason"]
+    assert "***" in payload["failure_reason"], "the reason must be redacted, not merely emptied"
+    assert "upstream auth failure" in payload["failure_reason"], "redaction must not destroy the diagnostic"
+
+
+def test_main_writes_a_failure_artifact_when_the_probe_raises(operator_script, tmp_path, monkeypatch):
+    """The FAILURE state, decided in main. Deleting the write left 463 tests green."""
+    _set_sentinel_credentials(monkeypatch)
+
+    async def exploding_probe(creds, args):
+        raise OKXAPIError("51000", "Invalid parameter")
+
+    monkeypatch.setattr(operator_script, "_probe", exploding_probe)
+    out = tmp_path / "preflight_result.json"
+    assert operator_script.main(["--out", str(out)]) == 1
+    assert json.loads(out.read_text())["probe_status"] == "failed"
+
+
+def test_main_writes_a_completed_artifact_on_success(operator_script, tmp_path, monkeypatch):
+    """The COMPLETED state and exit 0. Deleting the write, or returning 1, left 463 tests green."""
+    _set_sentinel_credentials(monkeypatch)
+    matrix = _full(41, 0, 0, 0)
+
+    async def probe(creds, args):
+        return matrix
+
+    monkeypatch.setattr(operator_script, "_probe", probe)
+    out = tmp_path / "preflight_result.json"
+    assert operator_script.main(["--out", str(out)]) == 0
+
+    payload = json.loads(out.read_text())
+    assert payload["probe_status"] == "completed"
+    assert payload["season_status"] == "qualified"
+    assert (payload["chain_index"], payload["bar"]) == ("196", "1m")
+
+
+def test_main_threads_the_operator_supplied_threshold_into_the_decision(operator_script, tmp_path, monkeypatch):
+    """--min-trials must reach select_combo. One matrix, two thresholds, two season verdicts."""
+    _set_sentinel_credentials(monkeypatch)
+    matrix = _full(41, 0, 0, 0)
+
+    async def probe(creds, args):
+        return matrix
+
+    monkeypatch.setattr(operator_script, "_probe", probe)
+    lenient, strict = tmp_path / "a.json", tmp_path / "b.json"
+    assert operator_script.main(["--out", str(lenient), "--min-trials", "40"]) == 0
+    assert operator_script.main(["--out", str(strict), "--min-trials", "200"]) == 0
+    assert json.loads(lenient.read_text())["season_status"] == "qualified"
+    assert json.loads(strict.read_text())["season_status"] == "exploratory"
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "scenario"), [(2, "abort"), (1, "failure"), (0, "success")], ids=["abort", "failure", "success"]
+)
+def test_main_returns_a_distinct_exit_code_per_outcome(operator_script, tmp_path, monkeypatch, exit_code, scenario):
+    """Per C28 the exit code IS the surface. All three were unpinned."""
+    if scenario != "abort":
+        _set_sentinel_credentials(monkeypatch)
+
+    async def probe(creds, args):
+        if scenario == "failure":
+            raise RuntimeError("boom")
+        return _full(41, 0, 0, 0)
+
+    monkeypatch.setattr(operator_script, "_probe", probe)
+    assert operator_script.main(["--out", str(tmp_path / f"{scenario}.json")]) == exit_code
+
+
+# --- QUALITY MINOR-2: HttpxTransport and filters_by_chain, both on the live operator path ----------
+
+
+class RecordingResponse:
+    def __init__(self, payload, *, status_error=None):
+        self._payload, self._status_error, self.raise_for_status_calls = payload, status_error, 0
+
+    def raise_for_status(self):
+        self.raise_for_status_calls += 1
+        if self._status_error is not None:
+            raise self._status_error
+
+    def json(self):
+        return self._payload
+
+
+class RecordingHttp:
+    """Any object with an async request(...) satisfies HttpxTransport. No network, no httpx."""
+
+    def __init__(self, response):
+        self.response, self.calls = response, []
+
+    async def request(self, method, path, *, params=None, json=None, headers=None):
+        self.calls.append({"method": method, "path": path, "params": params, "json": json, "headers": headers})
+        return self.response
+
+
+async def test_the_transport_raises_for_status_before_parsing(operator_script):
+    """The boundary between a TRANSPORT failure and OKX's in-200 application errors.
+
+    Dropping raise_for_status() left 463 tests green and would feed a 4xx body into the OKX envelope
+    parser on the live Gate B run.
+    """
+    boom = RuntimeError("HTTP 401")
+    http = RecordingHttp(RecordingResponse({"code": "0", "data": []}, status_error=boom))
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        await operator_script.HttpxTransport(http).request("GET", "/p", params=None, json_body=None, headers={})
+    assert http.response.raise_for_status_calls == 1
+
+
+async def test_the_transport_refuses_a_non_object_payload(operator_script):
+    """A JSON array or scalar is not an OKX envelope; the client's parser assumes a dict."""
+    http = RecordingHttp(RecordingResponse([{"code": "0"}]))
+    with pytest.raises(TypeError, match="must be a JSON object"):
+        await operator_script.HttpxTransport(http).request("GET", "/p", params=None, json_body=None, headers={})
+
+
+async def test_the_transport_preserves_param_iteration_order(operator_script):
+    """The OKX signature covers the query string, so a transport that reordered params would produce
+    a URL the OK-ACCESS-SIGN no longer matches. The class docstring says so; nothing pinned it."""
+    params = {"chainIndex": "196", "tokenContractAddress": "0xabc", "bar": "1m", "limit": "100"}
+    http = RecordingHttp(RecordingResponse({"code": "0", "data": []}))
+    await operator_script.HttpxTransport(http).request(
+        "GET", "/p", params=params, json_body=None, headers={"OK-ACCESS-KEY": "k"}
+    )
+    assert list(http.calls[0]["params"]) == ["chainIndex", "tokenContractAddress", "bar", "limit"]
+    assert http.calls[0]["headers"] == {"OK-ACCESS-KEY": "k"}
+
+
+def test_the_operator_filters_cover_every_chain_in_the_frozen_matrix(operator_script):
+    """A hard-coded map would fail loudly via run_matrix_probe's guard, but this is the seam that
+    decides WHICH markets the live probe reads."""
+    filters = operator_script.filters_by_chain()
+    assert sorted(filters) == ["196", "501"]
+    for chain_index, entry in filters.items():
+        assert entry.chain_index == chain_index
+    assert {chain for chain, _ in COMBO_ORDER} == set(filters)
