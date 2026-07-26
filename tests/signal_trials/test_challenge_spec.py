@@ -343,6 +343,57 @@ def _frozen_fixture_integrity(request: pytest.FixtureRequest) -> None:
     request.addfinalizer(_verify_unchanged)
 
 
+def test_fixture_snapshot_is_load_bearing() -> None:
+    """Mutation drill, in-suite: the integrity guard is only as good as this primitive.
+
+    Same shape as `test_liquidity_usd_entry_is_load_bearing` above, and for the same reason: the
+    guard is what BREAKS if the primitive stops discriminating, but nothing shows that the refusal
+    is produced by THIS function rather than by something else that happens to cover the same cases.
+
+    That gap is not theoretical. Replacing the body with `return ""` — one plausible "simplification"
+    by someone who does not know what it is for — leaves the whole suite green AND silently restores
+    the entire MINOR-7 hazard, because every snapshot then compares equal to every other. The guard
+    still runs, still compares, and can no longer detect anything. This is now protection
+    infrastructure the file depends on, so it needs a proof of life.
+
+    Each assertion below independently kills a constant-returning primitive. The first also kills a
+    non-deterministic one, which matters because a guard that fired on every test would be
+    "fixed" by deleting it.
+
+    Everything operates on `deepcopy` of the fixture, never the fixture itself. A drill that mutated
+    shared state to prove the guard catches mutation would be self-defeating in the most literal way
+    — and the autouse guard above independently verifies at teardown that this test did not, so if
+    the copying were wrong, this test would error rather than quietly corrupting every later one.
+    """
+    from copy import deepcopy  # local by necessity: a top-level import would shift every line
+    # number in this file, including the frozen block's, and the C8 check is a byte offset
+    # (`sed -n '13,30p'`). The import lives here so that check keeps working.
+
+    baseline = _fixture_snapshot(REST)
+
+    # Deterministic, and sensitive to nothing but content: an identical copy renders identically.
+    assert _fixture_snapshot(deepcopy(REST)) == baseline
+
+    # NESTED content, with the top-level key set unchanged. This is the aliasing hazard's real
+    # shape, and it is what a primitive rendering only top-level keys would miss.
+    nested = deepcopy(REST)
+    nested["token"] = {"tokenAddress": "So1", "symbol": "MUTATED"}
+    assert _fixture_snapshot(nested) != baseline
+
+    # A top-level VALUE change.
+    top_level = deepcopy(REST)
+    top_level["walletType"] = "9"
+    assert _fixture_snapshot(top_level) != baseline
+
+    # A removed key.
+    removed = deepcopy(REST)
+    del removed["price"]
+    assert _fixture_snapshot(removed) != baseline
+
+    # The drill itself left the fixture alone.
+    assert _fixture_snapshot(REST) == baseline
+
+
 def test_wallet_type_list_sorts_numerically_not_lexicographically() -> None:
     """Codes sort as NUMBERS. Every other list vector uses 1 and 2, where the two orders agree.
 
