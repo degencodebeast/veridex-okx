@@ -158,3 +158,116 @@ def test_forbidden_set_is_exactly_the_authorized_eleven() -> None:
     assert authorized == FORBIDDEN_EVIDENCE_FIELDS
     assert len(FORBIDDEN_EVIDENCE_FIELDS) == 11
     assert "minLiquidityUsd" not in FORBIDDEN_EVIDENCE_FIELDS
+
+
+# --- PKT-MILESTONE-DATA-CODEX-da5b59a MAJOR: `wallet_type` cross-transport canonicalization.
+#
+# Frozen spec §5.2 (`docs/superpowers/specs/2026-07-23-veridex-signal-trials-design.md:76`) requires
+# ONE canonical schema across transports and names this dimension explicitly:
+#     `wallet_type` <- REST numeric/named vs WS comma-separated numerics
+#
+# The frozen fixture holds `walletType` at the string "1" on BOTH sides, so the mandated
+# hash-equality test never varied the one dimension the spec says differs between transports. Every
+# line ran; the value was simply constant. The pairs below vary it, and each asserts BOTH canonical
+# field equality and evidence-hash equality — asserting only the hashes would reproduce the very
+# blindness being closed here.
+#
+# Canonical form (see `_canonical_wallet_type`): comma-separated numeric codes, deduplicated and
+# sorted ascending. `walletType=1` is Smart Money per §5.1, so "1" stays "1" and the frozen
+# fixture's hash is unchanged — pinned below.
+
+
+def test_wallet_type_named_rest_and_numeric_ws_share_evidence_identity() -> None:
+    """The required cross-transport pair whose RAW `walletType` values differ.
+
+    REST carries the named form, WS the numeric form, for the same logical wallet category. Before
+    the fix these produced `'Smart Money'` and `'1'` and therefore two different evidence hashes —
+    different receipt identity for one market event across the replay and live-exhibition paths.
+    """
+    rest = {**REST, "walletType": "Smart Money"}
+    ws = {**WS, "walletType": "1"}
+    assert rest["walletType"] != ws["walletType"]
+
+    rest_sig = normalize_signal(rest, "rest")
+    ws_sig = normalize_signal(ws, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type == "1"
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+
+def test_wallet_type_numeric_rest_is_accepted_and_matches_its_string_twin() -> None:
+    """A numeric REST `walletType` must enter the pack at all.
+
+    H2.1 carries raw rows through untouched, so an int on the wire reached `_as_str` and raised —
+    a valid row could not be normalized. The int and its string twin must also agree, or the same
+    row would hash differently depending on the JSON decoder's typing.
+    """
+    numeric = normalize_signal({**REST, "walletType": 1}, "rest")
+    stringy = normalize_signal({**REST, "walletType": "1"}, "rest")
+    assert numeric.wallet_type == stringy.wallet_type == "1"
+    assert evidence_hash(numeric) == evidence_hash(stringy)
+
+
+def test_wallet_type_ws_list_is_order_and_duplicate_invariant() -> None:
+    """A wallet-type set is unordered, so its serialization must not carry order into the hash.
+
+    WS emits comma-separated numerics. `"2,1"` and `"1,2"` denote the same set; if wire order
+    survived into the canonical value, two identical observations would take different receipt
+    identities purely from field ordering. Duplicates collapse for the same reason.
+    """
+    for raw in ("1,2", "2,1", "1,2,1", " 2 , 1 ", "01,2"):
+        assert normalize_signal({**WS, "walletType": raw}, "ws").wallet_type == "1,2"
+
+    ordered = normalize_signal({**WS, "walletType": "1,2"}, "ws")
+    reversed_ = normalize_signal({**WS, "walletType": "2,1"}, "ws")
+    assert evidence_hash(ordered) == evidence_hash(reversed_)
+
+
+def test_wallet_type_mixed_named_and_numeric_list_crosses_transports() -> None:
+    """The named and list forms compose: a named element inside a list resolves like a bare name.
+
+    This is the second cross-transport pair with differing raw values, covering the case where the
+    REST named form and the WS numeric-list form describe the same two-category set.
+    """
+    rest = {**REST, "walletType": "Smart Money,2"}
+    ws = {**WS, "walletType": "2,1"}
+    assert rest["walletType"] != ws["walletType"]
+
+    rest_sig = normalize_signal(rest, "rest")
+    ws_sig = normalize_signal(ws, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type == "1,2"
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+
+def test_frozen_fixture_evidence_hash_is_unchanged_by_this_correction() -> None:
+    """Over-correction lock: a payload already handled correctly must hash exactly as before.
+
+    This literal was captured from the frozen REST fixture at `da5b59a`, BEFORE any wallet-type
+    canonicalization existed. `walletType` there is the string `"1"`, which is already the canonical
+    form, so the correction must be a no-op for it. If this value ever moves, the change altered
+    evidence identity for previously-correct data — a finding, not a fix.
+    """
+    assert normalize_signal(REST, "rest").wallet_type == "1"
+    assert (
+        evidence_hash(normalize_signal(REST, "rest"))
+        == "6c803bc40c8bda82825ef62d0c1f01030e1337f6674695435e982f9cbbe5ede0"
+    )
+
+
+def test_wallet_type_refuses_unknown_names_and_malformed_lists() -> None:
+    """Canonicalizing must not become a licence to accept anything.
+
+    §5.1 authorizes exactly one name (`walletType=1`, Smart Money). An unrecognized name has no
+    known code, so mapping it would be a guess and passing it through would re-open the divergence
+    this correction closes — it raises instead. The malformed list forms raise for the same reason:
+    silently dropping an empty element would let `"1,,2"` and `"1,2"` share an identity they have
+    not earned.
+    """
+    for bad in ("Whale", "", "   ", "1,", ",1", "1,,2", "1,Whale", "-1", "1.5", "one"):
+        with pytest.raises(ValueError):
+            normalize_signal({**REST, "walletType": bad}, "rest")
+
+    # bool is an int subclass; True must not slip through as the code 1.
+    with pytest.raises(ValueError):
+        normalize_signal({**REST, "walletType": True}, "rest")
+    with pytest.raises(ValueError):
+        normalize_signal({**REST, "walletType": 1.5}, "rest")

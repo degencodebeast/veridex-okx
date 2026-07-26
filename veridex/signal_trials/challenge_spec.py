@@ -105,6 +105,12 @@ FORBIDDEN_EVIDENCE_FIELDS: frozenset[str] = frozenset(
 # unknown transport tag loudly instead of accepting it as a no-op.
 _SOURCES: tuple[str, ...] = ("rest", "ws")
 
+# Wallet-type NAMES this module is authorized to resolve to a numeric code. §5.1 pins the MVP
+# filter at `walletType=1` (Smart Money), and that is the only name the frozen spec gives a code
+# for. The table is deliberately not widened by guesswork: an unrecognized name raises rather than
+# being mapped to an invented code or passed through — see `_canonical_wallet_type`.
+_WALLET_TYPE_NAMES: dict[str, int] = {"smart money": 1}
+
 
 class LeakageError(ValueError):
     """A payload carried a field that is not observable at decision time.
@@ -225,6 +231,63 @@ def _as_float(value: Any, field: str) -> float:
     return number
 
 
+def _wallet_type_code(element: str, field: str) -> int:
+    """Resolve ONE wallet-type element — a numeric code or an authorized name — to its code.
+
+    ``isascii()`` guards the digit test because ``"²".isdigit()`` is true while ``int("²")`` raises;
+    without it a superscript would reach the name lookup and produce a confusing error. Name
+    matching folds case and treats ``_``/``-``/runs of whitespace as a single space, since those are
+    all spellings of the same display label rather than distinct categories.
+    """
+    text = element.strip()
+    if not text:
+        raise ValueError(f"field {field} has an empty wallet-type element: {element!r}")
+    if text.isascii() and text.isdigit():
+        return int(text)
+
+    key = " ".join(text.replace("_", " ").replace("-", " ").split()).casefold()
+    code = _WALLET_TYPE_NAMES.get(key)
+    if code is None:
+        raise ValueError(
+            f"field {field} has an unrecognized wallet type {element!r}; known names: {sorted(_WALLET_TYPE_NAMES)}"
+        )
+    return code
+
+
+def _canonical_wallet_type(value: Any, field: str) -> str:
+    """Wire wallet type -> the canonical comma-separated numeric-code form.
+
+    §5.2 requires one canonical schema across transports and names this dimension explicitly:
+    REST sends a numeric or named form, WS a comma-separated list of numerics. All of them are
+    accepted from EITHER transport and collapse onto the same value, which is what lets the same
+    market event keep one receipt identity across the replay and live-exhibition paths.
+
+    Numeric rather than named because the numeric code is the wire's primary identity (§5.1 filters
+    on ``walletType=1``), WS already emits numerics, and names are display labels. It also leaves
+    the already-canonical ``"1"`` untouched, so this correction cannot move the evidence hash of a
+    payload that was previously handled correctly.
+
+    Codes are deduplicated and sorted ascending: a set of wallet categories is unordered, so letting
+    wire order survive into the hash would give two identical observations different identities.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"field {field} must be a wallet type, got bool: {value!r}")
+
+    codes: list[int]
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"field {field} must be a non-negative wallet-type code, got {value!r}")
+        codes = [value]
+    elif isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"field {field} is empty")
+        codes = [_wallet_type_code(part, field) for part in value.split(",")]
+    else:
+        raise ValueError(f"field {field} must be a wallet type, got {type(value).__name__}: {value!r}")
+
+    return ",".join(str(code) for code in sorted(set(codes)))
+
+
 def normalize_signal(raw: dict[str, Any], source: Literal["rest", "ws"]) -> CanonicalSignal:
     """Canonicalize one raw OKX signal dict from either transport.
 
@@ -238,6 +301,12 @@ def normalize_signal(raw: dict[str, Any], source: Literal["rest", "ws"]) -> Cano
     "missing field" instead of normalizing correctly.
 
     ``soldRatioPercent`` / ``soldRatioPercentage`` are never read.
+
+    §5.2 names four cross-transport dimensions. Three are pure key aliases handled by ``_pick``
+    (``top10HolderPercent``/``top10HolderPercentage``, the dropped sold-ratio pair, ``price`` ->
+    ``trigger_price``). ``wallet_type`` is the fourth and is different in kind: the two transports
+    disagree on the VALUE REPRESENTATION, not the key, so it needs ``_canonical_wallet_type`` rather
+    than an alias lookup.
     """
     if source not in _SOURCES:
         raise ValueError(f"unknown source {source!r}; supported sources: {list(_SOURCES)}")
@@ -259,7 +328,7 @@ def normalize_signal(raw: dict[str, Any], source: Literal["rest", "ws"]) -> Cano
             "token.top10HolderPercent",
         ),
         trigger_price=_as_float(_pick(raw, "", "price"), "price"),
-        wallet_type=_as_str(_pick(raw, "", "walletType"), "walletType"),
+        wallet_type=_canonical_wallet_type(_pick(raw, "", "walletType"), "walletType"),
         trigger_wallet_count=_as_int(_pick(raw, "", "triggerWalletCount"), "triggerWalletCount"),
         trigger_wallet_address=_as_str(_pick(raw, "", "triggerWalletAddress"), "triggerWalletAddress"),
         amount_usd=_as_float(_pick(raw, "", "amountUsd"), "amountUsd"),
