@@ -40,6 +40,9 @@ import httpx
 from veridex.signal_trials.okx_client import OKXCredentials, OKXMarketClient, SignalFilters
 from veridex.signal_trials.preflight import (
     COMBO_ORDER,
+    FROZEN_COOLDOWN_MS,
+    FROZEN_HORIZON_MS,
+    FROZEN_MIN_TRIALS,
     ComboSelection,
     MatrixProbeResult,
     run_matrix_probe,
@@ -53,6 +56,20 @@ DEFAULT_BASE_URL = "https://web3.okx.com"
 REQUEST_TIMEOUT_SECONDS = 30.0
 
 _CREDENTIAL_VARS: tuple[str, ...] = ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
+
+
+class NonFrozenPolicyError(RuntimeError):
+    """The operator asked for a season policy other than the frozen one.
+
+    §5.1 fixes qualification at >= 40 trials, the same-token cooldown at 4h and the sole ranking
+    horizon at 1h, and EXPLICITLY FORBIDS lowering thresholds after observing outcomes. This command
+    writes the AUTHORITATIVE `preflight_result.json` that H2.4 consumes, so a run under different
+    rules must not be able to reach that artifact at all — not merely be disclosed inside it.
+
+    The switches are kept rather than deleted so an operator who asks for a different policy gets a
+    refusal that NAMES the frozen value and the one supplied, instead of an unknown-argument error
+    that reads like a typo.
+    """
 
 
 class MissingCredentialError(RuntimeError):
@@ -104,24 +121,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--min-trials",
         dest="min_trials",
         type=int,
-        default=40,
-        help="qualification threshold; the frozen season gate is 40 (default: %(default)s)",
+        default=FROZEN_MIN_TRIALS,
+        help="FROZEN at %(default)s by spec 5.1; any other value is REFUSED (default: %(default)s)",
     )
     parser.add_argument(
         "--cooldown-ms",
         dest="cooldown_ms",
         type=int,
-        default=14_400_000,
-        help="same-token dedup window in ms; frozen at 4h (default: %(default)s)",
+        default=FROZEN_COOLDOWN_MS,
+        help="FROZEN at %(default)s ms (4h); any other value is REFUSED (default: %(default)s)",
     )
     parser.add_argument(
         "--horizon-ms",
         dest="horizon_ms",
         type=int,
-        default=3_600_000,
-        help="ranked settlement horizon in ms; frozen at 1h (default: %(default)s)",
+        default=FROZEN_HORIZON_MS,
+        help="FROZEN at %(default)s ms (1h); any other value is REFUSED (default: %(default)s)",
     )
     return parser.parse_args(argv)
+
+
+def assert_frozen_policy(args: argparse.Namespace) -> None:
+    """Refuse to run the AUTHORITATIVE preflight under anything but the frozen season policy.
+
+    Raises:
+        NonFrozenPolicyError: naming every deviating switch, its frozen value and the value supplied.
+    """
+    deviations = [
+        (flag, frozen, supplied)
+        for flag, frozen, supplied in (
+            ("--min-trials", FROZEN_MIN_TRIALS, args.min_trials),
+            ("--cooldown-ms", FROZEN_COOLDOWN_MS, args.cooldown_ms),
+            ("--horizon-ms", FROZEN_HORIZON_MS, args.horizon_ms),
+        )
+        if supplied != frozen
+    ]
+    if deviations:
+        detail = "; ".join(
+            f"{flag} is frozen at {frozen} but {supplied} was supplied" for flag, frozen, supplied in deviations
+        )
+        raise NonFrozenPolicyError(
+            f"refusing to write an authoritative preflight artifact under a non-frozen season policy: {detail}. "
+            f"Spec 5.1 fixes these and forbids lowering thresholds after observing outcomes."
+        )
 
 
 def credentials_from_env(env: Mapping[str, str]) -> OKXCredentials:
@@ -202,6 +244,14 @@ async def _probe(creds: OKXCredentials, args: argparse.Namespace) -> MatrixProbe
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        assert_frozen_policy(args)
+    except NonFrozenPolicyError as exc:
+        # No artifact: a refused run probed nothing, so ABSENCE is the honest state, and writing a
+        # failure record would claim an attempt that never happened.
+        print(f"preflight refused before any request: {exc}", file=sys.stderr)
+        return 3
+
     try:
         creds = credentials_from_env(os.environ)
     except MissingCredentialError as exc:

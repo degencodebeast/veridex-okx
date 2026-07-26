@@ -579,6 +579,7 @@ RESULT_KEYS = [
     "counts",
     "rejection_reasons",
     "direction_semantics_confirmed",
+    "policy",
     "failure_reason",
 ]
 
@@ -2119,20 +2120,95 @@ def test_main_writes_a_completed_artifact_on_success(operator_script, tmp_path, 
     assert (payload["chain_index"], payload["bar"]) == ("196", "1m")
 
 
-def test_main_threads_the_operator_supplied_threshold_into_the_decision(operator_script, tmp_path, monkeypatch):
-    """--min-trials must reach select_combo. One matrix, two thresholds, two season verdicts."""
+@pytest.mark.parametrize(
+    ("flag", "value", "frozen"),
+    [("--min-trials", "1", 40), ("--min-trials", "200", 40),
+     ("--cooldown-ms", "1000", 14_400_000), ("--horizon-ms", "60000", 3_600_000)],
+    ids=["min-trials-lowered", "min-trials-raised", "cooldown", "horizon"],
+)
+def test_main_REFUSES_a_non_frozen_season_policy(operator_script, tmp_path, monkeypatch, capsys, flag, value, frozen):
+    """The authoritative Gate B command must not be able to publish a non-frozen experiment.
+
+    This REPLACES a test that asserted the opposite - that `--min-trials` changes the published
+    `season_status` for the same matrix - which the milestone Codex correctly cited as proving the
+    defect rather than a property. Spec 5.1 fixes these three values and forbids lowering thresholds
+    after observing outcomes, and this artifact is the authority H2.4 consumes, so a deviating run
+    must be refused rather than merely disclosed.
+    """
     _set_sentinel_credentials(monkeypatch)
-    matrix = _full(41, 0, 0, 0)
+    reached = []
 
     async def probe(creds, args):
-        return matrix
+        reached.append(args)
+        return _full(41, 0, 0, 0)
 
     monkeypatch.setattr(operator_script, "_probe", probe)
-    lenient, strict = tmp_path / "a.json", tmp_path / "b.json"
-    assert operator_script.main(["--out", str(lenient), "--min-trials", "40"]) == 0
-    assert operator_script.main(["--out", str(strict), "--min-trials", "200"]) == 0
-    assert json.loads(lenient.read_text())["season_status"] == "qualified"
-    assert json.loads(strict.read_text())["season_status"] == "exploratory"
+    out = tmp_path / "preflight_result.json"
+    assert operator_script.main(["--out", str(out), flag, value]) == 3
+
+    assert not out.exists(), "a refused run must leave ABSENCE, not an artifact"
+    assert reached == [], "the probe must not run at all under a non-frozen policy"
+    stderr = capsys.readouterr().err
+    assert "refused before any request" in stderr
+    assert flag in stderr and str(frozen) in stderr and value in stderr
+
+
+def test_main_accepts_the_frozen_policy_stated_explicitly(operator_script, tmp_path, monkeypatch):
+    """Passing the frozen values by hand is legal - the refusal is on DEVIATION, not on the flags."""
+    _set_sentinel_credentials(monkeypatch)
+
+    async def probe(creds, args):
+        return _full(41, 0, 0, 0)
+
+    monkeypatch.setattr(operator_script, "_probe", probe)
+    out = tmp_path / "preflight_result.json"
+    code = operator_script.main(
+        ["--out", str(out), "--min-trials", "40", "--cooldown-ms", "14400000", "--horizon-ms", "3600000"]
+    )
+    assert code == 0
+    assert json.loads(out.read_text())["season_status"] == "qualified"
+
+
+def test_the_artifact_declares_the_policy_it_was_produced_under(tmp_path):
+    """PROVENANCE. Without it, a run under a lowered threshold is indistinguishable downstream from
+    a conforming one and can still be labelled `qualified`."""
+    matrix = _full(41, 0, 0, 0)
+    out = tmp_path / "preflight_result.json"
+    write_preflight_result(select_combo(matrix), matrix, out)
+    assert _read(out)["policy"] == {"min_trials": 40, "cooldown_ms": 14_400_000, "horizon_ms": 3_600_000}
+
+    failed = tmp_path / "failed.json"
+    write_preflight_failure("boom", failed)
+    assert _read(failed)["policy"] == {"min_trials": 40, "cooldown_ms": 14_400_000, "horizon_ms": 3_600_000}
+
+
+def test_the_frozen_policy_constants_are_the_spec_values():
+    """One source of truth, asserted against LITERALS rather than against itself."""
+    assert preflight.FROZEN_MIN_TRIALS == 40
+    assert preflight.FROZEN_COOLDOWN_MS == 14_400_000
+    assert preflight.FROZEN_HORIZON_MS == 3_600_000
+    signature = inspect.signature(run_matrix_probe)
+    assert signature.parameters["min_trials"].default == 40
+    assert signature.parameters["cooldown_ms"].default == 14_400_000
+    assert signature.parameters["horizon_ms"].default == 3_600_000
+    assert inspect.signature(select_combo).parameters["min_trials"].default == 40
+
+
+def test_the_writer_refuses_a_selection_the_frozen_policy_would_not_produce(tmp_path):
+    """The second half of MAJOR-2, at the writer rather than the CLI.
+
+    A caller can still run `select_combo(result, min_trials=1)` in process. The artifact declares the
+    FROZEN policy, so it must not carry a selection that policy would not have reached.
+    """
+    matrix = _full(39, 0, 0, 0)
+    lenient = select_combo(matrix, min_trials=1)
+    assert lenient.season_status == "qualified", "precondition: a lowered threshold qualifies here"
+    assert select_combo(matrix).season_status == "exploratory", "precondition: the frozen policy does not"
+
+    out = tmp_path / "preflight_result.json"
+    with pytest.raises(PreflightError, match="not what the frozen policy"):
+        write_preflight_result(lenient, matrix, out)
+    assert not out.exists()
 
 
 @pytest.mark.parametrize(

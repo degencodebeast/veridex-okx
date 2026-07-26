@@ -125,6 +125,17 @@ REASON_NON_POSITIVE_SETTLEMENT_PRICE = "non_positive_settlement_price"
 # `direction`, `side`, `signalType` or `tradeDirection` member at all.
 SIGNAL_SOURCE_DIRECTION = "buy"
 
+# The FROZEN season policy (§5.1). One definition, used as the defaults below, as the only values the
+# operator entrypoint will accept, and as the `policy` block written into every authoritative
+# artifact. A single source of truth is the point: a mutation of any one of these is visible in all
+# three places at once, and the artifact can no longer disagree with the run that produced it.
+#
+# §5.1 fixes qualification at >= 40 trials and EXPLICITLY FORBIDS lowering thresholds after observing
+# outcomes; it fixes the same-token cooldown at 4h and the sole ranking horizon at 1h.
+FROZEN_MIN_TRIALS = 40
+FROZEN_COOLDOWN_MS = 14_400_000
+FROZEN_HORIZON_MS = 3_600_000
+
 # Keys a direction marker may arrive under IF a source volunteers one, and the values read as a buy.
 # These exist to DETECT A CONTRADICTION of the endpoint contract, never to satisfy it: no documented
 # row carries any of them. Textual only - see the module docstring on why numeric side codes are
@@ -237,7 +248,7 @@ def _require_usable_threshold(min_trials: int) -> None:
         )
 
 
-def select_combo(result: MatrixProbeResult, *, min_trials: int = 40) -> ComboSelection:
+def select_combo(result: MatrixProbeResult, *, min_trials: int = FROZEN_MIN_TRIALS) -> ComboSelection:
     """Choose the season's combo and status from a completed matrix probe.
 
     - ``qualified``: the FIRST combo in ``COMBO_ORDER`` whose count is ``>= min_trials``. Inclusive
@@ -453,9 +464,9 @@ async def run_matrix_probe(
     client: MarketClient,
     filters_by_chain: Mapping[str, SignalFilters],
     *,
-    cooldown_ms: int = 14_400_000,
-    horizon_ms: int = 3_600_000,
-    min_trials: int = 40,
+    cooldown_ms: int = FROZEN_COOLDOWN_MS,
+    horizon_ms: int = FROZEN_HORIZON_MS,
+    min_trials: int = FROZEN_MIN_TRIALS,
 ) -> MatrixProbeResult:
     """Measure the eligible-settleable count for all four frozen combos.
 
@@ -647,7 +658,12 @@ def _artifact(
     direction_semantics_confirmed: bool,
     failure_reason: str | None,
 ) -> dict[str, Any]:
-    """The single artifact schema. Both writers go through it, so the key set cannot diverge."""
+    """The single artifact schema. Both writers go through it, so the key set cannot diverge.
+
+    ``policy`` states the season rules the artifact was produced under. Without it a run under a
+    lowered threshold is INDISTINGUISHABLE downstream from a conforming one and can still be labelled
+    ``qualified`` — and this artifact is the authority H2.4 consumes.
+    """
     return {
         "probe_status": probe_status,
         "season_status": season_status,
@@ -656,6 +672,11 @@ def _artifact(
         "counts": counts,
         "rejection_reasons": rejection_reasons,
         "direction_semantics_confirmed": direction_semantics_confirmed,
+        "policy": {
+            "min_trials": FROZEN_MIN_TRIALS,
+            "cooldown_ms": FROZEN_COOLDOWN_MS,
+            "horizon_ms": FROZEN_HORIZON_MS,
+        },
         "failure_reason": failure_reason,
     }
 
@@ -682,6 +703,23 @@ def write_preflight_result(sel: ComboSelection, result: MatrixProbeResult, path:
     """
     indexed = _index_counts(result.counts)
     _validate_selection(sel, indexed, result.direction_semantics_confirmed)
+
+    # The artifact declares the FROZEN policy, so it must not carry a selection the frozen policy
+    # would not have reached. Re-deriving is cheap and closes the `min_trials` half of the operator
+    # override at the writer as well as at the CLI.
+    #
+    # REACH, stated exactly rather than implied: this catches a threshold deviation, because
+    # min_trials changes the DECISION over a fixed matrix. It does NOT catch a cooldown or horizon
+    # deviation — those change the COUNTS, and a matrix carries no record of how it was counted.
+    # Those are refused at the operator entrypoint, which is the only place they can be supplied.
+    frozen = select_combo(result, min_trials=FROZEN_MIN_TRIALS)
+    if (frozen.chain_index, frozen.bar, frozen.season_status) != (sel.chain_index, sel.bar, sel.season_status):
+        raise PreflightError(
+            f"selection {(sel.chain_index, sel.bar, sel.season_status)!r} is not what the frozen policy "
+            f"(min_trials={FROZEN_MIN_TRIALS}) produces for this matrix, which is "
+            f"{(frozen.chain_index, frozen.bar, frozen.season_status)!r}; the authoritative artifact "
+            f"must not represent a different experiment as the frozen season"
+        )
 
     ordered = [indexed[combo] for combo in COMBO_ORDER]
     aggregate: dict[str, int] = {}
