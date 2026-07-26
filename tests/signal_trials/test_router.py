@@ -8,6 +8,9 @@ is ordinary lane-authored test content.
 
 import base64
 import json
+import tempfile as _tempfile
+from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -740,7 +743,15 @@ _X402_ENV = {
     "X402_ENABLED": "true",
     "PAY_TO_ADDRESS": PAYOUT_ALPHA,
 }
-_PROD_ENV = {**_X402_ENV, "APP_ENV": "production"}
+#: Durable root for the compositions below. A real directory, created once per run: enabled
+#: payments refuse to start without one, because charging against an unconfigured store would
+#: record a paid commit where nothing can serve it. Deliberately NOT folded into ``_X402_ENV``,
+#: which must stay root-free so the fail-closed startup test has an env that actually trips it.
+_SERVED_DATA_ROOT = _tempfile.mkdtemp(prefix="signal-trials-served-")
+
+#: Production env for the credential and sync-settle pins, which require construction to SUCCEED
+#: and therefore need the durable root the payment path now demands.
+_PROD_ENV = {**_X402_ENV, "APP_ENV": "production", "SIGNAL_TRIALS_DATA_DIR": str(_SERVED_DATA_ROOT)}
 
 # Three DISTINCT sentinels. Not credentials and not credential-shaped — their only job
 # is to be told apart, so that a permutation of the three slots cannot pass.
@@ -760,9 +771,19 @@ def _prod_settings() -> Settings:
 
 
 def _served(env=None, *, settings=None, facilitator=None):
-    """Build the SERVED app (the guard) with the stock 402 layer wired for tests."""
+    """Build the SERVED app (the guard) with the Signal Trials payment path wired for tests.
+
+    Supplies a durable root when the caller's env carries none. Enabled payments now REFUSE to
+    start without one, because charging against an unconfigured store would record a paid commit
+    where nothing can serve it — so every payments-enabled composition needs a root, and these
+    tests are about the gate's behaviour rather than about that refusal. ``_X402_ENV`` itself is
+    deliberately left WITHOUT a root, so the test that asserts the refusal still has an env that
+    triggers it.
+    """
+    resolved = dict(_X402_ENV if env is None else env)
+    resolved.setdefault("SIGNAL_TRIALS_DATA_DIR", str(_SERVED_DATA_ROOT))
     return create_server_app(
-        env=_X402_ENV if env is None else env,
+        env=resolved,
         settings=_dev_settings() if settings is None else settings,
         x402_facilitator=FakeFacilitator() if facilitator is None else facilitator,
     )
@@ -1070,7 +1091,12 @@ def test_the_mount_registers_the_exact_scheme_for_x_layer():
     by crash rather than by assertion. Pinned here so the property is banked
     (PKT-DEC-C23: detected-by-exception is a gap, not a kill).
     """
-    resource_server = _mount_signal_trials_402(FastAPI(), _X402_ENV, is_production=False, facilitator=FakeFacilitator())
+    resource_server = _mount_signal_trials_402(
+        FastAPI(),
+        {**_X402_ENV, "SIGNAL_TRIALS_DATA_DIR": str(_SERVED_DATA_ROOT)},
+        is_production=False,
+        facilitator=FakeFacilitator(),
+    )
     assert resource_server is not None
     assert resource_server.has_registered_scheme(X_LAYER_MAINNET, "exact")
 
@@ -1097,3 +1123,232 @@ def test_the_refusal_never_echoes_the_configured_payout_address():
     with pytest.raises(ValueError) as exc:
         create_server_app(env={**_PROD_ENV, "PAY_TO_ADDRESS": secret_shaped}, settings=_prod_settings())
     assert secret_shaped not in str(exc.value) and "d" * 8 not in str(exc.value)
+
+
+# ======================================================================================
+# H4.1-A3 — THE PRODUCTION MOUNT, PROVEN THROUGH create_server_app().
+#
+# Every test above this line composes an app by hand. That is exactly what hid the defect this
+# block exists to catch: `SignalTrialsPaymentASGI` had ZERO production instantiations, the served
+# composition still mounted the SDK's temporary stock middleware, and two tests in this very file
+# PASSED because they assert the behaviour of that temporary layer. A hand-composed fixture cannot
+# tell "the wrapper works" from "the wrapper is reachable".
+#
+# So these go through the real factory, over ONE shared temporary data root, and assert the
+# properties the Integrator Codex ruling names as completion conditions.
+# ======================================================================================
+
+
+def _sig_for_mount(t0_ms: int) -> Any:
+    """A canonical signal for the mount tests. Synthetic constants only."""
+    from veridex.signal_trials.challenge_spec import CanonicalSignal
+
+    return CanonicalSignal(
+        t0_ms=t0_ms,
+        chain_index="196",
+        token_address="0x" + "1" * 40,
+        symbol="TKN",
+        name="Token",
+        market_cap_usd=1_500_000.0,
+        holders=4_200,
+        top10_holder_percent=31.5,
+        trigger_price=0.0125,
+        wallet_type="smart money",
+        trigger_wallet_count=3,
+        trigger_wallet_address="0x" + "2" * 40,
+        amount_usd=25_000.0,
+    )
+
+
+def _mount_env(data_root: Path) -> dict[str, str]:
+    """The served env for a payments-enabled deployment over ``data_root``."""
+    return {**_X402_ENV, "SIGNAL_TRIALS_DATA_DIR": str(data_root)}
+
+
+def _publish_trial(data_root: Path, *, trial_id: str = "trial_mount_probe", t0_ms: int | None = None) -> Any:
+    """Publish one open live trial into the root the served app will read, as the operator script does.
+
+    ``t0_ms`` defaults to the REAL clock, because the served wrapper uses the real clock — it takes
+    no injected one. A fixed past epoch would publish a trial whose five-minute commit window
+    closed years ago, and every paid commit here would correctly answer ``410
+    commit_window_closed``.
+    """
+    import time as _time
+
+    from veridex.signal_trials.live import LiveTrialRepository, open_live_trial
+
+    t0_ms = int(_time.time() * 1000) if t0_ms is None else t0_ms
+    trial = open_live_trial(_sig_for_mount(t0_ms), now_ms=t0_ms, trial_id=trial_id)
+    LiveTrialRepository(data_root / "live").publish(trial)
+    return trial
+
+
+async def _paid_commit_through(guard: Any, body: dict[str, Any]) -> Any:
+    """Drive the full client flow against the SERVED guard: unpaid -> 402 -> paid re-POST."""
+    import uuid
+
+    from x402.http.utils import encode_payment_signature_header  # type: ignore[import-untyped]
+    from x402.schemas.payments import PaymentPayload  # type: ignore[import-untyped]
+
+    async with _client_for(guard) as client:
+        unpaid = await client.post("/signal-trials/commit", json=body)
+        assert unpaid.status_code == 402, f"expected a 402 challenge, got {unpaid.status_code}: {unpaid.text}"
+        accepts = _challenge(unpaid)["accepts"][0]
+        payload = PaymentPayload(
+            payload={"signature": "0xfa" + uuid.uuid4().hex, "authorization": {"nonce": uuid.uuid4().hex}},
+            accepted=accepts,
+        )
+        header = encode_payment_signature_header(payload)
+        return await client.post("/signal-trials/commit", json=body, headers={"PAYMENT-SIGNATURE": header})
+
+
+async def test_MOUNT_the_served_app_uses_the_CUSTOM_wrapper_and_not_the_stock_middleware(tmp_path: Path) -> None:
+    """Condition 3: the temporary stock layer is gone from the served Signal Trials path.
+
+    Asserted on the composed middleware stack rather than inferred from a status code, because a
+    402 from the stock middleware and a 402 from the custom wrapper are indistinguishable on the
+    wire — which is precisely why the missing mount survived review. A 402 challenge from the
+    temporary layer is not evidence of paid delivery.
+    """
+    from veridex.signal_trials.payments import SignalTrialsPaymentASGI
+
+    _publish_trial(tmp_path)
+    guard = create_server_app(
+        env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=FakeFacilitator()
+    )
+    mounted = [m.cls.__name__ for m in guard.app.user_middleware]
+    assert "SignalTrialsPaymentASGI" in mounted, f"the custom wrapper is not in the served path: {mounted}"
+    assert "PaymentMiddlewareASGI" not in mounted, f"the temporary stock middleware is still mounted: {mounted}"
+    assert any(m.cls is SignalTrialsPaymentASGI for m in guard.app.user_middleware)
+
+
+async def test_MOUNT_free_open_trial_is_served_from_the_configured_root(tmp_path: Path) -> None:
+    """Condition 2, read side: the free route serves the trial published into the shared root."""
+    trial = _publish_trial(tmp_path)
+    guard: Any = create_server_app(
+        env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=FakeFacilitator()
+    )
+    async with _client_for(guard) as c:
+        served = await c.get("/signal-trials/open-trial")
+    assert served.status_code == 200, served.text
+    body = served.json()
+    assert body["trial_id"] == trial.trial_id and body["trial_mode"] == "live"
+    assert body["commit_deadline_ms"] == trial.commit_deadline_ms
+    assert body["evidence_hash"] == trial.evidence_hash
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_MOUNT_unpaid_commit_is_challenged_on_both_methods(tmp_path: Path, method: str) -> None:
+    """Condition 3 on the wire: both gated methods meet a genuine challenge, from the wrapper."""
+    _publish_trial(tmp_path)
+    guard: Any = create_server_app(
+        env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=FakeFacilitator()
+    )
+    async with _client_for(guard) as c:
+        r = await c.request(method, "/signal-trials/commit", json={"trial_id": "t", "p_follow_profitable": 0.5})
+    assert r.status_code == 402, r.text
+    assert "payment-required" in {k.lower() for k in r.headers}
+    assert _challenge(r)["accepts"][0]["payTo"].lower() == PAYOUT_ALPHA.lower()
+
+
+async def test_MOUNT_a_paid_commit_settles_ONCE_and_materializes_ONE_receipt_in_THAT_root(tmp_path: Path) -> None:
+    """The whole point: a paid POST reaches the custom path and lands in the configured root.
+
+    The receipt is read back with a store built independently over the same root, so this proves
+    the served app wrote where the operator tooling reads — not merely that some store somewhere
+    recorded something.
+    """
+    from veridex.signal_trials.receipts import ReceiptStore
+
+    trial = _publish_trial(tmp_path)
+    facilitator = FakeFacilitator()
+    guard = create_server_app(
+        env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=facilitator
+    )
+    paid = await _paid_commit_through(guard, {"trial_id": trial.trial_id, "p_follow_profitable": 0.6})
+    assert paid.status_code == 200, paid.text
+    assert facilitator.settle_calls == 1
+
+    independent = ReceiptStore(tmp_path)
+    (record,) = independent.finalized()
+    assert record.receipt_id == paid.json()["receipt_id"]
+    assert record.trial_id == trial.trial_id
+    assert record.payment_tx_hash and record.payer.startswith("0x")
+    assert independent.slot_state(record.payer, record.trial_id) == "finalized"
+
+
+async def test_MOUNT_an_identical_retry_does_not_settle_twice(tmp_path: Path) -> None:
+    """Idempotency survives the real composition, not only the hand-built one."""
+    trial = _publish_trial(tmp_path)
+    facilitator = FakeFacilitator()
+    guard = create_server_app(
+        env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=facilitator
+    )
+    body = {"trial_id": trial.trial_id, "p_follow_profitable": 0.6}
+    first = await _paid_commit_through(guard, body)
+    second = await _paid_commit_through(guard, body)
+    assert first.status_code == 200 and second.status_code == 200, second.text
+    assert second.json()["receipt_id"] == first.json()["receipt_id"]
+    assert facilitator.settle_calls == 1, "one commitment, one settlement, through the served app"
+
+
+async def test_MOUNT_startup_RECONCILES_a_recoverable_journal_left_by_a_crash(tmp_path: Path) -> None:
+    """Condition 4: the promised startup recovery actually runs.
+
+    The plan says the reconciler runs at startup, and production had no ``reconcile()`` call at
+    all. A journal entry with no finalized record is the state a crash between settlement and
+    finalization leaves behind: settlement is KNOWN to have happened, so completing it is the only
+    correct action. Without startup recovery this row stays invisible until someone runs a script
+    that does not exist yet.
+    """
+    from veridex.signal_trials.receipts import ReceiptStore, receipt_id_for
+
+    trial = _publish_trial(tmp_path)
+    seed = ReceiptStore(tmp_path)
+    seed.stage(
+        staging_id="crashed",
+        trial_id=trial.trial_id,
+        payer="0x" + "b" * 40,
+        body={"trial_id": trial.trial_id, "p_follow_profitable": 0.6, "methodology_version": None},
+        staged_at_ms=trial.t0_ms,
+        commit_deadline_ms=trial.commit_deadline_ms,
+        trial_mode="live",
+    )
+    seed.journal("crashed", payer="0x" + "b" * 40, tx_hash="0x" + "c" * 64)
+    assert seed.count_finalized() == 0 and seed.journal_len() == 1
+
+    create_server_app(env=_mount_env(tmp_path), settings=_dev_settings(), x402_facilitator=FakeFacilitator())
+
+    after = ReceiptStore(tmp_path)
+    assert after.count_finalized() == 1, "startup did not reconcile the journaled settlement"
+    assert after.journal_len() == 0
+    assert after.record(receipt_id_for("crashed")) is not None
+
+
+async def test_MOUNT_enabled_payments_REFUSE_to_start_without_a_durable_root(tmp_path: Path) -> None:
+    """Condition 1: a missing or blank durable root fails startup rather than charging into the void.
+
+    Charging against an ephemeral or disconnected store is the failure this refuses: the payer's
+    money moves, and the record it buys is written somewhere nothing serves or survives. ``match=``
+    because a money-path rejection has to discriminate the identity of the refusal.
+    """
+    for blank in (dict(_X402_ENV), {**_X402_ENV, "SIGNAL_TRIALS_DATA_DIR": "   "}):
+        with pytest.raises(ValueError, match="SIGNAL_TRIALS_DATA_DIR"):
+            create_server_app(env=blank, settings=_dev_settings(), x402_facilitator=FakeFacilitator())
+
+
+async def test_MOUNT_disabled_payments_keep_the_honest_503_and_need_no_root(tmp_path: Path) -> None:
+    """Condition 5: with payments off, the commit route still refuses honestly and startup succeeds.
+
+    No durable root is required either — a deployment that wants no payment gate must remain
+    bootable, which is the same reason the SDK import stays lazy.
+    """
+    guard: Any = create_server_app(
+        env={**_X402_ENV, "X402_ENABLED": "false"}, settings=_dev_settings(), x402_facilitator=None
+    )
+    mounted = [m.cls.__name__ for m in guard.app.user_middleware]
+    assert "SignalTrialsPaymentASGI" not in mounted and "PaymentMiddlewareASGI" not in mounted
+    async with _client_for(guard) as c:
+        r = await c.get("/signal-trials/commit")
+    assert r.status_code == 503 and r.json() == {"error": "trials_not_open"}
+    assert "payment-required" not in {k.lower() for k in r.headers}

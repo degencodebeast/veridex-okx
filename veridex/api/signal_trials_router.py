@@ -103,7 +103,35 @@ def register_signal_trials_routes(
         store: The two-phase commit store, needed for the commit route to be servable at
             all. Present so this function can tell "no trials here" apart from "trials
             but no payment gate", which are fixed differently.
+
+    **Dependencies are resolved PER REQUEST, preferring the composition root's.** These routes
+    are registered from inside the AgentOS composition, which runs BEFORE the composition root
+    can build the durable Signal Trials dependencies — so a value captured at registration time
+    would permanently be the one that was available too early. Each handler therefore consults
+    ``app.state`` first and falls back to whatever was injected here, which is what lets ONE
+    store and ONE repository serve both the free reads and the payment wrapper without
+    threading constructor arguments through ``build_agentos_app``. Injected values remain
+    authoritative for any caller that supplies them and sets no state, so every existing test
+    composition is unaffected.
     """
+
+    def _live_trials() -> LiveTrialRepository | None:
+        """The live-trial repository the composition root built, else the injected one."""
+        return getattr(app.state, "signal_trials_live", None) or live_trials
+
+    def _store() -> ReceiptStore | None:
+        """The commit store the composition root built, else the injected one."""
+        return getattr(app.state, "signal_trials_store", None) or store
+
+    def _data_dir() -> Path | str | None:
+        """The published-season root, preferring the one the composition root resolved.
+
+        The composition root resolves ``SIGNAL_TRIALS_DATA_DIR`` from the same mapping it
+        resolves everything else from. Preferring it here keeps one variable to one source: a
+        second independent read is how the season repository and the commit store could come to
+        disagree about which directory this deployment actually uses.
+        """
+        return getattr(app.state, "signal_trials_data_dir", None) or data_dir
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/health")
     async def signal_trials_health() -> dict[str, Any]:
@@ -113,7 +141,7 @@ def register_signal_trials_routes(
         and declined to build a season — from ``not_built``, where it never ran. Both
         answer ``404`` on ``/season``, so health is the only place they differ.
         """
-        return {"ok": True, "season_state": read_state(data_dir)["state"]}
+        return {"ok": True, "season_state": read_state(_data_dir())["state"]}
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/season", response_model=None)
     async def signal_trials_season() -> SignalTrialsSeasonResponse | JSONResponse:
@@ -126,7 +154,7 @@ def register_signal_trials_routes(
         route served a stale ``qualified`` season, and the API would be asserting both
         at once. See :func:`~veridex.signal_trials.published.read_season`.
         """
-        season = read_season(data_dir)
+        season = read_season(_data_dir())
         if season is None:
             return _error(404, "no_season_published")
         return SignalTrialsSeasonResponse(**season)
@@ -140,7 +168,8 @@ def register_signal_trials_routes(
         read per request: a live trial is opened by a separate process, so a value captured at
         registration would keep reporting ``no_open_trial`` after one was published.
         """
-        trial = live_trials.current() if live_trials is not None else None
+        repo = _live_trials()
+        trial = repo.current() if repo is not None else None
         if trial is not None:
             return _open_trial_response(trial)
         provided = None if open_trial_provider is None else open_trial_provider()
@@ -159,7 +188,8 @@ def register_signal_trials_routes(
         The id is never echoed into the refusal: it arrives from a URL path segment, so echoing
         it would reflect caller-controlled text back into logs and responses.
         """
-        trial = None if live_trials is None else live_trials.get(trial_id)
+        repo = _live_trials()
+        trial = None if repo is None else repo.get(trial_id)
         if trial is None:
             return _error(404, "trial_not_found")
         return _open_trial_response(trial)
@@ -200,7 +230,7 @@ def register_signal_trials_routes(
         path, which is an operator misconfiguration rather than a quiet period: a free 200 here
         would publish a benchmark commitment that was never paid for.
         """
-        if live_trials is None or store is None:
+        if _live_trials() is None or _store() is None:
             return _error(503, "trials_not_open")
         return _error(503, "payment_gate_not_configured")
 
