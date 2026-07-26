@@ -396,6 +396,35 @@ async def test_a_season_published_after_startup_is_served_without_a_rebuild(tmp_
         assert (await c.get("/signal-trials/health")).json()["season_state"] == "qualified"
 
 
+async def test_a_blank_data_dir_is_treated_as_unconfigured(tmp_path, monkeypatch):
+    """``SIGNAL_TRIALS_DATA_DIR`` set but EMPTY must read as unconfigured, not as ``.``.
+
+    ``Path("") / "published" / "state.json"`` is the RELATIVE path
+    ``published/state.json``, so without the blank-to-``None`` coercion at the
+    composition root an API process configured with NO data directory would serve
+    whatever season happens to sit under its working directory. That contradicts the
+    rule ``published.py`` states for itself: absence reads as ``not_built``, and only
+    absence does.
+
+    Blank-but-present is the third case and the one a container actually produces from
+    a declared-but-unset variable. It was held constant out of this file until now: the
+    autouse fixture DELETES the variable and the restart-state test SETS it to a real
+    path, so the coercion ran on every test and was varied by none of them.
+
+    The planted season is what gives the test teeth — without it, an implementation that
+    resolved ``""`` to the working directory would still report ``not_built`` simply
+    because nothing was there to find.
+    """
+    write_state(tmp_path, "qualified", {"planted": True})
+    write_season(tmp_path, SEASON_A)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(_DATA_DIR_ENV, "")
+
+    async with _client_for(create_app()) as c:
+        assert (await c.get("/signal-trials/health")).json()["season_state"] == "not_built"
+        assert (await c.get("/signal-trials/season")).status_code == 404
+
+
 async def test_a_corrupt_season_artifact_is_never_served_as_an_empty_season(tmp_path):
     """Corruption must not degrade into a plausible-looking 404 or a fabricated body."""
     published = tmp_path / "published"
@@ -775,21 +804,29 @@ def test_the_three_okx_credentials_are_not_transposed():
 def test_production_settlement_is_synchronous(monkeypatch):
     """``sync_settle`` is what stops an unsettled commit returning 200.
 
-    Held at its single value everywhere else in this file, so a hard-coded ``False``
-    would pass every other test while silently converting the gate to fire-and-forget
-    settlement — a commit receipt with no transaction behind it. Spying on the builder
-    is what makes the forwarded value observable at all; the client keeps it private.
+    Asserted on the CONSTRUCTED CLIENT, not on the argument handed to the builder. The
+    value crosses two sites — the mount forwards ``x402_settings.sync_settle`` into
+    ``_build_okx_facilitator``, and the builder passes it on into
+    ``OKXFacilitatorConfig`` — and a test that pins only the forwarded value leaves the
+    consuming one free. Half a law is not a law. A hard-coded ``False`` at EITHER site
+    delivers fire-and-forget settlement to production, where an unsettled commit returns
+    200 carrying a receipt with no transaction behind it, silently. Asserting the
+    delivered value is one assertion that covers both sites.
+
+    Reaches into the client's private attribute for the same reason
+    ``test_the_three_okx_credentials_are_not_transposed`` reaches into ``_auth``: the
+    installed SDK exposes no accessor for what it stored.
     """
-    captured: dict[str, object] = {}
+    built: dict[str, object] = {}
     real = server_module._build_okx_facilitator
 
     def _spy(env, *, sync_settle):
-        captured["sync_settle"] = sync_settle
-        return real(env, sync_settle=sync_settle)
+        built["client"] = real(env, sync_settle=sync_settle)
+        return built["client"]
 
     monkeypatch.setattr(server_module, "_build_okx_facilitator", _spy)
     create_server_app(env={**_PROD_ENV, **_SENTINEL_CREDENTIALS}, settings=_prod_settings())
-    assert captured["sync_settle"] is True
+    assert built["client"]._sync_settle is True
 
 
 def test_the_mount_registers_the_exact_scheme_for_x_layer():
@@ -798,9 +835,7 @@ def test_the_mount_registers_the_exact_scheme_for_x_layer():
     by crash rather than by assertion. Pinned here so the property is banked
     (PKT-DEC-C23: detected-by-exception is a gap, not a kill).
     """
-    resource_server = _mount_signal_trials_402(
-        FastAPI(), _X402_ENV, is_production=False, facilitator=FakeFacilitator()
-    )
+    resource_server = _mount_signal_trials_402(FastAPI(), _X402_ENV, is_production=False, facilitator=FakeFacilitator())
     assert resource_server is not None
     assert resource_server.has_registered_scheme(X_LAYER_MAINNET, "exact")
 
