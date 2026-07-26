@@ -172,6 +172,11 @@ async def test_get_candles_takes_bar_ms_from_the_requested_bar_and_not_from_a_co
     assert series.bar_ms == BAR_MS["1H"]
     assert BAR_MS["1H"] != BAR_MS["1m"]
     assert len(fake.calls) == 1
+    # PKT-DEC-C24: presence asserted BEFORE the subscript. A mutant that drops the key entirely is
+    # still a genuine kill either way — the test's own logic reached for it and found it missing —
+    # but `AssertionError: 'bar' in {...}` names the CONTRACT, where a bare KeyError names only a
+    # missing key and leaves the reader to infer what was required.
+    assert "bar" in fake.calls[0][2]
     assert fake.calls[0][2]["bar"] == "1H"
 
 
@@ -314,6 +319,10 @@ async def test_get_candles_sends_the_requested_chain_and_token_rather_than_const
 
     assert len(fake.calls) == 2  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
     first_params, second_params = fake.calls[0][2], fake.calls[1][2]
+    # PKT-DEC-C24: presence before subscript, so a dropped key fails as a named contract.
+    for params in (first_params, second_params):
+        assert "chainIndex" in params
+        assert "tokenContractAddress" in params
     assert (first_params["chainIndex"], first_params["tokenContractAddress"]) == ("501", "So1")
     assert (second_params["chainIndex"], second_params["tokenContractAddress"]) == (CHAIN_B, TOKEN_B)
     # Stated directly rather than left implicit in the two equalities above: the request must VARY
@@ -334,6 +343,9 @@ async def test_list_signals_sends_the_requested_chain_rather_than_a_constant():
     first_body, second_body = fake.calls[0][3], fake.calls[1][3]
     assert isinstance(first_body, list) and len(first_body) == 1
     assert isinstance(second_body, list) and len(second_body) == 1
+    # PKT-DEC-C24: presence before subscript.
+    assert "chainIndex" in first_body[0]
+    assert "chainIndex" in second_body[0]
     assert first_body[0]["chainIndex"] == "501"
     assert second_body[0]["chainIndex"] == CHAIN_B
     assert first_body[0]["chainIndex"] != second_body[0]["chainIndex"]
@@ -400,6 +412,13 @@ async def test_auth_headers_carry_the_credential_each_field_is_meant_to_carry():
 
     assert len(fake.calls) == 2  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
     for _, _, _, _, headers in fake.calls:
+        # PKT-DEC-C24: presence before subscript. Renaming an auth header is still a genuine kill
+        # without these two lines — the pin's own logic reaches for the header and finds it absent —
+        # but the failure then reads `KeyError: 'OK-ACCESS-KEY'`, which tells a maintainer that
+        # something broke rather than that this header is REQUIRED. This is the case that prompted
+        # C24; the classification was already right, only the legibility of the kill was poor.
+        assert "OK-ACCESS-KEY" in headers
+        assert "OK-ACCESS-PASSPHRASE" in headers
         assert headers["OK-ACCESS-KEY"] == SENTINEL_API_KEY
         assert headers["OK-ACCESS-PASSPHRASE"] == SENTINEL_PASSPHRASE
         # The transposition this pin exists to catch: the passphrase header carrying the secret key.
@@ -426,3 +445,82 @@ def test_credentials_repr_never_renders_the_secret_key_or_passphrase():
         assert SENTINEL_PASSPHRASE not in rendered
         assert SENTINEL_API_KEY not in rendered
         assert "***" in rendered
+
+
+# --- MAJOR-1 PIN (QUALITY review of 9a64083; fix at 9564f2d, written by another agent and pinned
+# here by one that did not write it). `list_signals` validated no row shape at all, so
+# {"code":"0","data":["a","b","c"]} returned SignalPage(signals=('a','b','c')). The dangerous half
+# was the cursor read: it already CONTEMPLATED a non-dict last row and chose a silent no-op, so a
+# malformed final row produced next_cursor=None — indistinguishable from end-of-pagination. A season
+# fetch would stop after page 1 and report a complete dataset. A handled case handled wrongly is
+# harder to find than missing handling, because the guard's presence reads as coverage.
+
+
+def _signal_row_without_cursor(token_address: str) -> dict[str, object]:
+    """A well-formed wire row that simply has no ``cursor`` key — the last page, lawfully."""
+    row = _signal_row("UNUSED", token_address)
+    del row["cursor"]
+    return row
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        ["not-a-signal-object"],  # sole row
+        ["not-a-signal-object", _signal_row("C", "So1")],  # FIRST position
+        [_signal_row("C", "So1"), "not-a-signal-object"],  # LAST position - the silent vector
+        [_signal_row("C", "So1"), 42, _signal_row("C", "So2")],  # MIDDLE position
+        [["ts", "price"]],  # a LIST row: iterable and non-empty, but not a wire object
+        [None],
+        [_signal_row("C", "So1"), None],  # None specifically in last position
+    ],
+)
+async def test_list_signals_rejects_rows_that_are_not_wire_objects(rows: list[object]) -> None:
+    """Every position matters, not just position 0.
+
+    A pin that only tested the first element would pass against the exact implementation that was
+    silent, because the truncation vector is the LAST row: that is the one the cursor is read from.
+    """
+    client = OKXMarketClient(RecordingFake({"code": "0", "data": rows}), OKXCredentials("k", "s", "p"))
+    with pytest.raises(OKXResponseError):
+        await client.list_signals(SignalFilters(chain_index="501"))
+
+
+async def test_list_signals_raises_rather_than_reporting_a_bad_last_row_as_end_of_pagination():
+    """The silent vector, pinned on its own because its failure mode is a WRONG RESULT, not an error.
+
+    The other row positions were merely unvalidated. This one was actively mis-handled: the cursor
+    read skipped a non-dict last row and left ``next_cursor=None``, which every caller is entitled to
+    read as "no more pages". Truncating a season's dataset while reporting success is a false
+    provenance claim of exactly the kind §7 reserves ``UNSCORED`` against.
+    """
+    rows = [_signal_row("CURSOR-FIRST", "So1"), "not-a-signal-object"]
+    client = OKXMarketClient(RecordingFake({"code": "0", "data": rows}), OKXCredentials("k", "s", "p"))
+
+    with pytest.raises(OKXResponseError) as excinfo:
+        await client.list_signals(SignalFilters(chain_index="501"))
+
+    # Names the signal row, so this cannot be satisfied by an unrelated failure or confused with the
+    # candle-row guard, which raises the same type.
+    assert "signal row" in str(excinfo.value)
+
+
+async def test_list_signals_over_correction_control_absence_is_still_lawful():
+    """The control. The fix must reject bad SHAPES without making legitimate ABSENCE raise.
+
+    Two distinct absences are lawful and must stay representable: no rows at all, and rows that
+    simply carry no cursor. Both mean "nothing further", which §7 needs in order to express a
+    genuine end-of-data rather than a swallowed failure. A guard that raised on either would have
+    broken the settlement law in the opposite direction from the defect it fixed.
+    """
+    empty = OKXMarketClient(RecordingFake({"code": "0", "data": []}), OKXCredentials("k", "s", "p"))
+    page = await empty.list_signals(SignalFilters(chain_index="501"))
+    assert page.signals == ()
+    assert page.next_cursor is None
+
+    last_row = _signal_row_without_cursor("So1")
+    assert "cursor" not in last_row
+    no_cursor = OKXMarketClient(RecordingFake({"code": "0", "data": [last_row]}), OKXCredentials("k", "s", "p"))
+    final_page = await no_cursor.list_signals(SignalFilters(chain_index="501"))
+    assert final_page.signals == (last_row,)
+    assert final_page.next_cursor is None
