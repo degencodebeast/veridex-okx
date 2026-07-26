@@ -115,6 +115,25 @@ def _client_for(app: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://sig")
 
 
+def _must_not_raise(build):
+    """Run ``build`` and convert any refusal into a PINNED assertion failure.
+
+    A test whose subject simply raises fails by exception, which PKT-DEC-C23 classifies
+    as detection-by-crash rather than a banked kill. Turning the refusal into an
+    AssertionError is what makes "this configuration must be accepted" a property the
+    suite owns rather than one it happens to notice.
+
+    Lives with the file-level helpers, not under the 402 banner: the schema tests use it
+    too, and a shared helper filed under one section reads as scoped to that section.
+    """
+    try:
+        return build()
+    except Exception as error:  # noqa: BLE001 - re-raised as an assertion below
+        raise AssertionError(
+            f"expected this configuration to be accepted, got {type(error).__name__}: {error}"
+        ) from error
+
+
 # --- the published-season repository: the artifact -> API contract ---
 
 
@@ -554,22 +573,6 @@ _SENTINEL_CREDENTIALS = {
 }
 
 
-def _must_not_raise(build):
-    """Run ``build`` and convert any refusal into a PINNED assertion failure.
-
-    A test whose subject simply raises fails by exception, which PKT-DEC-C23 classifies
-    as detection-by-crash rather than a banked kill. Turning the refusal into an
-    AssertionError is what makes "this configuration must be accepted" a property the
-    suite owns rather than one it happens to notice.
-    """
-    try:
-        return build()
-    except Exception as error:  # noqa: BLE001 - re-raised as an assertion below
-        raise AssertionError(
-            f"expected this configuration to be accepted, got {type(error).__name__}: {error}"
-        ) from error
-
-
 def _dev_settings() -> Settings:
     return Settings(APP_ENV="development", AUTH_MODE="dev")
 
@@ -716,6 +719,57 @@ def test_enabled_x402_without_any_facilitator_refuses_to_build():
         (_X402_ENV, _prod_settings),  # Settings says production, env does not
     ],
 )
+def test_a_production_signal_from_either_source_refuses_to_start_disabled(env, settings_factory):
+    """The must-be-enabled rule must fire on a production signal from EITHER source.
+
+    This rule and the payout-address rule below are owned by ``load_x402_settings``, which
+    re-derives production-ness from ``env["APP_ENV"]`` alone. The two-source resolver is
+    therefore only as good as what it is applied to: before it was routed through, the
+    ``Settings``-only row booted the money path ungated while both other rows refused.
+
+    The env-only and both-sources rows are the control — they passed before the fix and
+    must keep passing, which is what distinguishes a real gap from a broken test.
+    """
+    disabled = {k: v for k, v in env.items() if k != "X402_ENABLED"}
+    with pytest.raises(ValueError, match="X402"):
+        create_server_app(env=disabled, settings=settings_factory())
+
+
+@pytest.mark.parametrize(
+    ("env", "settings_factory"),
+    [
+        (_PROD_ENV, _prod_settings),
+        (_PROD_ENV, _dev_settings),
+        (_X402_ENV, _prod_settings),
+    ],
+)
+@pytest.mark.parametrize("bad_payout", ["", "not-an-address", "0x" + "f" * 39])
+def test_a_production_signal_from_either_source_refuses_a_malformed_payout(env, settings_factory, bad_payout):
+    """``pay_to`` well-formedness must fire on a production signal from EITHER source.
+
+    The failure this pins is not a refusal-to-start: it is a paywall that MOUNTS with an
+    unvalidated payout address, so the challenge a paying agent receives names an empty or
+    malformed destination. Measured before the fix at the ``Settings``-only row:
+    ``BOOTED, GATE MOUNTED, payTo=''``.
+
+    Credentials are supplied so the OKX client builds — without them the mount refuses on
+    missing credentials instead, which would pass this test for entirely the wrong reason.
+    """
+    with pytest.raises(ValueError, match="PAY_TO_ADDRESS"):
+        create_server_app(
+            env={**env, **_SENTINEL_CREDENTIALS, "X402_ENABLED": "true", "PAY_TO_ADDRESS": bad_payout},
+            settings=settings_factory(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("env", "settings_factory"),
+    [
+        (_PROD_ENV, _prod_settings),
+        (_PROD_ENV, _dev_settings),  # env says production, Settings does not
+        (_X402_ENV, _prod_settings),  # Settings says production, env does not
+    ],
+)
 def test_a_production_signal_from_either_source_refuses_the_fake(env, settings_factory):
     """Production-ness is decided fail-closed from BOTH sources.
 
@@ -826,6 +880,9 @@ def test_production_settlement_is_synchronous(monkeypatch):
 
     monkeypatch.setattr(server_module, "_build_okx_facilitator", _spy)
     create_server_app(env={**_PROD_ENV, **_SENTINEL_CREDENTIALS}, settings=_prod_settings())
+    # Presence before subscript: if the builder is never reached the pin should say so,
+    # not die on a KeyError that reads like an unrelated fault (C24 legibility).
+    assert "client" in built, "the production path never built a facilitator"
     assert built["client"]._sync_settle is True
 
 

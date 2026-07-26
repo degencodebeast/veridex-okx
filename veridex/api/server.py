@@ -237,8 +237,18 @@ def _x402_is_production(env: Mapping[str, str], settings: Settings) -> bool:
     refuse. Resolving to production instead only ever costs a test an explicit opt-out.
 
     The env-side rule reuses :data:`veridex.config._NON_PRODUCTION_APP_ENVS` rather than
-    restating it: a second copy of the money path's production rule is a copy that can
-    drift out of agreement with the loader that enforces it.
+    restating it here, which keeps this site from becoming a third definition of the rule.
+
+    It does NOT make this the only evaluation of it. The money path's production rule has
+    two definitions and three evaluation sites: ``config.py`` defines the frozenset and
+    :attr:`Settings.is_production` evaluates it; ``payments.py`` declares its own mirrored
+    copy and ``load_x402_settings`` evaluates that one; and this function evaluates the
+    ``config.py`` copy. The two frozensets are byte-identical today and ``payments.py`` is
+    frozen, so nothing diverges — but the residual is real and is recorded here rather
+    than left implied. What removes the risk that mattered is not the shared import: it is
+    that :func:`_mount_signal_trials_402` now hands the loader THIS function's answer
+    instead of letting it re-derive one, so the three duties cannot disagree about whether
+    a configuration is production.
     """
     app_env = env.get("APP_ENV", "development").strip().casefold()
     return settings.is_production or app_env not in _NON_PRODUCTION_APP_ENVS
@@ -314,7 +324,13 @@ def _mount_signal_trials_402(
       the same way;
     * in production the facilitator must be the real one, which
       :func:`~veridex.signal_trials.payments.build_resource_server` enforces by refusing
-      the fake and anything wrapping it.
+      the fake, its adapter, and an object holding a BARE fake under an attribute literally
+      named ``fake``. That last clause is name-dependent and one level deep:
+      :func:`~veridex.signal_trials.payments._is_test_double` discloses four wrapper shapes
+      it does NOT refuse (``_fake``, ``inner``, list-held, closure-captured, and
+      ``self.fake`` holding an *adapter*). Nothing here wraps a facilitator, so no bypass
+      exists at this head — but a future author of a wrapper reads THIS docstring first,
+      and it must not promise containment the guard does not provide.
 
     Returns:
         The composed ``x402ResourceServer`` when a gate was mounted, else ``None``.
@@ -342,7 +358,19 @@ def _mount_signal_trials_402(
 
     # Authoritative, fail-closed: refuses a production config that is disabled, carries a
     # malformed payout address, or carries a price that cannot honestly be charged.
-    x402_settings = load_x402_settings(env)
+    #
+    # The loader is handed the production decision ALREADY RESOLVED rather than being left
+    # to re-derive one from ``env["APP_ENV"]``. Three duties key off production-ness — the
+    # must-be-enabled rule and the PAY_TO_ADDRESS well-formedness rule, both owned by the
+    # loader, and the fake-facilitator refusal owned by ``build_resource_server`` — and
+    # they must not disagree about it. When only ``Settings`` carries the production signal
+    # (a ``veridex/.env`` deployment, or any caller supplying ``env=`` while letting
+    # ``settings`` default), a loader re-deriving from ``env`` alone reads the config as
+    # development and applies NEITHER of its two rules, mounting a paywall whose payout
+    # address was never validated. Overriding ``APP_ENV`` is what makes the resolved answer
+    # reach the rules; it reuses the loader's canonical checks rather than restating them,
+    # which matters because ``_EVM_ADDRESS`` is private to the frozen ``payments.py``.
+    x402_settings = load_x402_settings({**env, "APP_ENV": "production"} if is_production else env)
     if not x402_settings.enabled:
         return None
 
@@ -519,10 +547,14 @@ def create_server_app(
     # Signal Trials: the TEMPORARY stock x402 layer over the commit route (H1.2; H4.1 replaces it).
     # Attached to the COMPOSED app, not to the guard — see ``app = guard.app`` above.
     #
-    # Production ALWAYS goes through the fail-closed loader, even when X402_ENABLED looks unset, so a
-    # production deploy that forgot to enable payments refuses to start rather than serving the commit
-    # route ungated. Outside production the SDK is not even imported unless payments were asked for,
-    # which keeps installs without the optional ``signal-trials`` extra bootable.
+    # A production signal from EITHER source reaches the fail-closed loader, even when X402_ENABLED
+    # looks unset, so a production deploy that forgot to enable payments refuses to start rather than
+    # serving the commit route ungated. Two parts are needed for that and both are load-bearing: this
+    # clause makes the mount RUN when only Settings says production, and _mount_signal_trials_402
+    # hands the loader the resolved answer so it actually ENFORCES production once it does. Either one
+    # alone leaves the Settings-only configuration booting ungated. Outside production the SDK is not
+    # imported at all unless payments were asked for, which keeps installs without the optional
+    # ``signal-trials`` extra bootable.
     x402_is_production = _x402_is_production(resolved_env, resolved_settings)
     if x402_is_production or _x402_may_be_configured(resolved_env):
         _mount_signal_trials_402(app, resolved_env, is_production=x402_is_production, facilitator=x402_facilitator)
