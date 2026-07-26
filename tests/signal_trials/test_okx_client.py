@@ -114,6 +114,16 @@ CANDLE_UNCONFIRMED = ["1753400060000", "1.1", "1.3", "1.0", "1.2", "6", "6.6", "
 CHAIN_B = "56"
 TOKEN_B = "0xB0B"
 
+# Credential SENTINELS for the leakage-path pins. Deliberately self-describing non-secrets, never
+# realistic credential values: a test proving that secrets do not leak, which itself contains a
+# realistic-looking secret, has leaked one into the repository and into every evidence file that
+# quotes the run. These exist to be asserted ABSENT from rendered output, never to be exhibited.
+# One distinct sentinel PER FIELD, because the defect being pinned is a TRANSPOSITION — the secret
+# key being sent where the passphrase belongs — which identical or near-identical values cannot show.
+SENTINEL_API_KEY = "SENTINEL-API-KEY-NOT-A-CREDENTIAL"
+SENTINEL_SECRET_KEY = "SENTINEL-SECRET-KEY-NOT-A-CREDENTIAL"
+SENTINEL_PASSPHRASE = "SENTINEL-PASSPHRASE-NOT-A-CREDENTIAL"
+
 
 def _signal_row(cursor: str, token_address: str) -> dict[str, object]:
     """One wire signal row. Carried through untouched — normalization is H2.2, not this module."""
@@ -364,3 +374,55 @@ async def test_get_candles_maps_every_wire_column_to_its_own_field():
     # would silently stop detecting a swap between them while every assertion above still passed.
     numeric = [candle.open, candle.high, candle.low, candle.close, candle.vol, candle.vol_usd]
     assert len(set(numeric)) == len(numeric)
+
+
+# --- C23 PIN. The LEAKAGE PATH. Both behaviours below are currently CORRECT — the H2.1 SPEC review
+# verified the redaction by execution — and neither was observable to the suite, which is the whole
+# problem: a credential guard nothing tests is one refactor from being silently gone, and the next
+# person to touch it will have a green suite telling them it is fine. Asserted by the ABSENCE of a
+# sentinel from rendered or transmitted output; no credential-shaped value appears anywhere here.
+
+
+async def test_auth_headers_carry_the_credential_each_field_is_meant_to_carry():
+    """PIN 7a — the secret key SIGNS requests; it must never be TRANSMITTED as a header value.
+
+    Ranked first of the two: this is not a leak into a log or a traceback that someone might later
+    read. Populating OK-ACCESS-PASSPHRASE from `secret_key` puts the secret key on the wire, in a
+    header, to a third party, on every single request. Each header is asserted to carry the field it
+    is supposed to carry, and the secret sentinel is asserted absent from everything transmitted.
+    """
+    creds = OKXCredentials(SENTINEL_API_KEY, SENTINEL_SECRET_KEY, SENTINEL_PASSPHRASE)
+    fake = RecordingFake({"code": "0", "data": []})
+    client = OKXMarketClient(fake, creds)
+
+    await client.get_candles("501", "So1", "1m")
+    await client.list_signals(SignalFilters(chain_index="501"))
+
+    assert len(fake.calls) == 2  # ORDER IS LOAD-BEARING (PKT-DEC-C20 rule 1)
+    for _, _, _, _, headers in fake.calls:
+        assert headers["OK-ACCESS-KEY"] == SENTINEL_API_KEY
+        assert headers["OK-ACCESS-PASSPHRASE"] == SENTINEL_PASSPHRASE
+        # The transposition this pin exists to catch: the passphrase header carrying the secret key.
+        assert headers["OK-ACCESS-PASSPHRASE"] != SENTINEL_SECRET_KEY
+        # Absence, over every transmitted value — not just the header we happened to think of. The
+        # signature is an HMAC *derived from* the secret and must not contain it in the clear.
+        assert not any(SENTINEL_SECRET_KEY in str(value) for value in headers.values())
+
+
+def test_credentials_repr_never_renders_the_secret_key_or_passphrase():
+    """PIN 7b — the redacting ``__repr__`` is a security control, and controls need tests.
+
+    ``OKXCredentials`` is a frozen dataclass declared ``repr=False`` with an explicit redacting
+    ``__repr__``; the generated repr would leak ``secret_key`` and ``passphrase`` into any traceback,
+    pytest assertion diff, or structured log that renders the object. Every path below reaches
+    ``__repr__``: ``repr()`` directly, ``str()`` and f-string interpolation (no ``__str__``, so both
+    fall back to it), and containment in a collection, whose repr calls ``repr`` on its elements —
+    the leak route that is easiest to miss, because nothing in the code says "repr".
+    """
+    creds = OKXCredentials(SENTINEL_API_KEY, SENTINEL_SECRET_KEY, SENTINEL_PASSPHRASE)
+
+    for rendered in (repr(creds), str(creds), f"{creds}", repr([creds]), repr({"c": creds})):
+        assert SENTINEL_SECRET_KEY not in rendered
+        assert SENTINEL_PASSPHRASE not in rendered
+        assert SENTINEL_API_KEY not in rendered
+        assert "***" in rendered
