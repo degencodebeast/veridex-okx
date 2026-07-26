@@ -248,6 +248,16 @@ def test_a_retiring_state_hides_a_previously_published_season(tmp_path, publishe
     # which is production crashing rather than this test catching it (PKT-DEC-C23).
     assert _must_not_raise(lambda: read_season(tmp_path)) is None
 
+    # The payload is STILL ON DISK, read straight off the filesystem rather than through
+    # the reader under test. Without this the assertion above agrees for two different
+    # reasons and cannot tell them apart: hidden by the read path, or deleted by the
+    # write path. Codex's item 4 makes deletion optional and read-side consistency
+    # mandatory, so proving the payload survived is what proves the READ side is doing
+    # the work — and it is the case a crash between two file operations actually leaves.
+    season_file = tmp_path / "published" / "season.json"
+    assert season_file.is_file(), "the payload must survive on disk; read-side hiding is the contract, not deletion"
+    assert json.loads(season_file.read_text()) == published
+
 
 def test_a_payload_from_another_generation_is_refused_not_served(tmp_path):
     """A payload whose own status contradicts the state is cross-generation. Fail closed.
