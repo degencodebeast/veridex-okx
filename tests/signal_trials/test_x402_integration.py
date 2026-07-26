@@ -45,7 +45,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args, get_origin
 
 import httpx
 import pytest
@@ -497,15 +497,15 @@ async def test_challenge_advertises_the_CONFIGURED_payout_address(x402_app_facto
     async with _client(app) as client:
         challenge = await _challenge(client, _body(0.6))
     advertised = decode_payment_required_header(challenge.headers["payment-required"]).accepts[0]
+    # The two-address parametrization IS the discriminator, and no further assertion is needed to
+    # rule out a constant: a wrapper returning one matches on the run where that constant is the
+    # input and MISMATCHES on the other, so it cannot survive both runs. Measured, not argued —
+    # hard-coding `pay_to` fails this test with IDENTICAL failing-id counts at `40d3417` and at
+    # this head (8 ids for PAY_TO_A, 9 for PAY_TO_B), so an added `!= other` assertion detects
+    # nothing the parametrization does not already detect; one was added here and is removed
+    # again. What WAS vacuous, before `40d3417`, is a different line: `pay_to in (PAY_TO_A,
+    # PAY_TO_B)` plus `PAY_TO_A != PAY_TO_B` holds of every implementation, hard-coded included.
     assert advertised.pay_to == pay_to
-    # The OTHER address must be absent, which is the half that catches a hard-coding: asserting
-    # only that the advertised value equals this parametrization's own input would also pass an
-    # implementation returning a constant on the run where that constant IS the input. A previous
-    # revision of this line asserted `advertised.pay_to in (PAY_TO_A, PAY_TO_B)` and that the two
-    # differ — both true of every implementation, including a hard-coded one, and therefore
-    # nothing.
-    other = PAY_TO_B if pay_to == PAY_TO_A else PAY_TO_A
-    assert advertised.pay_to != other
 
 
 @pytest.mark.parametrize("pay_to", [PAY_TO_A, PAY_TO_B])
@@ -521,12 +521,10 @@ async def test_SETTLEMENT_is_requested_against_the_configured_payout_address(x40
     response = await _paid_post(app, _body(0.6))
     assert response.status_code == 200 and fac.settle_calls == 1
     assert fac.last_settled_requirements is not None, "the fake recorded no settlement requirements"
+    # As at the challenge: the parametrization already rules out a constant, and an added
+    # `!= other` assertion was measured to change nothing — hard-coding `pay_to` at the settle
+    # call only fails this test with the same single failing id at `40d3417` and at this head.
     assert fac.last_settled_requirements.pay_to == pay_to
-    # As at the challenge, the discriminating half: equality with this run's own input would also
-    # hold for an implementation returning a constant, on whichever run that constant matches.
-    # What rules a hard-coding out is that the OTHER configured address never appears.
-    other = PAY_TO_B if pay_to == PAY_TO_A else PAY_TO_A
-    assert fac.last_settled_requirements.pay_to != other
 
 
 async def test_wrapper_REFUSES_an_asynchronous_settlement_configuration(x402_app_factory):
@@ -660,6 +658,15 @@ async def test_the_default_price_reaches_the_wire_through_the_H1_1_validated_pat
     correctness. The ceiling and the malformed-price refusals are H1.1's and are pinned in
     ``test_payments.py``; this asserts only that the wrapper routes the price through that
     already-validated path rather than formatting an amount itself.
+
+    A scope limit worth naming, because the test's own name invites the wrong reading: this does
+    NOT detect a hard-coded ``price``. Replacing ``price=settings.price`` with a literal
+    ``"$0.01"`` leaves every assertion here true, because ``$0.01`` is what this fixture
+    configures — a vector equal to the constant under test cannot detect that constant. Measured:
+    that mutant fires 9 ids and NOT ONE of them is this test. The property is pinned by
+    ``test_the_advertised_amount_FOLLOWS_the_configured_price`` in ``test_payments.py``, which
+    varies the price and is correctly named for it. The network and timeout assertions below are
+    this test's own contribution and do fire on their mutants.
     """
     app, _store, _fac = x402_app_factory(facilitator=FakeFacilitator())
     async with _client(app) as client:
@@ -1196,12 +1203,20 @@ async def test_a_CORRUPT_finalized_row_is_never_counted_as_servable(x402_app_fac
 # below identical, and that pin belongs in Data's own suite.
 #
 # And per C17-R2-A1, field ORDER is the property that breaks SILENTLY where names, arity and
-# types break loudly. This lane's exposure to order is genuinely LOW and it is worth being
-# precise rather than claiming credit: every construction here is by KEYWORD
-# (`CanonicalSignal(**fields)`, `OpenTrialResponse(trial_id=...)`), never positional, so a
-# reorder cannot silently transpose values the way Law's positional eight-argument construction
-# could. Order is asserted anyway — it is cheap, it is what C22 requires, and the reason it is
-# safe here is a property of THIS code that a future edit could remove.
+# types break loudly. This lane's exposure to a reorder is genuinely LOW, and the reason is
+# stronger than "we happen to use keywords": all three consumed types are pydantic models, and
+# `BaseModel.__init__` takes NO positional arguments at all — `CanonicalSignal(1)` raises
+# `TypeError: BaseModel.__init__() takes 1 positional argument but 2 were given`, measured for
+# each of the three. So a reorder cannot silently transpose values here the way Law's positional
+# eight-argument `Candle` construction could, and that immunity is a property of PYDANTIC rather
+# than of this lane's style — an edit to this file cannot remove it.
+#
+# Order is asserted anyway, and it is NOT decoration: reordering two same-arity, differently
+# typed CanonicalSignal fields (`holders` <-> `top10_holder_percent`) SURVIVED every one of the
+# 269 tests in the four-file mutation set at `40d3417` (this file plus `test_commit_lifecycle`,
+# `test_router` and `test_payments`) and is killed only by the pin below. What the pin buys is
+# notice that the OWNER's contract moved — exactly C22's purpose — not protection against a
+# runtime bug in this lane, which pydantic's keyword-only construction already precludes.
 # ----------------------------------------------------------------------------------------
 
 #: The surface consumed from DATA-owned ``challenge_spec.py``. Names IN ORDER, with types.
@@ -1276,6 +1291,12 @@ def test_C22_commit_request_surface_and_its_probability_bound():
     bound in an unowned file would silently move validation off the wire and onto
     ``handle_commit``'s defensive check alone. Asserted as metadata rather than by feeding a bad
     value, so it fails on the CONSTRAINT changing rather than on the behaviour of one input.
+
+    Reported honestly: this pin is REDUNDANT as mutation coverage. Relaxing the bound to ``le=2``
+    was already killed at `40d3417` by ``test_commit_request_refuses_a_probability_outside_zero_to_one``,
+    which is correctly named for that property. It is kept because C22 requires the consumed
+    surface to be asserted, and because it fails naming the CONTRACT rather than one input's
+    behaviour — but it buys no detection the suite did not already have.
     """
     fields = CommitRequest.model_fields
     assert len(fields) == 3
@@ -1292,22 +1313,53 @@ def test_C22_open_trial_response_surface_is_what_the_router_constructs():
     ``trial_mode`` is a ``Literal["live"]``: the router passes the literal string rather than the
     trial's own mode, and that is deliberate — a replay trial must not be constructible as a
     discovery payload at all, so the type refuses it instead of the router remembering to.
+
+    The literal is asserted through ``get_origin``/``get_args`` rather than by ``==`` against
+    ``Literal["live"]``. Comparing an annotation to a typing special form is a
+    ``comparison-overlap`` error under ``mypy --strict`` — it was introduced at `04e7a56` and is
+    removed here — and the decomposed form is the stronger assertion anyway: it pins the set of
+    admitted VALUES, so widening the literal to admit ``"replay"`` fails on the value set rather
+    than on object identity.
+
+    Also REDUNDANT as mutation coverage, and said so rather than credited: renaming a field was
+    already killed at `40d3417` by ``test_open_trial_serves_exactly_what_the_provider_yields``,
+    and widening ``trial_mode`` by ``test_open_trial_refuses_any_mode_but_live``. Kept for the
+    same C22 reason as the ``CommitRequest`` pin above.
     """
     assert tuple(OpenTrialResponse.model_fields) == OPEN_TRIAL_RESPONSE_SURFACE
-    assert OpenTrialResponse.model_fields["trial_mode"].annotation == Literal["live"]
+    annotation = OpenTrialResponse.model_fields["trial_mode"].annotation
+    assert get_origin(annotation) is Literal
+    assert get_args(annotation) == ("live",)
 
 
 # ----------------------------------------------------------------------------------------
-# NON-VACUOUS BOUNDARY PINS — the widening direction.
+# NON-VACUOUS BOUNDARY PINS — and precisely WHICH widenings were previously undetected.
 #
-# The inclusive-bounds test above proves p=0 and p=1 are ACCEPTED, which kills a bound
-# TIGHTENED to an open interval. It says nothing about a bound WIDENED: `<= 1.0` changed to
-# `<= 2.0` accepts every value those vectors use, and 1.7 (the only out-of-range value tested
-# elsewhere) is so far outside that it cannot distinguish a bound at 1.0 from one at 1.5.
+# The inclusive-bounds test above proves p=0 and p=1 are ACCEPTED, which kills a bound TIGHTENED
+# to an open interval. What it cannot see is a bound WIDENED. The pre-existing out-of-range
+# vector that reaches `handle_commit`'s own check is 1.7, and MEASUREMENT — not argument — says
+# which widenings it already covers:
+#
+#   upper -> 2.0     ALREADY KILLED at `40d3417` by the 1.7 vector (1.7 becomes admissible, so
+#                    the test asserting its refusal fails). Adding a vector for this bought
+#                    nothing, and an earlier revision of this comment claimed the opposite.
+#   bound REMOVED    ALREADY KILLED at `40d3417`, for the same reason.
+#   upper -> 1.5     SURVIVED all 269 tests of the four-file mutation set at `40d3417`: 1.7 is
+#                    still refused at 1.5, so it cannot locate the bound between 1.0 and 1.7.
+#                    Killed here, 2 ids.
+#   lower -> -1.0    SURVIVED all 269 at `40d3417`. No vector reached this check from below at
+#                    all. Killed here, 2 ids.
+#
+# So these vectors earn their place in the LOWER direction and for a NEAR upper widening, not
+# for the far one. `tests/signal_trials/test_router.py` does feed -0.01 and 1.01, which are
+# tighter values still — but it asserts only `status_code >= 400 and != 402` against an app with
+# trials closed, so a widened bound still yields a 4xx and the mutant survives it. It therefore
+# does not discriminate this bound's location in either direction.
 #
 # A boundary assertion whose input already sits inside the bound proves nothing about the
 # comparison. These use values immediately OUTSIDE it, through `model_construct` so pydantic
-# does not answer first — which is the only way to reach handle_commit's own check.
+# does not answer first — which is the only way to reach handle_commit's own check. The WIRE
+# bound is a separate constraint, pinned as metadata in the C22 block above.
 # ----------------------------------------------------------------------------------------
 
 
