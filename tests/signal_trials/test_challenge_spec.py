@@ -287,6 +287,60 @@ def test_wallet_type_refuses_unknown_names_and_malformed_lists() -> None:
 # top-level `walletType` key and never writes into `token`. A single mutation of `sig["token"]` here
 # would corrupt the frozen fixture for every test that ran after it, and the failing test would not
 # be the one that caused it.
+#
+# That comment is now BACKED BY A GUARD (below). It was previously the only thing standing between
+# this file and silent shared-state corruption, and a comment detects nothing.
+
+
+def _fixture_snapshot(fixture: object) -> str:
+    """A total, order-sensitive rendering of a fixture, including its nested dicts.
+
+    `repr` rather than a hash: the fixtures are small, and when this guard fires the operator wants
+    to see WHAT changed, not that two digests differ. Order-sensitive on purpose — reordering keys
+    is a mutation of shared state even when the set of keys is unchanged.
+
+    Typed `object` rather than `dict[str, ...]` deliberately: `dict` is invariant in its value type,
+    so a concrete annotation makes `mypy --strict` reject the real fixtures, and the covariant
+    `Mapping` would need an import — which would shift every line number in this file, including the
+    frozen block's, for no benefit. Nothing here needs more than `repr`.
+    """
+    return repr(fixture)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_fixture_integrity(request: pytest.FixtureRequest) -> None:
+    """Fail any test that mutates the shared REST or WS fixture, wherever it sits in the file.
+
+    Both fixtures are module-level and both are reachable by aliasing: `{**REST, ...}` shares REST's
+    nested `token` dict by reference, and `{**WS, ...}` shares WS's own — a distinct dict, since line
+    19 does `WS["token"] = dict(REST["token"])`, but shared across every WS-derived payload all the
+    same. So a write through either spread corrupts state for every test that runs afterwards, and
+    the failure surfaces in some later test rather than the one that caused it.
+
+    A golden-hash lock cannot cover this. It hashes REST only, it is a single test at a fixed
+    position, and it is therefore blind to WS entirely and to anything added after it. That last
+    point is what makes this guard necessary rather than merely nice: the specification ruling that
+    every future gap in this file must be closed BY ADDITION guarantees that every future addition
+    lands BELOW the lock — precisely where the lock cannot reach. The rule protecting the frozen
+    fixture routes all future work into the lock's blind spot, and H2.5 adds to this file.
+
+    Autouse and teardown-based, so it is position-independent: it checks after EVERY test, including
+    ones written years from now by someone who never reads this docstring.
+
+    Note for whoever sees this fire: pytest reports a teardown assertion as an ERROR rather than a
+    FAILURE. The exit status is non-zero either way; the test that errors is the test that mutated.
+    """
+    before = (_fixture_snapshot(REST), _fixture_snapshot(WS))
+
+    def _verify_unchanged() -> None:
+        after = (_fixture_snapshot(REST), _fixture_snapshot(WS))
+        assert after == before, (
+            "a test mutated the shared REST/WS fixture. Both are module-level and aliased by the "
+            "{**REST, ...} / {**WS, ...} spread, so the corruption is visible to every later test "
+            "and the test that FAILS will not be the test that caused it. Copy before writing."
+        )
+
+    request.addfinalizer(_verify_unchanged)
 
 
 def test_wallet_type_list_sorts_numerically_not_lexicographically() -> None:
@@ -298,20 +352,38 @@ def test_wallet_type_list_sorts_numerically_not_lexicographically() -> None:
     defended by nothing. Wire order surviving into the canonical value splits receipt identity for
     one logical observation, which is the exact failure this dimension exists to prevent.
     """
-    assert normalize_signal({**WS, "walletType": "10,2"}, "ws").wallet_type == "2,10"
-    assert normalize_signal({**WS, "walletType": "9,10"}, "ws").wallet_type == "9,10"
+    # (raw wire value, required canonical form).
+    vectors = (("10,2", "2,10"), ("9,10", "9,10"), ("2,10", "2,10"))
 
-    # Cross-transport, the same set written in the other order on the other transport.
-    rest_sig = normalize_signal({**REST, "walletType": "2,10"}, "rest")
-    ws_sig = normalize_signal({**WS, "walletType": "10,2"}, "ws")
-    assert rest_sig.wallet_type == ws_sig.wallet_type == "2,10"
+    for raw, canonical in vectors:
+        # DERIVED self-guard, computed FROM the vector it protects and checked before that vector is
+        # used. A vector can only detect a lexicographic sort while numeric and lexicographic
+        # ordering DISAGREE on its codes, so rewriting any of these to codes like "1,2" fails HERE
+        # instead of silently blinding the assertion below it.
+        #
+        # The previous version of this guard asserted the same property over hardcoded literals
+        # alongside the vectors. That is structurally independent of them: weakening the vectors
+        # left the guard passing and the test blind. A self-guard works only when DERIVED from the
+        # vector, never when merely asserted next to it.
+        parts = raw.split(",")
+        assert sorted(parts, key=int) != sorted(parts), (
+            f"vector {raw!r} no longer discriminates: numeric and lexicographic order agree on it, "
+            "so this test can no longer detect a lexicographic sort"
+        )
+        assert normalize_signal({**WS, "walletType": raw}, "ws").wallet_type == canonical
+
+    # Cross-transport, SELECTED FROM the guarded vectors rather than written out again: two distinct
+    # wire spellings of one set, which must land on one canonical value and one evidence hash.
+    # Derived for the same reason as above — a hardcoded pair here could drift away from the vectors
+    # that are actually guarded.
+    same_set = [(a, b) for a, ca in vectors for b, cb in vectors if a != b and ca == cb]
+    assert same_set, "vectors no longer contain two distinct spellings of the same set"
+    rest_raw, ws_raw = same_set[0]
+
+    rest_sig = normalize_signal({**REST, "walletType": rest_raw}, "rest")
+    ws_sig = normalize_signal({**WS, "walletType": ws_raw}, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type
     assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
-
-    # Guards the VECTORS above, not the code: these codes are only discriminating while the two
-    # orderings disagree on them. Rewriting them to 1 and 2 would keep every assertion above green
-    # while silently making this test unable to detect a lexicographic sort.
-    assert sorted(["10", "2"]) == ["10", "2"]
-    assert [str(code) for code in sorted([10, 2])] == ["2", "10"]
 
 
 def test_wallet_type_refuses_non_ascii_digits_that_would_collide_onto_one_code() -> None:
