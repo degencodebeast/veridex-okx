@@ -938,10 +938,22 @@ def _sig(
     wallet_count="3",
     market_cap="2000000",
     wallet_type="1",
-    direction="buy",
+    direction=None,
     drop=(),
 ):
-    """One raw wire signal that PASSES the default SignalFilters unless a caller weakens a field."""
+    """One WIRE-REALISTIC Signal List row that passes the default SignalFilters.
+
+    The members are exactly the documented return fields of
+    `POST /api/v6/dex/market/signal/list` - timestamp, chainIndex, price, walletType,
+    triggerWalletCount, triggerWalletAddress, amountUsd, soldRatioPercent, token.* and cursor.
+
+    `direction` DEFAULTS TO None, i.e. ABSENT, because the endpoint returns no such member. An
+    earlier revision injected `"direction": "buy"` unconditionally, and that single line held "a
+    direction field is present" CONSTANT across every vector in the file - so the one dimension
+    never varied was WHAT A REAL OKX ROW LOOKS LIKE, and the suite could not see that a conforming
+    response was unpublishable. Callers that need a marker now pass one explicitly, which is also
+    what makes those vectors visible as the non-default case they are.
+    """
     raw = {
         "timestamp": str(t0),
         "chainIndex": chain,
@@ -950,16 +962,20 @@ def _sig(
         "triggerWalletCount": wallet_count,
         "triggerWalletAddress": "0xa,0xb,0xc",
         "amountUsd": amount,
-        "direction": direction,
+        "soldRatioPercent": "0",
+        "cursor": "c0",
         "token": {
             "tokenAddress": token,
             "symbol": "TOK",
             "name": "Token",
+            "logo": "https://example.invalid/logo.png",
             "marketCapUsd": market_cap,
             "holders": "900",
             "top10HolderPercent": "31.5",
         },
     }
+    if direction is not None:
+        raw["direction"] = direction
     for key in drop:
         raw.pop(key, None)
     return raw
@@ -1658,7 +1674,7 @@ async def test_contradictory_direction_markers_unconfirm_the_probe(buy_key, sell
     suite, and under that mutant a payload contradicting under the deleted key would CONFIRM buy
     polarity - fail-open on the polarity surface (SPEC MINOR-3).
     """
-    raw = {**_sig(drop=("direction",)), buy_key: "buy", sell_key: "sell"}
+    raw = {**_sig(), buy_key: "buy", sell_key: "sell"}
     result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
     assert result.direction_semantics_confirmed is False
 
@@ -1671,11 +1687,11 @@ async def test_every_direction_key_is_actually_consulted(key):
     present": the buy case then yields False (fail-closed, caught here) and a contradiction under it
     yields True (fail-OPEN, caught by the test above). The tuple's declared REACH is the property.
     """
-    buy = {**_sig(drop=("direction",)), key: "buy"}
+    buy = {**_sig(), key: "buy"}
     confirmed = await run_matrix_probe(FakeMarketClient({"501": [_page([buy])]}), _filters())
     assert confirmed.direction_semantics_confirmed is True
 
-    sell = {**_sig(drop=("direction",)), key: "sell"}
+    sell = {**_sig(), key: "sell"}
     contradicted = await run_matrix_probe(FakeMarketClient({"501": [_page([sell])]}), _filters())
     assert contradicted.direction_semantics_confirmed is False
 
@@ -1689,7 +1705,7 @@ async def test_every_recognized_buy_marker_confirms(marker):
     why they rank below the fail-open gap above, but an unpinned marker set is still an unpinned
     constant that enumeration category (a) claims to cover.
     """
-    raw = {**_sig(drop=("direction",)), "direction": marker}
+    raw = {**_sig(), "direction": marker}
     result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
     assert result.direction_semantics_confirmed is True
 
@@ -1698,19 +1714,58 @@ async def test_every_recognized_buy_marker_confirms(marker):
 async def test_no_unrecognized_marker_is_read_as_a_buy(marker):
     """The closed half of the same constant: nothing outside the set may confirm polarity. `"1"` and
     `"0"` are here deliberately - a numeric side code is an ENCODING GUESS and must never confirm."""
-    raw = {**_sig(drop=("direction",)), "direction": marker}
+    raw = {**_sig(), "direction": marker}
     result = await run_matrix_probe(FakeMarketClient({"501": [_page([raw])]}), _filters())
     assert result.direction_semantics_confirmed is False
 
 
-async def test_direction_is_unconfirmed_when_the_feed_carries_no_direction_field():
-    pages = {"501": [_page([_sig(drop=("direction",))])]}
+async def test_a_documented_signal_list_row_CONFIRMS_buy_semantics():
+    """THE regression test for the milestone MAJOR-1, and it inverts what this test used to assert.
+
+    The documented Signal List row carries NO direction member; polarity is fixed by the endpoint
+    contract ("Get latest buy-direction token signals"). The previous revision required a per-row
+    marker, so this vector asserted `is False` - a PASSING TEST FOR THE DEFECT. Together with
+    test_unconfirmed_direction_forces_no_season it demonstrated that a conforming response could
+    never publish a season, which is the entire purpose of the task failing closed.
+    """
+    pages = {"501": [_page([_sig()])]}
     result = await run_matrix_probe(FakeMarketClient(pages), _filters())
-    assert result.direction_semantics_confirmed is False
+    assert result.direction_semantics_confirmed is True
 
 
-async def test_a_partially_labelled_feed_is_unconfirmed():
-    pages = {"501": [_page([_sig(direction="buy"), _sig(token="B", drop=("direction",))])]}
+async def test_a_wire_realistic_probe_can_reach_a_QUALIFIED_season():
+    """End-to-end on documented rows only: the probe must be able to PUBLISH.
+
+    Nothing in this vector invents a wire member. If a per-row direction marker is ever required
+    again, this goes to no_season and the task's purpose fails closed once more.
+    """
+    tokens = [f"T{i}" for i in range(3)]
+    pages = {"501": [_page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS) for i, t in enumerate(tokens)])]}
+    series = {}
+    for i, token in enumerate(tokens):
+        series.update(_both_bars("501", token, BASE_MS + i * COOLDOWN_MS))
+    result = await run_matrix_probe(FakeMarketClient(pages, series), _filters(), min_trials=3)
+
+    assert result.direction_semantics_confirmed is True
+    assert _count_for(result, "501", "1m").eligible_settleable == 3
+    assert _count_for(result, "501", "1H").eligible_settleable == 3
+    selection = select_combo(result, min_trials=3)
+    assert selection.season_status == "qualified"
+    # 501/1m, not 501/1H: both bars settle here and COMBO_ORDER ranks precision above the fallback.
+    assert (selection.chain_index, selection.bar) == ("501", "1m")
+
+
+async def test_a_partially_labelled_feed_is_still_confirmed():
+    """A source that labels SOME rows contradicts nothing: the unlabelled ones are the documented
+    shape and the labelled one agrees with the contract."""
+    pages = {"501": [_page([_sig(direction="buy"), _sig(token="B")])]}
+    result = await run_matrix_probe(FakeMarketClient(pages), _filters())
+    assert result.direction_semantics_confirmed is True
+
+
+async def test_one_contradicting_row_unconfirms_a_partially_labelled_feed():
+    """The fail-closed half, kept. One explicit non-buy poisons the whole probe."""
+    pages = {"501": [_page([_sig(), _sig(token="B", direction="sell")])]}
     result = await run_matrix_probe(FakeMarketClient(pages), _filters())
     assert result.direction_semantics_confirmed is False
 
@@ -1734,7 +1789,9 @@ async def test_an_unconfirmed_direction_survives_a_fully_qualified_matrix():
     """End-to-end: real counts, unreadable polarity, no season."""
     tokens = [f"T{i}" for i in range(3)]
     pages = {
-        "501": [_page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, drop=("direction",)) for i, t in enumerate(tokens)])]
+        "501": [
+            _page([_sig(token=t, t0=BASE_MS + i * COOLDOWN_MS, direction="sell") for i, t in enumerate(tokens)])
+        ]
     }
     series = {}
     for i, token in enumerate(tokens):

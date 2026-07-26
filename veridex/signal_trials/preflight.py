@@ -39,11 +39,17 @@ Four responsibilities, and each one exists because of a specific way this can go
    counts at all, which is not. Both writers emit the same key set in the same order, so a reader
    can always reach ``probe_status`` without a ``KeyError``.
 
-**Never guess polarity.** The probe reports ``direction_semantics_confirmed=True`` only when every
-observed signal carries a direction marker this module recognizes as a buy. No marker, a partially
-labelled feed, an unrecognized value, or no signals at all all yield ``False``. Numeric side codes
-are deliberately NOT in the recognized set: mapping ``"1"`` to "buy" would be a guess about an
-encoding the frozen contract does not pin, and a wrong guess would invert every trial's stance.
+**Polarity is a property of the ENDPOINT, not of a row.** The frozen source is documented as "latest
+buy-direction token signals" and its documented rows carry no direction member whatsoever, so the
+probe confirms buy semantics when it has READ rows from that source and nothing in them contradicts
+the contract. It still fails closed: zero rows confirm nothing, and any row that volunteers a marker
+which is not a recognized buy — including one this module cannot read, such as a numeric side code —
+unconfirms the whole probe. Mapping ``"1"`` to "buy" would be a guess about an encoding the frozen
+contract does not pin, and a wrong guess would invert every trial's stance.
+
+An earlier revision required a per-row marker. That was a defect of the mirror kind: it never
+guessed polarity and it never CONFIRMED it either, so every conforming response forced
+``no_season`` and Gate B could not publish a season from the frozen source at all.
 
 **No transport lives here.** ``run_matrix_probe`` takes a structural :class:`MarketClient`; the
 concrete HTTP client is constructed only by ``scripts/signal_trials/run_preflight.py``, which is
@@ -110,8 +116,19 @@ REASON_SETTLEMENT_WINDOW_GAP = "settlement_window_gap"
 REASON_AMBIGUOUS_SETTLEMENT_CANDLE = "ambiguous_settlement_candle"
 REASON_NON_POSITIVE_SETTLEMENT_PRICE = "non_positive_settlement_price"
 
-# Wire keys a buy-direction marker may arrive under, and the values read as a buy. Textual only:
-# see the module docstring on why numeric side codes are excluded.
+# The frozen primary source is the OKX "Latest" Signal List, POST /api/v6/dex/market/signal/list,
+# documented as "Get latest buy-direction token signals sorted descending by time".
+#
+# DIRECTION IS A PROPERTY OF THE ENDPOINT, NOT A REPEATED PROPERTY ON EACH ROW. The documented
+# return fields are `timestamp`, `chainIndex`, `price`, `walletType`, `triggerWalletCount`,
+# `triggerWalletAddress`, `amountUsd`, `soldRatioPercent`, `token.*` and `cursor` - there is no
+# `direction`, `side`, `signalType` or `tradeDirection` member at all.
+SIGNAL_SOURCE_DIRECTION = "buy"
+
+# Keys a direction marker may arrive under IF a source volunteers one, and the values read as a buy.
+# These exist to DETECT A CONTRADICTION of the endpoint contract, never to satisfy it: no documented
+# row carries any of them. Textual only - see the module docstring on why numeric side codes are
+# excluded from the buy set.
 _DIRECTION_KEYS: tuple[str, ...] = ("direction", "side", "signalType", "tradeDirection")
 _BUY_MARKERS: frozenset[str] = frozenset({"buy", "b", "long"})
 
@@ -259,19 +276,30 @@ def select_combo(result: MatrixProbeResult, *, min_trials: int = 40) -> ComboSel
     return ComboSelection(chain_index, bar, "exploratory")
 
 
-def _is_buy(raw: Mapping[str, Any]) -> bool:
-    """Whether ``raw`` carries a direction marker this module reads as a buy.
+def _contradicts_buy_direction(raw: Mapping[str, Any]) -> bool:
+    """Whether ``raw`` EXPLICITLY declares a direction that is not a buy.
 
-    Absent, unrecognized, non-buy, and self-contradictory all answer ``False`` — the caller cannot
-    tell those apart, and deliberately so: all four mean "we could not confirm polarity", and
-    confirming is the only thing that may raise the flag. EVERY marker present must read as a buy,
-    not merely the first one found: a payload carrying ``direction="buy"`` beside ``side="sell"``
-    has told us we do not understand its schema.
+    The polarity of the frozen source is fixed by its ENDPOINT CONTRACT, so a row carrying no
+    direction member does NOT contradict it — that is the documented shape of every conforming row.
+    Requiring a per-row marker was a real defect: it made ``direction_semantics_confirmed`` False for
+    every conforming response, which forced ``no_season`` regardless of eligible counts and left
+    Gate B unable to publish a season from the frozen primary source at all.
+
+    This still FAILS CLOSED, which is the half worth keeping. If the client is ever generalised to a
+    source that volunteers a direction, any row whose marker is not a recognized buy — including one
+    this module cannot READ, such as a numeric side code — counts as a contradiction and unconfirms
+    the whole probe. EVERY marker present is checked, not merely the first: a row carrying
+    ``direction="buy"`` beside ``side="sell"`` has told us we do not understand its schema.
+
+    "Never guess polarity" and "never confirm polarity" are different properties. The first is kept
+    here; the second was the defect.
     """
-    present = [raw[key] for key in _DIRECTION_KEYS if key in raw]
-    if not present:
-        return False
-    return all(isinstance(value, str) and value.strip().casefold() in _BUY_MARKERS for value in present)
+    for key in _DIRECTION_KEYS:
+        if key in raw:
+            value = raw[key]
+            if not (isinstance(value, str) and value.strip().casefold() in _BUY_MARKERS):
+                return True
+    return False
 
 
 def _screen(raw: Mapping[str, Any], chain_index: str, filters: SignalFilters) -> CanonicalSignal | str:
@@ -490,13 +518,13 @@ async def run_matrix_probe(
     reasons: dict[tuple[str, str], dict[str, int]] = {combo: {} for combo in COMBO_ORDER}
     series_cache: dict[tuple[str, str, str], CandleSeries | None] = {}
     observed = 0
-    buy_labelled = 0
+    contradicting = 0
 
     for chain_index in chains:
         bars = tuple(bar for chain, bar in COMBO_ORDER if chain == chain_index)
         raw_signals = await _collect_signals(client, filters_by_chain[chain_index])
         observed += len(raw_signals)
-        buy_labelled += sum(1 for raw in raw_signals if _is_buy(raw))
+        contradicting += sum(1 for raw in raw_signals if _contradicts_buy_direction(raw))
 
         eligible: list[CanonicalSignal] = []
         for raw in raw_signals:
@@ -536,7 +564,7 @@ async def run_matrix_probe(
             ComboCount(chain_index, bar, counts[(chain_index, bar)], dict(reasons[(chain_index, bar)]))
             for chain_index, bar in COMBO_ORDER
         ),
-        direction_semantics_confirmed=observed > 0 and buy_labelled == observed,
+        direction_semantics_confirmed=observed > 0 and contradicting == 0,
     )
 
 
