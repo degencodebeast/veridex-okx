@@ -271,3 +271,100 @@ def test_wallet_type_refuses_unknown_names_and_malformed_lists() -> None:
         normalize_signal({**REST, "walletType": True}, "rest")
     with pytest.raises(ValueError):
         normalize_signal({**REST, "walletType": 1.5}, "rest")
+
+
+# --- PKT-REV-H2-2-QUALITY-R2-4aeb68f: three GUARDS that survived a ten-mutation battery at 46/46.
+#
+# The reviewer's diagnosis is the brief for these three: this suite pins OUTCOMES densely and GUARDS
+# not at all. Every mutation it caught changes the canonical value of an input some test already
+# supplies; every mutation that survived only matters for an input NO test supplies. So the question
+# each test below is written against is not "does this pass" but "which line could I delete and still
+# be green" — and each therefore also asserts the property that makes its own vector discriminating,
+# so the vector cannot later be weakened into agreement without a failure.
+#
+# NOTE on the fixture, deliberately observed: `{**REST, ...}` is a SHALLOW spread, so the nested
+# `token` dict stays shared BY REFERENCE with the frozen fixture. Every test below only REPLACES the
+# top-level `walletType` key and never writes into `token`. A single mutation of `sig["token"]` here
+# would corrupt the frozen fixture for every test that ran after it, and the failing test would not
+# be the one that caused it.
+
+
+def test_wallet_type_list_sorts_numerically_not_lexicographically() -> None:
+    """Codes sort as NUMBERS. Every other list vector uses 1 and 2, where the two orders agree.
+
+    A `sorted({str(c) for c in codes})` refactor is green across this entire suite while
+    canonicalizing `"10,2"` to `'10,2'`. Two-digit codes are the only inputs that can tell the two
+    apart, and nothing else in the file supplies one — so the invariant is stated by the code and
+    defended by nothing. Wire order surviving into the canonical value splits receipt identity for
+    one logical observation, which is the exact failure this dimension exists to prevent.
+    """
+    assert normalize_signal({**WS, "walletType": "10,2"}, "ws").wallet_type == "2,10"
+    assert normalize_signal({**WS, "walletType": "9,10"}, "ws").wallet_type == "9,10"
+
+    # Cross-transport, the same set written in the other order on the other transport.
+    rest_sig = normalize_signal({**REST, "walletType": "2,10"}, "rest")
+    ws_sig = normalize_signal({**WS, "walletType": "10,2"}, "ws")
+    assert rest_sig.wallet_type == ws_sig.wallet_type == "2,10"
+    assert evidence_hash(rest_sig) == evidence_hash(ws_sig)
+
+    # Guards the VECTORS above, not the code: these codes are only discriminating while the two
+    # orderings disagree on them. Rewriting them to 1 and 2 would keep every assertion above green
+    # while silently making this test unable to detect a lexicographic sort.
+    assert sorted(["10", "2"]) == ["10", "2"]
+    assert [str(code) for code in sorted([10, 2])] == ["2", "10"]
+
+
+def test_wallet_type_refuses_non_ascii_digits_that_would_collide_onto_one_code() -> None:
+    """The `isascii()` guard on the digit test, which nothing exercised.
+
+    These three all satisfy `isdigit()` AND convert cleanly under `int()`, so without the ASCII
+    guard each becomes the code 1 — three byte-different wire values silently sharing ONE receipt
+    identity. That is the mirror image of the cross-transport defect this module was built to fix:
+    that one SPLIT a single identity across transports, this one COLLIDES distinct values into one.
+    Both are silent, and both are evidence-identity failures.
+
+    The refusal loop above has ten inputs and not one non-ASCII digit. `'²'` — the character the
+    source docstring cites — is NOT a collision vector, because `int('²')` raises; it would reach the
+    name lookup and fail loudly either way. The dangerous characters are the ones `int()` accepts.
+    """
+    collide_onto_one = (
+        "١",  # ARABIC-INDIC DIGIT ONE
+        "۱",  # EXTENDED ARABIC-INDIC DIGIT ONE
+        "１",  # FULLWIDTH DIGIT ONE
+    )
+    for char in collide_onto_one:
+        # Guards the vector: each must genuinely be a collision risk, or this test proves nothing.
+        assert char.isdigit()
+        assert not char.isascii()
+        assert int(char) == 1
+        with pytest.raises(ValueError):
+            normalize_signal({**REST, "walletType": char}, "rest")
+
+    # The value they would have collided ONTO is a legitimate, accepted input — which is precisely
+    # why the collision would be invisible downstream.
+    assert normalize_signal({**REST, "walletType": "1"}, "rest").wallet_type == "1"
+
+
+def test_wallet_type_refuses_a_negative_integer_code() -> None:
+    """The sign guard on the INT path, which the refusal loop reads as covering but never reaches.
+
+    `"-1"` is in that loop and does raise — but through the NAME lookup, because `"-1".isdigit()` is
+    False, so it never reaches the sign guard at all. The loop reads as covering this dimension while
+    leaving it entirely undefended: drop the guard and the int `-1` canonicalizes to `'-1'` while the
+    string `"-1"` still raises. That is int/str disagreement on the same logical value — the property
+    the numeric-twin test pins, but pins only at `1`.
+    """
+    with pytest.raises(ValueError) as int_exc:
+        normalize_signal({**REST, "walletType": -1}, "rest")
+    assert "non-negative" in str(int_exc.value)
+
+    # The trap, asserted rather than described: the string form takes a DIFFERENT path to a
+    # different error, so a bare `raises(ValueError)` on the string cannot stand in for this.
+    assert not "-1".isdigit()
+    with pytest.raises(ValueError) as str_exc:
+        normalize_signal({**REST, "walletType": "-1"}, "rest")
+    assert "unrecognized wallet type" in str(str_exc.value)
+    assert "non-negative" not in str(str_exc.value)
+
+    # Over-correction control: 0 is non-negative and must not be swept up by the guard.
+    assert normalize_signal({**REST, "walletType": 0}, "rest").wallet_type == "0"
