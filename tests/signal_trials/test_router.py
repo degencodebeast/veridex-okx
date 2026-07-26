@@ -259,6 +259,36 @@ def test_a_retiring_state_hides_a_previously_published_season(tmp_path, publishe
     assert json.loads(season_file.read_text()) == published
 
 
+@pytest.mark.parametrize("asserting_state", ["qualified", "exploratory"])
+def test_a_state_that_asserts_a_season_with_no_payload_is_refused(tmp_path, asserting_state):
+    """The state's authority runs BOTH ways, and this is the direction that was unpinned.
+
+    ``qualified``/``exploratory`` assert that a season exists. If the payload is missing,
+    the published set is incomplete — not absent. Returning ``None`` here would leave
+    ``/health`` asserting a season while ``/season`` reported none: the same contradiction
+    Codex found, pointing the other way, and reachable through the same crash window.
+
+    Both asserting states are exercised, so a reader that special-cased one still fails.
+    Every other vector in this file pairs an asserting state with a MATCHING payload —
+    ``_publish`` writes the pair by construction — so "state asserts, payload absent" was
+    held constant at *never occurs* and either answer passed.
+    """
+    write_state(tmp_path, asserting_state, {"n": 61})
+    assert read_state(tmp_path)["state"] == asserting_state  # the state really does assert one
+    with pytest.raises(ValueError, match="is missing"):
+        read_season(tmp_path)
+
+
+@pytest.mark.parametrize("asserting_state", ["qualified", "exploratory"])
+async def test_the_route_refuses_an_asserted_season_whose_payload_is_missing(tmp_path, asserting_state):
+    """End-to-end mirror of the above: /season must not quietly 404 a season /health asserts."""
+    write_state(tmp_path, asserting_state, {"n": 61})
+    async with _client_for(_routed_app(data_dir=tmp_path)) as c:
+        assert (await c.get("/signal-trials/health")).json()["season_state"] == asserting_state
+        with pytest.raises(ValueError, match="is missing"):
+            await c.get("/signal-trials/season")
+
+
 def test_a_payload_from_another_generation_is_refused_not_served(tmp_path):
     """A payload whose own status contradicts the state is cross-generation. Fail closed.
 

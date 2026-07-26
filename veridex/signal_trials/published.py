@@ -191,24 +191,37 @@ def read_season(data_dir: Path | str | None) -> dict[str, Any] | None:
       a leftover from an earlier generation and is not served, whether or not the
       scorer got around to deleting it. Deleting it is an optimisation; this is the
       correctness.
-    * ``qualified`` and ``exploratory`` serve the payload, but only if the payload
-      agrees that it is that kind of season. A document whose ``season_status``
-      contradicts the authoritative state is a cross-generation artifact and is refused
-      rather than served, on the same principle as a corrupt one: it is not absent, so
-      reporting absence would be a lie.
+    * ``qualified`` and ``exploratory`` ASSERT that a season exists, so the payload has
+      to be there and has to agree. A missing payload, a payload whose ``season_status``
+      contradicts the state, and a corrupt payload are all the same kind of thing: an
+      INCOMPLETE OR INCONSISTENT published set, not an absence. Each is refused. The
+      module's rule is that absence reads as ``not_built`` and ONLY absence does, so
+      answering "nothing is published" to a state that says otherwise would be exactly
+      the lie this function exists to prevent — the mirror of serving a stale season
+      under ``no_season``, and reachable through the same crash window.
+
+    Refusing is deliberately noisier than returning ``None``. The alternative leaves
+    ``/health`` asserting a season while ``/season`` reports none, which is the
+    contradiction, merely pointing the other way.
+
+    **Write order matters, and it is the writer's half of this contract.** Publish the
+    payload BEFORE the state that advertises it. A crash in that order leaves a payload
+    with a stale state, which the rules above already absorb silently. The reverse order
+    leaves a state asserting a season that does not exist, which is the case this
+    function has to refuse.
 
     Args:
         data_dir: The signal-trials data directory, or ``None`` when none is
             configured.
 
     Returns:
-        The season document, or ``None`` when the state says nothing is published or
-        no payload exists.
+        The season document, or ``None`` when no data directory is configured or the
+        state says nothing is published.
 
     Raises:
-        ValueError: The state artifact is unreadable or carries an unknown state; or
-            the season artifact is unreadable; or the payload's ``season_status``
-            disagrees with the authoritative state.
+        ValueError: The state artifact is unreadable or carries an unknown state; or the
+            state asserts a season whose payload is missing, unreadable, or carries a
+            ``season_status`` that disagrees with the authoritative state.
     """
     if data_dir is None:
         return None
@@ -217,7 +230,10 @@ def read_season(data_dir: Path | str | None) -> dict[str, Any] | None:
         return None
     path = _published_dir(data_dir) / SEASON_FILENAME
     if not path.is_file():
-        return None
+        raise ValueError(
+            f"published state is {state!r}, which asserts a season, but {SEASON_FILENAME} is "
+            "missing; refusing to report an asserted season as merely absent"
+        )
     season = _read_json_object(path)
     payload_status = season.get("season_status")
     if payload_status != state:
