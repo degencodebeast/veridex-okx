@@ -38,13 +38,18 @@ DEFAULT_COMMIT_PRICE = "$0.01"
 COMMIT_MAX_TIMEOUT_SECONDS = 300
 
 # Documented product ceiling for a single commit, enforced before the price ever
-# reaches the SDK. Two measured limits sit above it and neither fails loudly:
-# the SDK's parser rounds silently past 28 significant digits, and above roughly
-# 1e309 it goes through ``float`` and yields infinity — which the stock middleware
-# then advertises as a 407-digit atomic amount no EVM ``uint256`` can hold. A
-# ceiling of one million dollars keeps the atomic amount at 13 digits: 15 digits
-# inside the rounding frontier and 65 inside ``uint256``, while still being a
-# hundred million times the default price, so it constrains no real configuration.
+# reaches the SDK. The hazard above it is silent rather than loud, and it starts
+# far lower than a float overflow would suggest: the advertised amount is built on
+# the SDK's DECIMAL path (``parse_amount(parse_money_to_string(price), 6)`` at
+# ``mechanisms/evm/exact/server.py:188``), which rounds at 28 significant digits —
+# from roughly 1e22 for a six-decimal price. A 400-digit price is advertised as a
+# 407-digit atomic amount no EVM ``uint256`` can hold, and that string contains no
+# infinity. ``float`` is NOT the cause: ``parse_money_to_decimal`` does return
+# ``inf``, but it feeds only ``_money_parsers``, which starts empty and which this
+# project never populates, so the ``inf`` is discarded. A ceiling of one million
+# dollars keeps the atomic amount at 13 digits: 15 digits inside the rounding
+# frontier and 65 inside ``uint256``, while still being a hundred million times
+# the default price, so it constrains no real configuration.
 MAX_COMMIT_PRICE = Decimal("1000000")
 
 # Deterministic stand-ins returned by FakeFacilitator. Synthetic constants, not
@@ -114,15 +119,18 @@ def _validate_commit_price(price: str) -> None:
     that quietly break the gate rather than failing: ``"$0"`` mounts a route that
     charges nothing but reports itself paid, ``"-1"`` yields a negative charge,
     ``"NaN"``/``"Infinity"`` become float values instead of errors, and a
-    400-digit price becomes infinity, which the stock middleware then advertises
-    as a 407-digit atomic amount no EVM ``uint256`` can hold. Matching a strict
-    pattern first, then comparing as :class:`~decimal.Decimal`, means none of
-    those states is ever constructed — no float ever sees this value.
+    400-digit price is advertised as a 407-digit atomic amount no EVM ``uint256``
+    can hold — that one comes from the SDK's Decimal path rounding at 28
+    significant digits, not from the float overflow far above it. Matching a
+    strict pattern first, then comparing as :class:`~decimal.Decimal`, means none
+    of those states is ever constructed.
 
-    The magnitude check compares rather than multiplies on purpose.
-    ``Decimal(str)`` *construction* is exact regardless of context, but arithmetic
-    is not: ``Decimal(price) * 10**6`` on a 70-digit amount would silently round
-    under the default 28-digit context and could report a rounded value as exact.
+    The magnitude check compares rather than multiplies. At this ceiling the two
+    forms are equivalent — no input distinguishes them — so that is defensive
+    style rather than behaviour: ``Decimal(str)`` construction is exact regardless
+    of context, but arithmetic is not, and a multiplying form rounds under the
+    default 28-digit context. The false pass that habit caught was in a probe's
+    own expectation, not in this guard.
 
     Called from two places on purpose. :func:`load_x402_settings` guards the
     *configuration* an operator supplies; :func:`build_commit_price` guards

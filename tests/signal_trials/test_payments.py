@@ -49,6 +49,25 @@ def _settings_priced(price):
     return X402Settings(enabled=True, pay_to="0x" + "a" * 40, price=price, network=X_LAYER_MAINNET, sync_settle=True)
 
 
+def _must_not_raise(build):
+    """Run ``build`` and convert any refusal into a PINNED assertion failure.
+
+    A test whose subject simply raises fails by exception, which PKT-DEC-C23 classifies
+    as detection-by-crash rather than a banked kill. Turning the refusal into an
+    AssertionError is what makes "this configuration must be accepted" a property the
+    suite owns rather than one it happens to notice.
+
+    Duplicated from ``test_router.py`` rather than imported: that file belongs to another
+    lane, and importing across two independently owned suites couples them.
+    """
+    try:
+        return build()
+    except Exception as error:  # noqa: BLE001 - re-raised as an assertion below
+        raise AssertionError(
+            f"expected this configuration to be accepted, got {type(error).__name__}: {error}"
+        ) from error
+
+
 def _expected_atomic(price):
     """Atomic units by exact integer arithmetic; Decimal arithmetic would round at this scale."""
     whole, _, frac = price.lstrip("$").partition(".")
@@ -272,6 +291,40 @@ def test_canonical_leading_zero_before_the_point_is_still_accepted():
     assert load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": "$0.01"}).price == "$0.01"
 
 
+def test_the_ceiling_is_inclusive_on_both_paths():
+    """The ACCEPT side of the boundary, banked as an assertion rather than as the absence of a crash.
+
+    Without this, flipping ``>`` to ``>=`` is noticed only because production code raises
+    through a test that never reaches an assertion.
+    """
+    settings = _must_not_raise(lambda: load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": AT_CEILING}))
+    assert settings.price == AT_CEILING
+    assert _must_not_raise(lambda: build_commit_price(settings)).price == AT_CEILING
+    assert _must_not_raise(lambda: build_commit_price(_settings_priced(AT_CEILING))).price == AT_CEILING
+
+
+@pytest.mark.parametrize("price", ["$٥", "$1٥", "$1.٥", "$۵", "$１"])
+def test_non_ascii_decimal_digits_are_refused(price):
+    r"""``\d`` matches any Unicode decimal digit, and ``Decimal("1٥")`` reads as 15.
+
+    The grammar uses ``[0-9]`` so these never reach the money path. Without this vector,
+    reverting that character class is invisible to the whole suite.
+
+    Asserted explicitly rather than with ``pytest.raises``: a context manager that reports
+    ``DID NOT RAISE`` fails without any assertion of this test running, which is the
+    detection-by-crash shape PKT-DEC-C23 declines to bank. ``$1٥`` and ``$1.٥`` are the
+    vectors that discriminate — a leading non-ASCII digit is refused either way, because
+    ``\d`` sits only in the trailing and fractional positions.
+    """
+    refusal = None
+    try:
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
+    except ValueError as error:
+        refusal = error
+    assert refusal is not None, f"non-ASCII digits must be refused; Decimal reads {price!r} as a number"
+    assert "SIGNAL_TRIALS_COMMIT_PRICE" in str(refusal)
+
+
 @pytest.mark.parametrize("price", [JUST_ABOVE_CEILING, "$1000001", OVERSIZED_PRICE])
 def test_price_above_the_ceiling_is_refused_by_the_loader(price):
     with pytest.raises(ValueError, match="ceiling"):
@@ -306,7 +359,7 @@ async def test_accepted_boundary_prices_advertise_a_representable_atomic_amount(
     Guards the defect directly: the 400-digit price reached this middleware and was
     advertised as a 407-digit atomic amount that no EVM uint256 can hold.
     """
-    settings = load_x402_settings({**DEV_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price})
+    settings = _must_not_raise(lambda: load_x402_settings({**DEV_ENV, "SIGNAL_TRIALS_COMMIT_PRICE": price}))
     amount = await _advertised_atomic_amount(settings)
 
     assert amount.isdigit(), f"non-integer atomic amount advertised: {amount[:40]}"
