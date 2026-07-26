@@ -58,6 +58,8 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel
 
+from veridex.chain.anchor import run_manifest_hash
+
 #: The slot states, as runtime values. ``SlotState`` is erased at runtime, so membership tests
 #: need this alongside it.
 SlotState = Literal["in_flight", "settle_attempted", "quarantined", "finalized"]
@@ -68,6 +70,60 @@ SLOT_STATES: Final[frozenset[str]] = frozenset({"in_flight", "settle_attempted",
 #: double-charge, and it is deliberately a named constant rather than two inline comparisons:
 #: adding a fifth indeterminate state must extend the refusal by construction.
 INDETERMINATE_STATES: Final[frozenset[str]] = frozenset({"settle_attempted", "quarantined"})
+
+#: The trial mode a PAID commit is permitted to bind to (frozen spec section 11: paid external
+#: commits are live-only). Spelled here rather than imported from ``live`` because ``live``
+#: imports THIS module, so the dependency only runs one way. ``test_the_live_mode_constant_matches
+#: _the_trial_module`` is what keeps the two copies equal.
+LIVE_TRIAL_MODE: Final[str] = "live"
+
+#: How each field of the payer's canonical commit body is recovered from a finalized record,
+#: as ``body field -> stored record key``.
+#:
+#: All but one are the same name. ``trial_id`` is not: the body carries the PAYER'S spelling of
+#: the id and the record is keyed on the RESOLVED one, and resolution is explicitly permitted to
+#: canonicalize between them (see the slot-acquisition comment in ``payments.py``). The body hash
+#: was taken over what the payer sent, so re-deriving it from the resolved id would report a
+#: tamper on every honest receipt the first time resolution changed a character.
+#:
+#: **This mapping is coupled to ``CommitRequest``'s shape**, because the staged hash is over the
+#: whole dumped request. A field added there and not here makes every receipt fail ``body_hash``
+#: — fail-closed, and loud, but still wrong;
+#: ``test_the_body_derivation_covers_every_field_a_commit_request_can_carry`` pins the two
+#: together so the obligation cannot be missed while editing either one.
+COMMIT_BODY_FIELDS: Final[dict[str, str]] = {
+    "trial_id": "committed_trial_id",
+    "p_follow_profitable": "p_follow_profitable",
+    "methodology_version": "methodology_version",
+}
+
+#: The commit-time facts the receipt's manifest hash BINDS, sealed at finalization.
+#:
+#: The payer's probability and methodology are deliberately absent: the manifest carries
+#: ``body_hash``, so it binds the commitment BY REFERENCE. That keeps the two checks separable — a
+#: rewritten probability is ``body_hash``'s finding and a rewritten payment is the manifest's,
+#: rather than one compound verdict reported under two names.
+COMMIT_MANIFEST_FIELDS: Final[tuple[str, ...]] = (
+    "receipt_id",
+    "trial_id",
+    "committed_trial_id",
+    "payer",
+    "body_hash",
+    "payment_tx_hash",
+    "committed_at_ms",
+    "commit_deadline_ms",
+    "trial_mode",
+)
+
+#: The checks :func:`verify_receipt` reports, in report order. COMMIT-TIME only: the four outcome
+#: checks (``bar_version``, ``law_version``, ``evidence_equality``, ``outcome_source``) arrive at
+#: H4.3 with the settlement path that can answer them. A placeholder for them here would
+#: advertise a settlement verdict nothing has computed.
+VERIFY_COMMIT_CHECKS: Final[tuple[str, ...]] = ("body_hash", "manifest", "deadline_respected", "live_mode")
+
+#: A single check's verdict. Two values, and neither is "unknown": every commit-time check reads
+#: facts the receipt itself carries, so there is no state in which one of them cannot be decided.
+CheckState = Literal["pass", "fail"]
 
 #: How long after staging a row with NO attempt marker becomes sweepable. Derived, not picked:
 #: the commit window is 300_000 ms (frozen spec section 11), and 600_000 ms of grace covers
@@ -108,6 +164,25 @@ class CommitRecord:
     trial_mode: str | None
 
 
+@dataclass(frozen=True)
+class VerifyReport:
+    """The verdict on one finalized receipt: every check, and what each one found.
+
+    ``checks`` is a mapping rather than four named fields because the set of checks GROWS — H4.3
+    adds the outcome checks to the same report — and because a caller's job is to display or
+    audit them uniformly, not to branch per check. :data:`VERIFY_COMMIT_CHECKS` is the key set at
+    this task.
+
+    Every value is ``"pass"`` or ``"fail"``. There is no "error" state and no exception path for a
+    receipt that fails: **a tampered receipt is a successfully computed report that says so.**
+    Reporting a verification failure as an API failure would make tampering indistinguishable
+    from an outage, which is the one confusion a trust surface cannot afford.
+    """
+
+    receipt_id: str
+    checks: dict[str, CheckState]
+
+
 def canonical_body_hash(body: BaseModel | dict[str, Any]) -> str:
     """Hash a commit body so that "identical canonical body" is a decidable question.
 
@@ -129,6 +204,59 @@ def canonical_body_hash(body: BaseModel | dict[str, Any]) -> str:
     """
     payload = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def committed_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the canonical commit body a finalized row attests to.
+
+    Rebuilt from the fields the receipt SERVES — via :data:`COMMIT_BODY_FIELDS` — rather than from
+    a second stored copy of the request, and that choice is the whole strength of the check. If the
+    row carried its own verbatim body and the hash were taken over that, rewriting the
+    ``p_follow_profitable`` a reader is actually shown would leave the hash intact and the
+    verifier would report ``pass`` on a receipt that serves a probability nobody committed to.
+    Deriving from the served fields means every value a consumer can see is a hashed input.
+
+    Args:
+        payload: The stored finalized row, verbatim.
+
+    Returns:
+        The body as it would have to have been for this row's ``body_hash`` to be correct.
+    """
+    return {field: payload.get(source) for field, source in COMMIT_BODY_FIELDS.items()}
+
+
+def commit_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the commit-time manifest for a finalized row.
+
+    Total by construction — every field is read with ``.get`` and nothing is coerced — because
+    this runs on the money path inside :meth:`ReceiptStore.finalize_from_journal`, AFTER a
+    settlement has succeeded. A manifest builder that could raise on an odd field would turn a
+    paid commit into an unfinalized one.
+
+    The same function serves the writer and the verifier, over the same stored shape, so the two
+    cannot normalize differently. Two separate field lists would drift, and the drift would
+    surface as ``manifest: fail`` on receipts nobody touched.
+
+    Args:
+        payload: The finalized row. ``manifest_hash`` itself is never an input — it is the OUTPUT
+            of hashing this — so it is absent from :data:`COMMIT_MANIFEST_FIELDS`.
+
+    Returns:
+        The manifest, ready for :func:`~veridex.chain.anchor.run_manifest_hash`.
+    """
+    return {field: payload.get(field) for field in COMMIT_MANIFEST_FIELDS}
+
+
+def _epoch_ms(value: Any) -> int | None:
+    """Return ``value`` when it is usable as an epoch-millisecond stamp, else ``None``.
+
+    ``type(value) is int`` rather than ``isinstance``, which would admit ``bool``: ``True`` would
+    otherwise compare as the millisecond ``1`` and a receipt stamped ``true`` would be reported as
+    a commitment made in 1970. A string, a float or an absent field is likewise not a timestamp,
+    and the caller turns ``None`` into ``fail`` — a receipt whose timing nothing can establish has
+    not been shown to be timely.
+    """
+    return value if type(value) is int else None
 
 
 def _slot_key(payer: str, trial_id: str) -> str:
@@ -505,6 +633,10 @@ class ReceiptStore:
         record = {
             "receipt_id": receipt_id,
             "trial_id": row["trial_id"],
+            # The payer's own spelling of the trial id, carried ALONGSIDE the resolved one because
+            # the body hash was taken over it. Resolution may canonicalize, so the two are not
+            # interchangeable, and dropping this would leave ``body_hash`` unverifiable.
+            "committed_trial_id": body.get("trial_id"),
             "payer": row["payer"],
             "p_follow_profitable": body.get("p_follow_profitable"),
             "methodology_version": body.get("methodology_version"),
@@ -514,6 +646,11 @@ class ReceiptStore:
             "commit_deadline_ms": row.get("commit_deadline_ms"),
             "trial_mode": row.get("trial_mode"),
         }
+        # Sealed here, in the one place a finalized row is created, and over the row itself rather
+        # than over the arguments that built it — so the hash commits to exactly what gets
+        # written. Reconciler-completed finalizations run this same line, so a crash-recovered
+        # receipt is sealed identically to one finalized on the request path.
+        record["manifest_hash"] = run_manifest_hash(commit_manifest(record))
         self._write_atomic(self._finalized / f"{receipt_id}.json", record)
         self._transition_slot(
             str(row["payer"]),
@@ -560,10 +697,44 @@ class ReceiptStore:
         """Return the finalized records for ``payer``. Staged and quarantined rows are absent."""
         return [record for record in self._public_iter() if record.payer == payer]
 
+    def _finalized_path(self, receipt_id: str) -> Path | None:
+        """Return the file ``receipt_id`` names, or ``None`` when the id could not name one.
+
+        The verify route takes this id straight from a URL path segment, so this is the boundary
+        where a traversal attempt has to stop: without the guard, ``../../secrets`` would resolve
+        outside the finalized directory and any readable JSON file on the host would be served as
+        a receipt.
+
+        Refused with ``None`` rather than by raising — unlike
+        :meth:`LiveTrialRepository._trial_path`, which raises. The difference is what the caller
+        can honestly say: an id that cannot name a receipt simply has no receipt behind it, and
+        "no such receipt" is both the truth and a 404. Raising would answer a probe with a 500,
+        which distinguishes a rejected id from an unknown one for whoever is probing.
+        """
+        if not receipt_id or "/" in receipt_id or "\\" in receipt_id or "\0" in receipt_id:
+            return None
+        if receipt_id in {".", ".."}:
+            return None
+        return self._finalized / f"{receipt_id}.json"
+
+    def finalized_payload(self, receipt_id: str) -> dict[str, Any] | None:
+        """Return the stored finalized row VERBATIM, or ``None`` when there is none.
+
+        The verifier's read path. Verbatim rather than through :class:`CommitRecord` because
+        verification has to see what is ON DISK: :meth:`_record_from` coerces as it loads, and a
+        check fed coerced values could not tell a stamp stored as ``"1700000000000"`` from one
+        stored as an integer. It is also what keeps the writer and the verifier hashing the same
+        bytes — both sides read this shape.
+        """
+        path = self._finalized_path(receipt_id)
+        if path is None or not path.is_file():
+            return None
+        return self._read_json(path)
+
     def record(self, receipt_id: str) -> CommitRecord | None:
         """Return one finalized record by receipt id, or ``None``."""
-        path = self._finalized / f"{receipt_id}.json"
-        return self._record_from(self._read_json(path)) if path.is_file() else None
+        payload = self.finalized_payload(receipt_id)
+        return None if payload is None else self._record_from(payload)
 
     def finalized_for(self, payer: str, trial_id: str) -> CommitRecord | None:
         """Return the finalized record for ``(payer, trial_id)``, or ``None``.
@@ -679,3 +850,67 @@ class ReceiptStore:
                 continue
             if clock - int(row.get("staged_at_ms") or 0) > STALE_AFTER_MS:
                 path.unlink(missing_ok=True)
+
+
+def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
+    """Verify a finalized receipt's COMMIT-TIME claims. Never raises on a bad receipt.
+
+    Four checks, all four always evaluated, each reporting only what it covers:
+
+    ``body_hash``
+        The canonical body rebuilt from the fields the receipt SERVES re-hashes to the hash taken
+        over the payer's request at staging time. Catches any rewrite of the probability, the
+        methodology, the payer's trial-id spelling, or the stored hash itself.
+    ``manifest``
+        The receipt's binding facts re-hash to the manifest hash sealed at finalization. Catches a
+        rewritten payer, payment transaction, receipt id or resolved trial — none of which is
+        inside the signed body, which is why this is a check of its own.
+    ``deadline_respected``
+        The recorded commit instant is STRICTLY before the recorded deadline. Frozen spec section
+        11 makes the boundary instant late (``received_at >= commit_deadline`` is rejected), so the
+        comparison is ``<``, not ``<=``.
+    ``live_mode``
+        The recorded mode is exactly :data:`LIVE_TRIAL_MODE`. Paid commits are live-only: a replay
+        outcome is publicly knowable, so a paid "prediction" of one is not a prediction.
+
+    The last two read facts the receipt CARRIES rather than consulting the live trial, and that is
+    what makes a historical receipt verifiable at all — the trial it belongs to may have closed
+    long ago, and a check that needed the trial store could only verify recent commitments.
+
+    **A failure is a returned verdict, not an exception.** The only ``raise`` here is for a
+    receipt that does not exist, because "no such receipt" is a different statement from "this
+    receipt does not verify" and the route answers them with different status codes.
+
+    Args:
+        receipt_id: The receipt to verify. Arrives from a URL path segment on the free verify
+            route, and is resolved through :meth:`ReceiptStore.finalized_payload`, which refuses
+            an id that could escape the finalized directory.
+        store: The commit store, read-only throughout.
+
+    Returns:
+        The report. Its ``receipt_id`` is the id that RESOLVED to a stored row — not the row's
+        self-reported one, which a tamper could have rewritten and which the ``manifest`` check
+        covers.
+
+    Raises:
+        KeyError: No FINALIZED row answers to ``receipt_id``. A staged row is a commitment that
+            was received and not yet paid for, and a quarantined slot is a settlement whose
+            outcome is unknown; neither is a receipt, and reporting checks over one would let an
+            unpaid commitment be quoted as a verified one.
+    """
+    payload = store.finalized_payload(receipt_id)
+    if payload is None:
+        raise KeyError(f"no finalized receipt {receipt_id!r}; pending and quarantined rows are not receipts")
+
+    committed_at_ms = _epoch_ms(payload.get("committed_at_ms"))
+    commit_deadline_ms = _epoch_ms(payload.get("commit_deadline_ms"))
+    verdicts: dict[str, bool] = {
+        "body_hash": canonical_body_hash(committed_body(payload)) == payload.get("body_hash"),
+        "manifest": run_manifest_hash(commit_manifest(payload)) == payload.get("manifest_hash"),
+        "deadline_respected": (
+            committed_at_ms is not None and commit_deadline_ms is not None and committed_at_ms < commit_deadline_ms
+        ),
+        "live_mode": payload.get("trial_mode") == LIVE_TRIAL_MODE,
+    }
+    checks: dict[str, CheckState] = {check: "pass" if verdicts[check] else "fail" for check in VERIFY_COMMIT_CHECKS}
+    return VerifyReport(receipt_id=receipt_id, checks=checks)

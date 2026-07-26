@@ -38,6 +38,7 @@ from veridex.api.signal_trials_schemas import (
     SignalTrialsSeasonResponse,
 )
 from veridex.signal_trials.published import read_season, read_state
+from veridex.signal_trials.receipts import verify_receipt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -236,5 +237,29 @@ def register_signal_trials_routes(
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/receipts/{{receipt_id}}/verify")
     async def signal_trials_verify_receipt(receipt_id: str) -> JSONResponse:
-        """No receipts can exist before a payment can settle."""
-        return _error(404, "receipt_not_found")
+        """Re-derive a finalized receipt's commit-time claims. Free, and honest about failure.
+
+        **A failed check is a 200 carrying a ``fail``**, never a 500. The verdict is what this
+        route exists to publish, so reporting a tampered receipt as a server error would make
+        tampering indistinguishable from an outage — and reporting it as a success with no checks
+        would make it indistinguishable from an intact receipt. Both are the same lie in opposite
+        directions, and this is the trust surface the whole benchmark rests on.
+
+        404 covers everything that is NOT a finalized receipt, under ONE code, because the
+        distinctions are not the caller's business and some of them are nobody's: a staged row is
+        a commitment that was received and not yet paid for, a quarantined slot is a settlement
+        whose outcome is unknown, an unmounted store means no receipt can exist at all, and an
+        unknown id may be a probe. Naming which one applied would confirm the existence of a
+        pending payment to whoever asked.
+
+        The id is never echoed into the refusal — it arrives from a URL path segment, so echoing it
+        would reflect caller-controlled text back into logs and responses.
+        """
+        commit_store = _store()
+        if commit_store is None:
+            return _error(404, "receipt_not_found")
+        try:
+            report = verify_receipt(receipt_id, commit_store)
+        except KeyError:
+            return _error(404, "receipt_not_found")
+        return JSONResponse(status_code=200, content={"receipt_id": report.receipt_id, "checks": dict(report.checks)})
