@@ -8,8 +8,12 @@ merely enabled — may carry an invalid commit price.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -18,6 +22,16 @@ from typing import Any
 # Ignored at the import site rather than via a ``pyproject.toml`` override so the
 # suppression stays scoped to this module and to these two names.
 from x402.http import PaymentOption  # type: ignore[import-untyped]
+from x402.http.constants import (  # type: ignore[import-untyped]
+    PAYMENT_REQUIRED_HEADER,
+    PAYMENT_RESPONSE_HEADER,
+    PAYMENT_SIGNATURE_HEADER,
+)
+from x402.http.utils import (  # type: ignore[import-untyped]
+    decode_payment_signature_header,
+    encode_payment_required_header,
+    encode_payment_response_header,
+)
 from x402.schemas.responses import (  # type: ignore[import-untyped]
     SettleResponse,
     SupportedKind,
@@ -25,6 +39,10 @@ from x402.schemas.responses import (  # type: ignore[import-untyped]
     VerifyResponse,
 )
 from x402.server import x402ResourceServer  # type: ignore[import-untyped]
+
+from veridex.api.signal_trials_schemas import CommitRequest
+from veridex.signal_trials.live import LiveTrial, LiveTrialRepository, handle_commit
+from veridex.signal_trials.receipts import INDETERMINATE_STATES, ReceiptStore
 
 COMMIT_PATH = "/signal-trials/commit"
 # GET is gated alongside POST: the OKX review probe issues a GET against the
@@ -56,6 +74,12 @@ MAX_COMMIT_PRICE = Decimal("1000000")
 # credentials: no real payer ever has this address and no chain has this hash.
 FAKE_PAYER = "0x" + "b" * 40
 FAKE_TX_HASH = "0x" + "c" * 64
+
+# Distinguishes "no verify_payer configured" from an explicitly configured ``None`` or ``""``.
+# A plain ``None`` default could not tell the two apart, and telling them apart is the point:
+# ``VerifyResponse.payer`` is typed ``str | None``, so a facilitator returning no payer at all
+# is a state the fail-closed guard has to be drivable into.
+_USE_FAKE_PAYER: Any = object()
 
 # Mirrors the fail-closed rule in ``veridex/config.py``: only these EXPLICIT
 # values are non-production. Any other value — ``prod``, ``staging``, a typo —
@@ -168,22 +192,45 @@ def _validate_commit_price(price: str) -> None:
         )
 
 
-def load_x402_settings(env: Mapping[str, str]) -> X402Settings:
+def load_x402_settings(env: Mapping[str, str], *, is_production: bool | None = None) -> X402Settings:
     """Resolve x402 settings from ``env``, failing closed in production.
+
+    ``is_production`` is an EXPLICIT PARAMETER rather than something a caller has to smuggle in
+    through ``env``. When a caller has already resolved production-ness from somewhere other
+    than ``APP_ENV`` — a ``Settings`` object, a deployment flag — it passes the answer here, and
+    the mapping keeps reporting the operator's ACTUAL ``APP_ENV``.
+
+    That distinction is the whole reason the parameter exists, and it is worth being precise
+    about. The previous shape was for the caller to synthesize ``{**env, "APP_ENV":
+    "production"}``. It reaches the right verdict and it is LOSSY: it overwrites the value the
+    diagnostics below quote, so an operator who typed ``APP_ENV=prodction`` — classified as
+    production by the fail-closed rule, which is correct — was told their environment was
+    ``'production'``. The one message able to explain WHY a development-looking deployment
+    started enforcing production rules instead confirmed a value nobody had set. The echo at the
+    ``PAY_TO_ADDRESS`` rejection exists specifically to make that misspelling diagnosable, and
+    synthesis silently removed the only information it carried.
+
+    ``None`` means "derive it from ``APP_ENV``", which is itself fail-closed: every value
+    outside :data:`_NON_PRODUCTION_APP_ENVS` — ``prod``, ``staging``, a typo — reads as
+    production, so a misspelling can never downgrade the money path.
 
     Args:
         env: Environment mapping to read configuration from.
+        is_production: The resolved production decision, or ``None`` to derive it from
+            ``env["APP_ENV"]``.
 
     Returns:
         The resolved settings.
 
     Raises:
-        ValueError: ``APP_ENV`` is production-equivalent and x402 is disabled or
-            ``PAY_TO_ADDRESS`` is missing/malformed; or the configuration can
-            charge and ``SIGNAL_TRIALS_COMMIT_PRICE`` is not a valid price.
+        ValueError: The configuration is production and x402 is disabled or ``PAY_TO_ADDRESS``
+            is missing/malformed; or the configuration can charge and
+            ``SIGNAL_TRIALS_COMMIT_PRICE`` is not a valid price.
     """
+    # Reported verbatim in the diagnostics below, never overwritten by the caller's verdict.
     app_env = env.get("APP_ENV", "development").strip().casefold()
-    is_production = app_env not in _NON_PRODUCTION_APP_ENVS
+    if is_production is None:
+        is_production = app_env not in _NON_PRODUCTION_APP_ENVS
     enabled = env.get("X402_ENABLED", "false").strip().casefold() in _TRUTHY
     pay_to = env.get("PAY_TO_ADDRESS", "").strip()
     price = env.get("SIGNAL_TRIALS_COMMIT_PRICE", "").strip() or DEFAULT_COMMIT_PRICE
@@ -243,16 +290,56 @@ class FakeFacilitator:
     refuses the fake and the adapter alike in production.
     """
 
-    def __init__(self, fail_settlement: bool = False) -> None:
+    def __init__(
+        self,
+        fail_settlement: bool = False,
+        *,
+        settle_delay_ms: int = 0,
+        raise_transport_error: bool = False,
+        verify_payer: Any = _USE_FAKE_PAYER,
+        verify_is_valid: bool = True,
+    ) -> None:
         """Create a fake facilitator.
 
+        The H1.1 surface is preserved EXACTLY: ``fail_settlement`` stays the sole positional
+        argument, and ``verify``, ``settle``, ``verify_calls``, ``settle_calls`` and
+        ``last_settlement`` are unchanged in name, signature and behaviour. The three additions
+        below are keyword-only with defaults that reproduce the H1.1 behaviour byte for byte, so
+        every existing call site and every existing assertion is unaffected. They exist because
+        H4.1's frozen test block drives three states the two-outcome fake could not represent —
+        a slow settlement, a settlement whose OUTCOME IS UNKNOWN, and a facilitator that
+        verifies a payment without naming a payer.
+
         Args:
-            fail_settlement: When true, every settle reports ``"failed"``.
+            fail_settlement: When true, every settle reports ``"failed"``. This is a DEFINITIVE
+                returned failure: the facilitator answered, and the answer was no.
+            settle_delay_ms: How long the SDK-facing adapter waits before delegating, so two
+                concurrent commits genuinely overlap instead of running back to back. Awaited in
+                the adapter rather than slept here, because this method is synchronous by
+                freeze and a blocking sleep would serialize the event loop — which would make a
+                concurrency test pass while exercising no concurrency at all.
+            raise_transport_error: When true, settle records the attempt and then RAISES. This
+                is categorically different from ``fail_settlement``: the request was sent and no
+                answer came back, so whether money moved is unknown and unknowable from here.
+            verify_payer: The payer the adapter reports at the SDK boundary. Defaults to
+                :data:`FAKE_PAYER`; an explicit ``None`` or ``""`` drives the fail-closed guard.
+            verify_is_valid: The ``is_valid`` flag the adapter reports. ``False`` models the
+                facilitator REFUSING the payment while still naming a payer, which the SDK's
+                response shape permits — so a caller that read ``payer`` without consulting
+                ``is_valid`` would treat a rejected payment as a verified one.
         """
         self.fail_settlement = fail_settlement
         self.verify_calls = 0
         self.settle_calls = 0
         self.last_settlement: dict[str, str] | None = None
+        self.settle_delay_ms = settle_delay_ms
+        self.raise_transport_error = raise_transport_error
+        self.verify_payer = FAKE_PAYER if verify_payer is _USE_FAKE_PAYER else verify_payer
+        self.verify_is_valid = verify_is_valid
+        #: The requirements the LAST settlement was requested against. Recorded by the adapter,
+        #: because the frozen single-argument ``settle`` below never sees them — and they carry
+        #: ``pay_to``, which decides where the money goes and is therefore worth an oracle.
+        self.last_settled_requirements: Any = None
 
     def verify(self, payload: Mapping[str, Any]) -> VerifiedPayment:
         """Accept ``payload`` unconditionally and record the call."""
@@ -260,8 +347,22 @@ class FakeFacilitator:
         return VerifiedPayment(payer=FAKE_PAYER)
 
     def settle(self, payload: Mapping[str, Any]) -> dict[str, str]:
-        """Record a settlement attempt and return its synthetic result."""
+        """Record a settlement attempt and return its synthetic result.
+
+        The counter is incremented BEFORE the transport error is raised, and that order is the
+        honest model of the failure: the attempt was made, the request may have reached the
+        facilitator, and the caller has no way to learn whether it settled. A fake that raised
+        without counting would describe a request that was never sent, which is the one case
+        this state is not.
+
+        Raises:
+            ConnectionError: ``raise_transport_error`` is set. Not caught by the store's own
+                error handling anywhere; the wrapper is required to read it as INDETERMINATE.
+        """
         self.settle_calls += 1
+        if self.raise_transport_error:
+            self.last_settlement = None
+            raise ConnectionError("simulated facilitator transport failure after the request was sent")
         if self.fail_settlement:
             # Empty hash on failure: nothing settled, so there is no transaction
             # to point at. A placeholder here would look like a real receipt.
@@ -304,12 +405,29 @@ class FakeFacilitatorClientAdapter:
         return SupportedResponse(kinds=[SupportedKind(x402_version=2, scheme="exact", network=X_LAYER_MAINNET)])
 
     async def verify(self, payload: Any, requirements: Any) -> VerifyResponse:
-        """Delegate to the fake and translate its result into the SDK shape."""
-        verified = self.fake.verify(payload)
-        return VerifyResponse(is_valid=True, payer=verified.payer)
+        """Delegate to the fake and translate its result into the SDK shape.
+
+        The fake's own ``verify`` still returns ``VerifiedPayment(payer=FAKE_PAYER)``, whose
+        ``payer`` is typed ``str`` and stays non-optional. The payer that reaches the SDK
+        response is ``fake.verify_payer``, which may be ``None`` or ``""`` — and it is CORRECT
+        for that to be possible only here, because this is the boundary where the SDK's
+        ``str | None`` type lives. Making the frozen veridex type carry the optionality would
+        push a payment-layer concern into a value object that has no business with it.
+        """
+        self.fake.verify(payload)
+        return VerifyResponse(is_valid=self.fake.verify_is_valid, payer=self.fake.verify_payer)
 
     async def settle(self, payload: Any, requirements: Any) -> SettleResponse:
-        """Delegate to the fake, carrying a failed settlement through honestly."""
+        """Delegate to the fake, carrying a failed or indeterminate settlement through honestly.
+
+        The requirements are recorded on the FAKE, not held here, so the fake stays the single
+        test oracle exactly as ``PKT-DEC-C11`` requirement 4 intends. They are recorded BEFORE
+        delegating, so a settlement that raises still leaves evidence of what it was asked to do
+        — which is the case where that evidence matters most.
+        """
+        self.fake.last_settled_requirements = requirements
+        if self.fake.settle_delay_ms:
+            await asyncio.sleep(self.fake.settle_delay_ms / 1000)
         result = self.fake.settle(payload)
         settled = result["status"] == "confirmed"
         return SettleResponse(
@@ -407,3 +525,460 @@ def build_resource_server(
             f"X402 refuses unsupported network {settings.network!r}; supported: {sorted(_ALLOWED_NETWORKS)}"
         )
     return x402ResourceServer(facilitator)
+
+
+def _settle_outcome_is_definitive_failure(settled: SettleResponse) -> bool:
+    """Report whether ``settled`` is a PROVEN settlement failure.
+
+    A separate named predicate because the whole design turns on this one question, and the
+    answer is only ever yes when the facilitator RETURNED and said no. An exception never
+    reaches here: it is caught by the caller and treated as indeterminate, because a raised
+    settle is absence of evidence rather than evidence of absence. Reading a timeout as a
+    failure is how a real payment loses its record.
+    """
+    return not settled.success
+
+
+class SignalTrialsPaymentASGI:
+    """ASGI wrapper that makes the commit route settlement-atomic.
+
+    Mount it AROUND the composed application — the analogue of ``guard.app``, never of a guard
+    object that merely delegates to it. Middleware attached to a delegating wrapper is not in
+    the request path at all, so it would gate nothing while appearing to be installed.
+
+    **The SDK's verify and settle functions are called DIRECTLY, and no resource-server hook is
+    ever registered.** That is not stylistic. ``x402ResourceServerBase._settle_payment_core``
+    runs its after-settle hooks INSIDE the ``try`` block that guards the facilitator call, so an
+    exception raised by an ``on_after_settle`` hook lands in the ``except`` that then invokes the
+    settle-FAILURE hooks. A journal-or-finalize step implemented as an after-settle hook could
+    therefore trigger the failure path — deleting records — after a settlement that really
+    happened. Orchestrating in this class instead removes the hazard by construction rather than
+    by being careful inside a hook.
+
+    The order of operations is fixed by what each step proves, not by convenience:
+
+    ==== =============================== ==================================================
+    step action                          why it is where it is
+    ==== =============================== ==================================================
+    1    402 challenge when unpaid       GET and POST alike, so the review probe meets the
+                                         paywall rather than a 200
+    2    VERIFY, then ``payer``          fail-closed on ``None``/``""``: an empty payer would
+                                         key every commit to one shared decision slot
+    3    ACQUIRE the slot                a single atomic ``O_CREAT | O_EXCL``, so two
+                                         concurrent commits cannot both proceed
+    4    VALIDATE the request            a 4xx here releases the slot: settlement was
+                                         provably never reached
+    5    STAGE                           the payload exists before anything points at it
+    6    MARK ``settle_attempted``       fsynced BEFORE settle, so a crash past this point
+                                         is never misread as "never settled"
+    7    SETTLE                          three outcomes, not two
+    8    JOURNAL then FINALIZE           the proof is durable before the bookkeeping
+    ==== =============================== ==================================================
+
+    Step 7 is the reason the class exists:
+
+    * **returned failure** -> delete the staged row, RELEASE the slot, ``402``. Zero records of
+      any kind, which is what frozen spec section 12 requires of a failed payment.
+    * **raised or timed out** -> change NOTHING. The slot stays ``settle_attempted`` for the
+      reconciler to quarantine, and the answer is ``502 payment_indeterminate``. Never a
+      deletion, because this is not a proven failure.
+    * **returned success** -> journal, then finalize. After this point no failure path exists:
+      a journal or finalize error still answers ``200``, because the money has moved and telling
+      the payer otherwise would be a lie the store can already repair.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        server: x402ResourceServer,
+        settings: X402Settings,
+        store: ReceiptStore,
+        live_trials: LiveTrialRepository,
+        now_ms: Callable[[], int] | None = None,
+    ) -> None:
+        """Wrap ``app``, gating its commit route.
+
+        Args:
+            app: The composed ASGI application to wrap.
+            server: An x402 resource server with a facilitator bound and a scheme registered.
+            settings: Resolved, validated x402 configuration.
+            store: The two-phase commit store.
+            live_trials: The published open-trial repository, used to resolve a commit's trial.
+            now_ms: Clock returning epoch milliseconds. Injected so a deadline is testable
+                without waiting; defaults to the real clock.
+
+        Raises:
+            ValueError: ``settings.sync_settle`` is false. CONSUMED here rather than forwarded:
+                the entire design depends on settlement completing before the ``200`` is
+                emitted, because the receipt carries a real transaction hash and the slot
+                reaches ``finalized`` only after money moved. Settling asynchronously would let
+                an unsettled commit be published as a paid one, so construction fails closed
+                instead of mounting a gate that can lie.
+        """
+        if not settings.sync_settle:
+            raise ValueError(
+                "SignalTrialsPaymentASGI requires sync_settle=True: the commit receipt carries a "
+                "real transaction hash and the decision slot is finalized only after settlement, "
+                "so an asynchronous settle would publish an unsettled commit as paid"
+            )
+        self.app = app
+        self.server = server
+        self.settings = settings
+        self.store = store
+        self.live_trials = live_trials
+        self._now_ms = now_ms if now_ms is not None else (lambda: int(time.time() * 1000))
+        self._requirements: list[Any] | None = None
+
+    # ------------------------------------------------------------------ ASGI plumbing
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Gate the commit route; pass everything else through untouched.
+
+        Evidence reads are free by frozen spec section 11, so anything that is not the gated
+        commit route reaches the wrapped app with its ``receive`` channel UNCONSUMED. The body is
+        buffered only on the path this class answers itself, which is also the only path where
+        it never delegates — so a buffered request is never replayed and a passed-through one is
+        never touched.
+        """
+        if scope.get("type") != "http" or scope.get("path") != COMMIT_PATH:
+            await self.app(scope, receive, send)
+            return
+        method = scope.get("method", "")
+        if method not in GATED_METHODS:
+            await self.app(scope, receive, send)
+            return
+        await self._handle_commit_request(scope, receive, send, method=method)
+
+    @staticmethod
+    def _header(scope: Any, name: str) -> str | None:
+        """Return a request header by lowercase name.
+
+        ASGI delivers headers as a list of raw ``(bytes, bytes)`` pairs with names already
+        lowercased by the server, but the comparison lowercases again rather than trusting that:
+        ``PAYMENT-SIGNATURE`` is the one header whose absence means "unpaid", so a case mismatch
+        would silently turn a paid request into a 402 challenge.
+        """
+        target = name.lower().encode("latin-1")
+        headers: list[tuple[bytes, bytes]] = scope.get("headers", [])
+        for key, value in headers:
+            if key.lower() == target:
+                return value.decode("latin-1")
+        return None
+
+    @staticmethod
+    async def _read_body(receive: Any) -> bytes:
+        """Buffer the full request body from the ASGI receive channel."""
+        chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        return b"".join(chunks)
+
+    @staticmethod
+    async def _send_json(send: Any, status: int, payload: dict[str, Any], extra: dict[str, str] | None = None) -> None:
+        """Emit a JSON response with ``status`` and any extra headers."""
+        body = json.dumps(payload).encode("utf-8")
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("latin-1"))]
+        for key, value in (extra or {}).items():
+            headers.append((key.encode("latin-1"), value.encode("latin-1")))
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
+
+    # ------------------------------------------------------------------ x402 challenge
+
+    def _payment_requirements(self) -> list[Any]:
+        """Build the route's payment requirements once, initializing the server on first use.
+
+        Lazy for the same reason the stock middleware is lazy: ``initialize`` interrogates the
+        facilitator, and doing that at import or mount time would make composing an app depend
+        on a facilitator being reachable. Cached because the requirements are a pure function of
+        the settings, which are frozen.
+        """
+        if self._requirements is None:
+            self.server.initialize()
+            self._requirements = list(self.server.build_payment_requirements(build_commit_price(self.settings)))
+        return self._requirements
+
+    async def _send_challenge(self, send: Any, error: str) -> None:
+        """Emit the 402 challenge, carrying the requirements in ``PAYMENT-REQUIRED``.
+
+        The body names only a stable machine-readable code. Nothing the caller supplied is
+        echoed — not the trial id, not the body — because this is the one response an
+        unauthenticated caller can provoke at will, and it is where an echoed value would end up
+        in somebody else's logs.
+        """
+        requirements = self._payment_requirements()
+        challenge = self.server.create_payment_required_response(requirements, error=error)
+        await self._send_json(
+            send,
+            402,
+            {"error": error},
+            {PAYMENT_REQUIRED_HEADER: encode_payment_required_header(challenge)},
+        )
+
+    # ------------------------------------------------------------------ the money path
+
+    async def _handle_commit_request(self, scope: Any, receive: Any, send: Any, *, method: str) -> None:
+        """Run the eight-step commit path for one gated request."""
+        header = self._header(scope, PAYMENT_SIGNATURE_HEADER)
+        if not header:
+            # Step 1. Identical on GET and POST: the OKX review probe issues a GET.
+            await self._send_challenge(send, "payment_required")
+            return
+
+        # A paid GET is refused BEFORE verification, so nothing is charged for it. A commitment
+        # is a body, and GET is gated only so the unpaid probe meets a challenge.
+        if method != "POST":
+            await self._send_json(send, 405, {"error": "commit_requires_post"})
+            return
+
+        try:
+            payload = decode_payment_signature_header(header)
+        except Exception:
+            # Deliberately broad: every malformation of an attacker-supplied header — bad
+            # base64, bad JSON, a payload failing model validation — is the same answer, and
+            # enumerating the SDK's decode failures would leave the un-enumerated one as a 500.
+            await self._send_challenge(send, "invalid_payment")
+            return
+
+        requirements = self._matching_requirements(payload)
+        if requirements is None:
+            # The payload settles a DIFFERENT set of requirements than this route advertised — a
+            # different amount, asset or payee. Refused before verify, and nothing is written.
+            await self._send_challenge(send, "invalid_payment")
+            return
+
+        # Step 2. Direct SDK verify. No hooks are registered, so this runs the facilitator call
+        # and nothing else.
+        verified = await self.server.verify_payment(payload, requirements)
+        payer = verified.payer if verified.is_valid else None
+        if not payer:
+            # FAIL CLOSED on None and on "". The SDK types ``payer`` as ``str | None``, and an
+            # empty payer would become a decision-slot key SHARED by every anonymous commit —
+            # so the first commitment would idempotently answer for all of them. No state is
+            # written on this path, which is what makes a refused payment leave no trace.
+            await self._send_challenge(send, "invalid_payment")
+            return
+
+        raw_body = await self._read_body(receive)
+        try:
+            request = CommitRequest.model_validate_json(raw_body)
+        except Exception:
+            # Before any slot exists, so there is nothing to release. Broad for the same reason
+            # as the header decode: one answer for every shape of malformed request body.
+            await self._send_json(send, 422, {"error": "invalid_commit_request"})
+            return
+
+        trial = self.live_trials.get(request.trial_id)
+        now_ms = self._now_ms()
+
+        # Step 3. Atomic slot acquisition.
+        created, state = self.store.acquire_slot(payer, request.trial_id, now_ms=now_ms)
+        if not created:
+            await self._answer_existing_slot(send, state, request=request, trial=trial, payer=payer, now_ms=now_ms)
+            return
+
+        # Step 4. Validate. Any refusal releases the slot: settlement was never reached, so no
+        # payment can exist and holding the slot would lock the payer out of retrying.
+        #
+        # ``handle_commit`` cannot answer with an existing receipt id on this path, and the reason
+        # is structural rather than lucky: it resolves idempotency through the SLOT pointer, and
+        # this call created that slot as ``in_flight`` a moment ago. Only ``_answer_existing_slot``
+        # can see a ``finalized`` slot, which is why the replay answer lives there and not here.
+        outcome = handle_commit(request, trial=trial, payer=payer, now_ms=now_ms, store=self.store)
+        if outcome.status != 200:
+            self.store.release_slot(payer, request.trial_id)
+            await self._send_json(send, outcome.status, {"error": outcome.error})
+            return
+        if trial is None:
+            # Unreachable: a 200 from handle_commit implies a resolved trial, since it answers 404
+            # for ``None``. Written as a real fail-closed branch rather than an ``assert`` because
+            # an assert is removed under ``-O``, and the money path should not have a guard whose
+            # presence depends on an interpreter flag.
+            self.store.release_slot(payer, request.trial_id)
+            await self._send_json(send, 404, {"error": "trial_not_found"})
+            return
+
+        await self._stage_settle_finalize(send, payload, requirements, request=request, trial=trial, payer=payer)
+
+    def _matching_requirements(self, payload: Any) -> Any:
+        """Return the advertised requirements this payload fulfils, or ``None``.
+
+        Delegated to the SDK's own comparison so the definition of "matching" is the protocol's
+        rather than this module's opinion of it. Without this check a payer could present a
+        valid signature over cheaper requirements and be served.
+        """
+        return self.server.find_matching_requirements(self._payment_requirements(), payload)
+
+    async def _answer_existing_slot(
+        self,
+        send: Any,
+        state: str,
+        *,
+        request: CommitRequest,
+        trial: LiveTrial | None,
+        payer: str,
+        now_ms: int,
+    ) -> None:
+        """Answer a request whose decision slot is already held, WITHOUT ever settling.
+
+        No branch here reaches a settle call, and that is the property that makes a
+        post-quarantine retry unable to double-charge. Each state gets its own code and reason
+        so an agent can tell "try again shortly" from "a human has to look at this" from "you
+        already committed".
+        """
+        if state in INDETERMINATE_STATES:
+            # An earlier payment for this slot MAY have settled and there is no way to ask.
+            # 409 rather than the 502 used at the moment of the indeterminate settle: by now the
+            # state is a known, recorded condition of the slot rather than a failure in flight.
+            await self._send_json(send, 409, {"error": "payment_indeterminate"})
+            return
+        if state == "in_flight":
+            await self._send_json(send, 409, {"error": "commit_in_flight"})
+            return
+        # finalized: the idempotency pointer. handle_commit compares canonical bodies and
+        # returns either the ORIGINAL receipt or a 409, and settles nothing either way.
+        outcome = handle_commit(request, trial=trial, payer=payer, now_ms=now_ms, store=self.store)
+        if outcome.status == 200 and outcome.receipt_id is not None:
+            await self._send_receipt(send, outcome.receipt_id, settled=None)
+            return
+        await self._send_json(send, outcome.status if outcome.status != 200 else 409, {"error": outcome.error})
+
+    async def _stage_settle_finalize(
+        self,
+        send: Any,
+        payload: Any,
+        requirements: Any,
+        *,
+        request: CommitRequest,
+        trial: LiveTrial,
+        payer: str,
+    ) -> None:
+        """Steps 5 to 8: stage, mark, settle, journal, finalize."""
+        staging_id = hashlib.sha256(payload.model_dump_json(by_alias=True, exclude_none=True).encode()).hexdigest()
+
+        # Step 5. The payload lands before anything points at it.
+        self.store.stage(
+            staging_id=staging_id,
+            trial_id=trial.trial_id,
+            payer=payer,
+            body=request,
+            staged_at_ms=self._now_ms(),
+            commit_deadline_ms=trial.commit_deadline_ms,
+            trial_mode=trial.trial_mode,
+        )
+        # Step 6. Durable, directory-synced, and BEFORE the settle call.
+        self.store.mark_settle_attempted(staging_id)
+
+        # Step 7. Direct SDK settle, three outcomes.
+        try:
+            settled = await self.server.settle_payment(payload, requirements)
+        except Exception:
+            # INDETERMINATE. The request may have been sent and the money may have moved, so
+            # NOTHING is deleted and NOTHING is released: the slot stays settle_attempted and the
+            # reconciler quarantines it. Broad on purpose — a transport error, a timeout and an
+            # SDK bug are indistinguishable from here, and all three mean "unknown".
+            await self._send_json(send, 502, {"error": "payment_indeterminate"})
+            return
+
+        if _settle_outcome_is_definitive_failure(settled):
+            # PROVEN failure: the facilitator answered no. This is one of exactly two places a
+            # slot may be released, and the only one after staging.
+            self.store.delete_staged(staging_id)
+            self.store.release_slot(payer, trial.trial_id)
+            await self._send_json(send, 402, {"error": "payment_failed"})
+            return
+
+        # Step 8. Past this point the money has moved, so no failure path exists.
+        if not self._journal_with_one_retry(staging_id, payer=payer, tx_hash=settled.transaction):
+            await self._send_settled_receipt_pending(send, settled, trial=trial, payer=payer)
+            return
+        try:
+            receipt_id = self.store.finalize_from_journal(staging_id)
+        except Exception:
+            # The journal entry survives, so the reconciler completes this exact receipt id. The
+            # payer is told the truth: settled, receipt materializing.
+            await self._send_settled_receipt_pending(send, settled, trial=trial, payer=payer)
+            return
+        await self._send_receipt(send, receipt_id, settled=settled)
+
+    def _journal_with_one_retry(self, staging_id: str, *, payer: str, tx_hash: str) -> bool:
+        """Write the journal entry, retrying once. Report whether it landed.
+
+        Retried because the write is the durable proof of a settlement that already happened and
+        a transient I/O failure should not cost it. Retried ONCE rather than indefinitely because
+        the payer is waiting and the fallback is already safe: the slot stays
+        ``settle_attempted``, the reconciler quarantines it, and an operator resolves it against
+        the facilitator. A ``BaseException`` — process death — is deliberately not caught, so a
+        crash here surfaces as a crash instead of a 200 with no journal behind it.
+        """
+        for attempt in (1, 2):
+            try:
+                self.store.journal(staging_id, payer=payer, tx_hash=tx_hash)
+            except Exception:
+                if attempt == 2:
+                    return False
+            else:
+                return True
+        return False
+
+    async def _send_settled_receipt_pending(
+        self, send: Any, settled: SettleResponse, *, trial: LiveTrial, payer: str
+    ) -> None:
+        """Answer 200 for a settlement that succeeded but whose record is not yet materialized.
+
+        Never a failure code, because the money moved: reporting failure after settlement is the
+        one dishonesty this whole module is built to avoid. ``receipt_id`` is ``null`` rather
+        than invented, and the status says exactly which state this is, so a caller can tell it
+        from a finalized commit instead of discovering the difference later.
+        """
+        await self._send_json(
+            send,
+            200,
+            {
+                "receipt_id": None,
+                "status": "settled_receipt_pending",
+                "trial_id": trial.trial_id,
+                "payer": payer,
+                "payment_tx_hash": settled.transaction,
+            },
+            {PAYMENT_RESPONSE_HEADER: encode_payment_response_header(settled)},
+        )
+
+    async def _send_receipt(self, send: Any, receipt_id: str, *, settled: SettleResponse | None) -> None:
+        """Emit the finalized commit receipt, with ``PAYMENT-RESPONSE`` when this call settled.
+
+        The header is attached only when THIS request settled a payment. An idempotent replay
+        did not settle anything, and attaching a settlement response to it would advertise a
+        second payment that never happened.
+
+        Raises:
+            KeyError: The slot pointed at a receipt with no record behind it. Refused rather
+                than answered with a stub, because a receipt id the payer can quote must
+                resolve to a real record.
+        """
+        record = self.store.record(receipt_id)
+        if record is None:
+            raise KeyError(f"decision slot points at receipt {receipt_id!r} with no finalized record")
+        extra = {PAYMENT_RESPONSE_HEADER: encode_payment_response_header(settled)} if settled is not None else None
+        await self._send_json(
+            send,
+            200,
+            {
+                "receipt_id": record.receipt_id,
+                "status": "finalized",
+                "trial_id": record.trial_id,
+                "payer": record.payer,
+                "p_follow_profitable": record.p_follow_profitable,
+                "methodology_version": record.methodology_version,
+                "body_hash": record.body_hash,
+                "payment_tx_hash": record.payment_tx_hash,
+                "committed_at_ms": record.committed_at_ms,
+            },
+            extra,
+        )
