@@ -478,9 +478,7 @@ def create_server_app(
     # II-5f served composition (the guard return / deny-by-default / /readyz gate set are unchanged).
     # Built BEFORE the readiness router so /readyz probes the AUTHORITATIVE R-2 catalog (Codex MAJOR-3),
     # not a weaker second filesystem validator.
-    replay_catalog = build_catalog(
-        pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None
-    )
+    replay_catalog = build_catalog(pack_root, capture_root=resolved_env.get("REPLAY_CAPTURE_ROOT", "") or None)
 
     readiness_router = build_readiness_router(
         get_pool=lambda: pool_holder["pool"],
