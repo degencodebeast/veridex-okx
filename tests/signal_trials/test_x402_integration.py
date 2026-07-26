@@ -1377,3 +1377,203 @@ def test_the_probability_bound_refuses_values_JUST_outside_it(just_outside):
     outcome = handle_commit(unvalidated, trial=trial, payer=PAY_TO_A, now_ms=NOW_MS, store=store)
     assert outcome.status == 422 and outcome.error == "invalid_probability"
     assert store.count_all() == 0 and store.slot_count() == 0
+
+
+# ----------------------------------------------------------------------------------------
+# F1 REGRESSION — the decision slot is keyed on the RESOLVED trial id, never the payer's.
+#
+# These assert on ID-KEYING and are therefore PORTABLE. They do not depend on filesystem case
+# sensitivity, and they fail on a case-sensitive filesystem exactly as they fail on APFS.
+#
+# That distinction is the point. The defect was FOUND through a case-insensitive filesystem, on
+# which `get("TRIAL_X")` resolves the file `trial_x.json` and returns a trial whose own id is
+# `trial_x`. But the filesystem is only one way to make requested != resolved; an alias table, a
+# canonicalizing normalizer, or a future id migration would all do it. A test written against
+# APFS case-folding would pin the platform and pass vacuously in the Debian container the
+# service actually ships in (`python:3.11-slim`), which is where a regression would hide.
+#
+# So resolution is made to normalize EXPLICITLY, and the assertion is the invariant itself:
+# ONE payment leaves ONE slot, and that slot is keyed on the id the trial actually has.
+# ----------------------------------------------------------------------------------------
+
+
+class _NormalizingTrialRepository(LiveTrialRepository):
+    """A repository whose resolution canonicalizes the requested id.
+
+    Models every real way `request.trial_id != trial.trial_id` can arise — a case-insensitive
+    filesystem, an alias table, an id migration — without depending on any of them. `get` is the
+    only seam that matters: the wrapper resolves through it and must key the slot on what comes
+    back, not on what was asked for.
+    """
+
+    def get(self, trial_id: str) -> LiveTrial | None:
+        """Resolve case-insensitively, so a requested id may differ from the resolved one."""
+        return super().get(trial_id.lower())
+
+
+def _normalizing_app(*, facilitator: FakeFacilitator, store: ReceiptStore, trial: LiveTrial) -> SignalTrialsPaymentASGI:
+    """The gated app with a normalizing resolver in front of the same published trial."""
+    base = _build_app(facilitator=facilitator, store=store, trial=trial, settings=_settings())
+    repo = _NormalizingTrialRepository(store.root / "live")
+    return SignalTrialsPaymentASGI(
+        base.app,
+        server=base.server,
+        settings=base.settings,
+        store=store,
+        live_trials=repo,
+        now_ms=lambda: NOW_MS,
+    )
+
+
+async def test_F1_one_payment_leaves_exactly_ONE_slot_keyed_on_the_RESOLVED_trial_id():
+    """A commitment whose requested id differs from the resolved one leaves a single slot.
+
+    Two slots for one payment is the whole defect. Acquisition on the payer's spelling and
+    finalization on the resolved one means `mark_settle_attempted`, which derives its key from
+    the staged row, transitions a slot that does not exist -- and `_transition_slot` CREATES it.
+    The orphan then sits `in_flight` with no attempt marker, which is precisely the state
+    `reconcile` branch 3 is required to release as "provably never reached settle".
+    """
+    requested = LIVE_TRIAL_ID.upper()
+    resolved = LIVE_TRIAL_ID
+    assert requested != resolved, "the vector is vacuous unless the two ids genuinely differ"
+
+    facilitator = FakeFacilitator()
+    store = _FaultInjectingStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=resolved)
+    app = _normalizing_app(facilitator=facilitator, store=store, trial=trial)
+
+    first = await _paid_post(app, _body(0.6, trial_id=requested))
+    assert first.status_code == 200, first.text
+    assert facilitator.settle_calls == 1 and store.count_finalized() == 1
+
+    assert store.slot_count() == 1, "one payment must leave exactly one decision slot"
+    assert store.slot_state(FAKE_PAYER, resolved) == "finalized"
+    assert store.slot_state(FAKE_PAYER, requested) is None, "no slot may be keyed on the payer's spelling"
+    # The record binds the resolved id, which is what plan line 875 means by "the slot key comes
+    # FROM the finalized record -- no free variables".
+    (record,) = store.finalized()
+    assert record.trial_id == resolved
+    assert store.slot_state(record.payer, record.trial_id) == "finalized"
+
+
+async def test_F1_an_off_spelling_retry_NEVER_settles_twice_even_after_reconciliation():
+    """The double charge itself: retry the same commitment and it must still settle exactly once.
+
+    This is the money assertion. With the slot keyed on the payer's spelling, the orphan is
+    released by `reconcile`, the retry then finds no slot, `handle_commit` answers 200 WITH the
+    original receipt id -- and a wrapper that tests only `outcome.status != 200` falls through
+    and settles again. Both halves of the fix are required: the consistent key stops the orphan
+    existing, and honouring `outcome.receipt_id` stops the fall-through.
+    """
+    requested = LIVE_TRIAL_ID.upper()
+    facilitator = FakeFacilitator()
+    store = _FaultInjectingStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    app = _normalizing_app(facilitator=facilitator, store=store, trial=trial)
+
+    first = await _paid_post(app, _body(0.6, trial_id=requested))
+    assert first.status_code == 200
+
+    # Immediate retry, fresh signature, identical canonical body.
+    retry = await _paid_post(app, _body(0.6, trial_id=requested))
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["receipt_id"] == first.json()["receipt_id"]
+    assert facilitator.settle_calls == 1 and store.count_finalized() == 1
+
+    # And after reconciliation, which is what released the orphan and reopened the door.
+    store.reconcile(now_ms=10**15)
+    after = await _paid_post(app, _body(0.6, trial_id=requested))
+    assert after.status_code == 200, after.text
+    assert after.json()["receipt_id"] == first.json()["receipt_id"]
+    assert facilitator.settle_calls == 1, "one commitment, one settlement -- ever"
+    assert store.count_finalized() == 1
+    assert len(store.public_records(FAKE_PAYER)) == 1, "one commitment must not yield two paid records"
+
+
+async def test_F1_a_DIFFERENT_body_under_an_off_spelling_is_still_a_409(x402_app_factory):
+    """The other half of idempotency survives the fix: a different body still writes nothing."""
+    requested = LIVE_TRIAL_ID.upper()
+    facilitator = FakeFacilitator()
+    store = _FaultInjectingStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    app = _normalizing_app(facilitator=facilitator, store=store, trial=trial)
+
+    assert (await _paid_post(app, _body(0.6, trial_id=requested))).status_code == 200
+    conflicting = await _paid_post(app, _body(0.7, trial_id=requested))
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"] == "different_commit_body"
+    assert facilitator.settle_calls == 1 and store.count_finalized() == 1
+
+
+async def test_F3_a_finalized_slot_with_no_record_names_a_CODE_not_null(x402_app_factory):
+    """The error envelope is always `{"error": "<code>"}` -- `null` is not a code.
+
+    Reachable when a slot reads `finalized` but its payload is absent: a partially restored or
+    hand-repaired store, or `create_slot(state="finalized")` with no receipt id. No money moves
+    on this path and the slot still refuses re-settlement, which is why this is minor -- but an
+    agent matching on the code gets `null`, and the lane's own contract says it gets a string.
+    """
+    app, store, fac = x402_app_factory(facilitator=FakeFacilitator())
+    assert (await _paid_post(app, _body(0.6))).status_code == 200
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized"
+
+    # Remove the finalized payload, leaving the slot pointing at nothing.
+    for stale in (store.root / "finalized").glob("*.json"):
+        stale.unlink()
+    assert store.count_finalized() == 0
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized"
+
+    retry = await _paid_post(app, _body(0.6))
+    assert retry.status_code == 409
+    assert retry.json()["error"] == "receipt_record_missing", retry.text
+    assert isinstance(retry.json()["error"], str)
+    assert fac.settle_calls == 1, "an inconsistent store must never license a re-settle"
+
+
+async def test_F1_a_validation_refusal_under_an_off_spelling_RELEASES_the_slot():
+    """A refused commit releases the slot it actually acquired, not one keyed on the request.
+
+    Written because a mutant survived: the F1 tests above all reach settlement or answer from an
+    existing slot, so none of them exercises the validation-4xx RELEASE with a requested id that
+    differs from the resolved one. With that release keyed on the payer's spelling, the slot
+    acquired on the resolved id is never freed and the payer is locked out of the trial until the
+    reconciler's staleness window expires -- on a five-minute commit window, that is the whole
+    window. Same class as the release gap on a proven settlement failure.
+
+    The refusal used is the closed commit window, because it is a validation outcome that needs
+    no fault injection and leaves an unambiguous code.
+    """
+    requested = LIVE_TRIAL_ID.upper()
+    facilitator = FakeFacilitator()
+    store = _FaultInjectingStore(_fresh_root())
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    base = _build_app(facilitator=facilitator, store=store, trial=trial, settings=_settings())
+    late = SignalTrialsPaymentASGI(
+        base.app,
+        server=base.server,
+        settings=base.settings,
+        store=store,
+        live_trials=_NormalizingTrialRepository(store.root / "live"),
+        now_ms=lambda: trial.commit_deadline_ms,
+    )
+
+    refused = await _paid_post(late, _body(0.6, trial_id=requested))
+    assert refused.status_code == 410 and refused.json()["error"] == "commit_window_closed"
+    assert facilitator.settle_calls == 0 and store.count_all() == 0
+    assert store.slot_count() == 0, "a validation refusal must leave no slot on EITHER spelling"
+    assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) is None
+    assert store.slot_state(FAKE_PAYER, requested) is None
+
+    # And the release is usable: the same payer commits inside the window afterwards.
+    in_window = SignalTrialsPaymentASGI(
+        base.app,
+        server=base.server,
+        settings=base.settings,
+        store=store,
+        live_trials=_NormalizingTrialRepository(store.root / "live"),
+        now_ms=lambda: NOW_MS,
+    )
+    accepted = await _paid_post(in_window, _body(0.6, trial_id=requested))
+    assert accepted.status_code == 200, accepted.text
+    assert facilitator.settle_calls == 1 and store.count_finalized() == 1

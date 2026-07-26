@@ -774,34 +774,52 @@ class SignalTrialsPaymentASGI:
             await self._send_json(send, 422, {"error": "invalid_commit_request"})
             return
 
-        trial = self.live_trials.get(request.trial_id)
         now_ms = self._now_ms()
 
-        # Step 3. Atomic slot acquisition.
-        created, state = self.store.acquire_slot(payer, request.trial_id, now_ms=now_ms)
+        # Resolve BEFORE acquiring, and refuse an unresolvable trial before any slot exists. The
+        # ordering is what makes the slot key trustworthy: past this point ``trial`` is not None,
+        # so ``trial.trial_id`` is available for every slot operation and the payer's spelling of
+        # the id is never used as a key.
+        trial = self.live_trials.get(request.trial_id)
+        if trial is None:
+            await self._send_json(send, 404, {"error": "trial_not_found"})
+            return
+
+        # Step 3. Atomic slot acquisition, keyed on the RESOLVED id.
+        #
+        # ``request.trial_id`` is the payer's spelling and MUST NOT key anything. Resolution is
+        # permitted to canonicalize — a case-insensitive filesystem does it today, an alias table
+        # or an id migration could do it tomorrow — and when it does, keying acquisition on the
+        # request while staging, the attempt marker and finalization key on the resolved id leaves
+        # TWO slots for ONE payment. The orphan sits ``in_flight`` with no attempt marker, which
+        # is exactly the state the reconciler is required to release as "provably never reached
+        # settle"; once released, the next retry finds no slot and settles a second time. One
+        # payment, one slot, and the id comes from the trial — not from the request.
+        created, state = self.store.acquire_slot(payer, trial.trial_id, now_ms=now_ms)
         if not created:
             await self._answer_existing_slot(send, state, request=request, trial=trial, payer=payer, now_ms=now_ms)
             return
 
         # Step 4. Validate. Any refusal releases the slot: settlement was never reached, so no
         # payment can exist and holding the slot would lock the payer out of retrying.
-        #
-        # ``handle_commit`` cannot answer with an existing receipt id on this path, and the reason
-        # is structural rather than lucky: it resolves idempotency through the SLOT pointer, and
-        # this call created that slot as ``in_flight`` a moment ago. Only ``_answer_existing_slot``
-        # can see a ``finalized`` slot, which is why the replay answer lives there and not here.
         outcome = handle_commit(request, trial=trial, payer=payer, now_ms=now_ms, store=self.store)
         if outcome.status != 200:
-            self.store.release_slot(payer, request.trial_id)
+            self.store.release_slot(payer, trial.trial_id)
             await self._send_json(send, outcome.status, {"error": outcome.error})
             return
-        if trial is None:
-            # Unreachable: a 200 from handle_commit implies a resolved trial, since it answers 404
-            # for ``None``. Written as a real fail-closed branch rather than an ``assert`` because
-            # an assert is removed under ``-O``, and the money path should not have a guard whose
-            # presence depends on an interpreter flag.
-            self.store.release_slot(payer, request.trial_id)
-            await self._send_json(send, 404, {"error": "trial_not_found"})
+        if outcome.receipt_id is not None:
+            # A finalized record already answers for this commitment, so return the ORIGINAL
+            # receipt and settle nothing.
+            #
+            # With acquisition keyed on the resolved id this should not be reachable: the slot was
+            # created ``in_flight`` a moment ago and ``finalized_for`` consults that same key. It
+            # is honoured rather than assumed anyway. A previous revision argued the branch away
+            # as "structural rather than lucky" and was wrong — the argument rested on
+            # ``get(x).trial_id == x``, a property of the resolver, not of this function. Reading
+            # the answer the validator already computed costs one comparison; discarding it and
+            # falling through to settle is a double charge.
+            self.store.release_slot(payer, trial.trial_id)
+            await self._send_receipt(send, outcome.receipt_id, settled=None)
             return
 
         await self._stage_settle_finalize(send, payload, requirements, request=request, trial=trial, payer=payer)
@@ -821,7 +839,7 @@ class SignalTrialsPaymentASGI:
         state: str,
         *,
         request: CommitRequest,
-        trial: LiveTrial | None,
+        trial: LiveTrial,
         payer: str,
         now_ms: int,
     ) -> None:
@@ -831,6 +849,9 @@ class SignalTrialsPaymentASGI:
         post-quarantine retry unable to double-charge. Each state gets its own code and reason
         so an agent can tell "try again shortly" from "a human has to look at this" from "you
         already committed".
+
+        ``trial`` is non-optional: the caller refuses an unresolvable trial with a 404 before any
+        slot is acquired, so reaching this function at all means the trial resolved.
         """
         if state in INDETERMINATE_STATES:
             # An earlier payment for this slot MAY have settled and there is no way to ask.
@@ -847,7 +868,20 @@ class SignalTrialsPaymentASGI:
         if outcome.status == 200 and outcome.receipt_id is not None:
             await self._send_receipt(send, outcome.receipt_id, settled=None)
             return
-        await self._send_json(send, outcome.status if outcome.status != 200 else 409, {"error": outcome.error})
+        if outcome.status == 200:
+            # The slot reads ``finalized`` but no finalized record answers for it, so
+            # ``finalized_for`` returned None and the validator fell through to its later checks
+            # with nothing to report. Reachable only from an inconsistent store — a partial
+            # restore, or a hand-created slot with no receipt id.
+            #
+            # A NAMED code, never ``outcome.error``, which is None here: the lane's envelope is
+            # ``{"error": "<code>"}`` and agents match on that code, so forwarding null would
+            # publish a response no caller can dispatch on. Still a 409 and still no settle: the
+            # slot says this commitment was already finalized, and an unreadable record is not a
+            # licence to charge again.
+            await self._send_json(send, 409, {"error": "receipt_record_missing"})
+            return
+        await self._send_json(send, outcome.status, {"error": outcome.error})
 
     async def _stage_settle_finalize(
         self,
