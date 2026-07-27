@@ -809,6 +809,90 @@ def test_the_unreadable_row_tolerance_is_SCOPED_to_the_verifier(committed_receip
         store.record(committed_receipt.receipt_id)
 
 
+# --- the THIRD way the parse fails: an integer literal past the digit limit ---
+#
+# ``JSONDecodeError`` and ``RecursionError`` are not the whole set at the read boundary. An integer
+# literal longer than ``sys.get_int_max_str_digits()`` makes ``json.loads`` raise a BARE
+# ``ValueError`` — neither of the two named types. Before the fix it escaped ``_read_json``
+# UNWRAPPED: no artifact name, no ``__cause__``, outside the normalization that method's docstring
+# promises. The end-to-end outcome was nonetheless honest, but only because ``ValueError`` happens
+# to be the type ``verify_receipt`` absorbs — correct behaviour arrived at by coincidence of
+# exception ancestry rather than by enumeration, which is the failure mode this whole remediation
+# exists to eliminate, in its benign form. The tests below split that in two, and the split is the
+# point: the normalization test is a RED, and the two outcome tests are PINS that were already
+# green.
+
+#: Digit counts straddling ``sys.get_int_max_str_digits()``, which is 4300 on this build. 4300 is
+#: the longest literal this interpreter will parse, so 4301 is the smallest row that reproduces it.
+_PAST_DIGIT_LIMIT = [4_301, 20_000]
+
+
+def _giant_int_row_field(store: _TamperableStore, receipt_id: str, *, field: str, digits: int) -> None:
+    """Replace one field of a finalized row with an integer literal ``digits`` long, as raw bytes.
+
+    Raw text for the same reason as :func:`_nested_text`: ``json.dumps`` refuses to serialize such
+    an int at all, so the fixture cannot be built by round-tripping the row through the encoder.
+    """
+    path = Path(store.root) / _FINALIZED_DIRNAME / f"{receipt_id}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop(field, None)
+    head = json.dumps(payload, sort_keys=True)[:-1]
+    store.corrupt(receipt_id, raw=f"{head}, {json.dumps(field)}: {'1' * digits}}}")
+
+
+@pytest.mark.parametrize("digits", _PAST_DIGIT_LIMIT)
+def test_an_integer_past_the_digit_limit_is_NORMALIZED_rather_than_escaping_the_read_raw(
+    committed_receipt, store, digits
+):
+    """The read boundary converts every way the parse can fail, not the two that have a type name.
+
+    This one has no type of its own — CPython raises a plain ``ValueError`` — so a clause naming
+    ``JSONDecodeError`` does not catch it and neither does the one naming ``RecursionError``. It
+    therefore left ``_read_json`` without passing through the conversion at all, carrying CPython's
+    own message and no cause chain, which is a contract this method's docstring did not honour: a
+    caller told to expect "``path`` is unreadable as JSON" got an exception that never named
+    ``path``.
+
+    Asserted on the artifact name and the ``__cause__``, not on the type. The type was already
+    right by accident, and a test that only checked the type would have passed before the fix —
+    which is exactly how the case stayed invisible.
+    """
+    _giant_int_row_field(store, committed_receipt.receipt_id, field="committed_at_ms", digits=digits)
+    with pytest.raises(ValueError, match=r"commit-store artifact .*\.json carries a number") as caught:
+        store.finalized_payload(committed_receipt.receipt_id)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert not isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize("digits", _PAST_DIGIT_LIMIT)
+def test_an_integer_past_the_digit_limit_verifies_as_four_fails(committed_receipt, store, digits):
+    """PIN of behaviour that was ALREADY correct — green before the normalization above and after it.
+
+    Recorded as a pin and not as a red on purpose. The verdict was right the whole time, because the
+    bare ``ValueError`` is caught by the same ``except ValueError`` that absorbs a malformed row. Its
+    value is that it holds the outcome still while the clause above changes what is raised: a
+    normalization that accidentally re-typed this case, or a later clause that let it escape as
+    something the verifier does not absorb, turns this red.
+    """
+    _giant_int_row_field(store, committed_receipt.receipt_id, field="committed_at_ms", digits=digits)
+    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+
+
+async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_an_integer_past_the_digit_limit(
+    committed_receipt, store
+):
+    """PIN, at the public surface. Also already green — see the test above for why that is stated
+    rather than dressed up as a repair."""
+    _giant_int_row_field(store, committed_receipt.receipt_id, field="committed_at_ms", digits=4_301)
+    async with _server_client_for(_verify_app(store)) as client:
+        response = await client.get(_verify_path(committed_receipt.receipt_id))
+    assert response.status_code == 200
+    assert response.json() == {
+        "receipt_id": committed_receipt.receipt_id,
+        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+    }
+
+
 # --- a row that is SYNTACTICALLY valid JSON but nested past the recursion budget ---
 #
 # The previous block's rows are all rejected by the DECODER as malformed. These are not: every row
@@ -1005,6 +1089,78 @@ async def test_the_verify_endpoint_reports_only_THAT_check_failed_for_an_unhasha
         "receipt_id": committed_receipt.receipt_id,
         "checks": _all_pass(**{defeated: "fail"}),
     }
+
+
+def test_a_defeated_rehash_does_not_MASK_a_second_check_that_INDEPENDENTLY_fails(committed_receipt, store, monkeypatch):
+    """An unaffected check observed FAILING on its own merits, alongside a defeated re-hash.
+
+    The discrimination control the attribution tests above cannot supply. Every one of them asserts
+    ``_all_pass(<one>="fail")``, so the three unaffected checks are only ever observed as ``pass`` —
+    an observation equally consistent with those three being re-derived and with them being
+    hard-coded to ``pass`` whenever the guard fires. Neither the parametrisation swap nor the
+    whole-verdict equality closes that: both only ever ask an unaffected check to agree with the
+    clean receipt.
+
+    This row breaks two things by two unrelated causes at once — ``payer`` nested past the
+    serializer, and a ``trial_mode`` that is simply not ``live`` — so exactly two checks must fail
+    and each must be attributed to its own cause. A guard that reported the unaffected checks from
+    a constant rather than from their own evaluation shows ``live_mode: pass`` here and is caught.
+    """
+    intact = store.finalized_payload(committed_receipt.receipt_id)
+    assert intact is not None
+    broken = {**intact, "payer": _nested_value(_NEST_BEYOND_ANY_READER), "trial_mode": "paper"}
+    monkeypatch.setattr(store, "finalized_payload", lambda _receipt_id: broken)
+    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail", live_mode="fail")
+
+
+# --- values the canonical serializer would reject under DIFFERENT flags (the guard's real risk) ---
+#
+# ``_rehash_reproduces`` catches ``RecursionError`` and nothing else, and that is complete only
+# because both canonical serializers keep ``ensure_ascii=True`` and ``allow_nan=True``. Those are
+# DEFAULTS — unwritten at both call sites, and one of them (``veridex/chain/anchor.py``) is in
+# another subsystem whose docstring frames its canonical form purely as a determinism concern.
+# ``ensure_ascii=False`` is the single most common edit made to a canonical-JSON serializer; it is
+# what RFC 8785 specifies. Making it turns a lone surrogate from an escaped ``\ud800`` into a raw
+# one, and the ``.encode("utf-8")`` beside the ``dumps`` then raises ``UnicodeEncodeError``.
+#
+# The rows below are PINS OF PRE-EXISTING BEHAVIOUR, not reds: every one reaches a correct verdict
+# today. They are here to turn red on the edit that would reintroduce the defect, and they cover
+# each flag at each call site — a pin that only exercised one site could not see the other break.
+
+#: ``(field, hostile value, the ONE check that must fail)``. Field chosen so each value reaches
+#: exactly one canonical serializer: ``payer`` and ``payment_tx_hash`` are manifest-only,
+#: ``methodology_version`` and ``p_follow_profitable`` are body-only. So the four rows are the four
+#: (flag x call site) combinations the guard's completeness silently depends on.
+_SERIALIZER_HOSTILE_VALUES = [
+    pytest.param("payer", "\ud800", "manifest", id="lone_surrogate_at_anchor_ensure_ascii"),
+    pytest.param("methodology_version", "\ud800", "body_hash", id="lone_surrogate_at_receipts_ensure_ascii"),
+    pytest.param("payment_tx_hash", float("nan"), "manifest", id="nan_at_anchor_allow_nan"),
+    pytest.param("p_follow_profitable", float("nan"), "body_hash", id="nan_at_receipts_allow_nan"),
+]
+
+
+@pytest.mark.parametrize(("field", "value", "defeated"), _SERIALIZER_HOSTILE_VALUES)
+def test_a_value_the_serializer_would_reject_UNDER_OTHER_FLAGS_still_reaches_a_verdict(
+    committed_receipt, store, field, value, defeated
+):
+    """PIN. Both values survive ``json.loads``, so both can genuinely be on disk, and both re-hash
+    cleanly under the flags in force — the rewritten field fails its own check and nothing else.
+
+    Turns red the moment either call site adopts ``ensure_ascii=False`` or ``allow_nan=False``:
+    the re-derivation then raises out of :func:`_rehash_reproduces`, which catches only
+    ``RecursionError``, and the route answers 500 for a receipt that verification could have
+    reported on honestly. That is a tampering-versus-outage conflation, which is the one confusion
+    this surface cannot afford — so the guard's dependency on those two defaults is pinned here
+    rather than left to a docstring.
+    """
+    store.tamper(committed_receipt.receipt_id, field=field, value=value)
+    reloaded = store.finalized_payload(committed_receipt.receipt_id)
+    assert reloaded is not None
+    # Compared by repr because one of the values is NaN, which is not equal to itself. Asserting
+    # the round trip at all is the point: a pin over a value the write silently normalized away
+    # would be green for the wrong reason.
+    assert repr(reloaded[field]) == repr(value)
+    assert _verdict(committed_receipt, store) == _all_pass(**{defeated: "fail"})
 
 
 def test_an_OSError_from_the_READ_is_not_normalized_into_a_verdict(committed_receipt, store, monkeypatch):

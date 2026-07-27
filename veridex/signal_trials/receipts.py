@@ -260,9 +260,33 @@ def _rehash_reproduces(rehash: Callable[[], str], sealed: object) -> bool:
 
     ``RecursionError`` only. Every other exception is left to propagate, because every other
     exception here would be the service failing rather than the row being unhashable, and reporting
-    that as ``fail`` would tell a holder their receipt is invalid when what broke was the check. A
-    ``TypeError`` from a non-serializable value cannot arise: the payload came out of ``json.loads``,
-    so every value in it is one ``json.dumps`` accepts.
+    that as ``fail`` would tell a holder their receipt is invalid when what broke was the check.
+
+    **Why that is complete, and what it depends on.** ``TypeError`` is not the risk: the payload came
+    out of ``json.loads``, so every value in it has a type ``json.dumps`` accepts. The risk at a
+    canonical ``json.dumps(...).encode("utf-8")`` pair is the ``ValueError`` FAMILY, and the values
+    that trigger it are ones ``json.loads`` produces every day — a lone surrogate (``"\\ud800"``),
+    ``NaN``, an integer past ``sys.get_int_max_str_digits()``, a circular reference. None of them can
+    arise HERE, but not for a reason about the payload's type:
+
+    * **Lone surrogates** are escaped rather than emitted because both serializers keep
+      ``ensure_ascii=True``. Under ``ensure_ascii=False`` the ``dumps`` still succeeds and the
+      ``.encode("utf-8")`` beside it raises ``UnicodeEncodeError``, which IS a ``ValueError``.
+    * **NaN and the infinities** serialize to ``NaN``/``Infinity`` because both keep
+      ``allow_nan=True``. Under ``allow_nan=False`` ``dumps`` raises ``ValueError``.
+    * **Oversized integers** cannot reach here at all: ``loads`` and ``dumps`` share the same digit
+      limit, so a literal that would defeat the encoder already defeated the decoder upstream.
+    * **Circular references** cannot arise from a freshly parsed document.
+
+    So this guard's completeness rests on FOUR unwritten default arguments at TWO call sites —
+    :func:`canonical_body_hash` here, and :func:`~veridex.chain.anchor.run_manifest_hash` in
+    ``veridex/chain/anchor.py``, which is in ANOTHER SUBSYSTEM and frames its canonical form purely
+    as a determinism concern. ``ensure_ascii=False`` is the most common edit made to a canonical-JSON
+    serializer — RFC 8785 specifies it — and making it at either site would raise straight through
+    this guard and answer 500 for a receipt that could have been reported on honestly, which is the
+    tampering-versus-outage conflation this module refuses everywhere else.
+    ``test_a_value_the_serializer_would_reject_UNDER_OTHER_FLAGS_still_reaches_a_verdict`` pins all
+    four combinations, so that edit turns a test red instead of turning a verdict into an outage.
 
     Args:
         rehash: The canonical re-derivation, deferred so the failure is caught rather than raised
@@ -374,21 +398,33 @@ class ReceiptStore:
     def _read_json(path: Path) -> dict[str, Any]:
         """Load ``path`` as a JSON object, failing loudly if it is not one.
 
-        Two ways the parse can fail, and CPython reports them under unrelated exception trees. A
+        THREE ways the parse can fail, and CPython reports them under unrelated exception trees. A
         malformed byte raises ``JSONDecodeError``, which IS a ``ValueError``. A well-formed but
         deeply nested document instead exhausts the recursion budget and raises ``RecursionError``,
         which is a ``RuntimeError`` and shares no ancestor with the first — so a caller written to
         absorb corruption as a ``ValueError`` absorbs the malformed row and is bypassed entirely by
-        the nested one. Both are the same fact about the row: these bytes do not yield a payload.
-        Normalizing here rather than at each caller is what keeps that one fact under one exception,
-        and the ``read_text`` beside the parse is deliberately NOT inside the conversion — an
-        ``OSError`` from the disk is a fact about the SERVICE and must stay distinguishable.
+        the nested one. An integer literal longer than ``sys.get_int_max_str_digits()`` raises a
+        BARE ``ValueError`` with no type of its own, so neither named clause sees it. All three are
+        the same fact about the row: these bytes do not yield a payload. Normalizing here rather
+        than at each caller is what keeps that one fact under one exception, and the ``read_text``
+        beside the parse is deliberately NOT inside the conversion — an ``OSError`` from the disk is
+        a fact about the SERVICE and must stay distinguishable.
+
+        The last clause is ``ValueError`` and not a named type BECAUSE the digit limit has no named
+        type, and it is written as a clause rather than left to the caller deliberately: that case
+        already reached a correct verdict, but only because ``ValueError`` happens to be what
+        :func:`verify_receipt` absorbs — correct by coincidence of exception ancestry rather than by
+        enumeration. Catching it here costs nothing in breadth, since the only statement inside the
+        ``try`` is the parse and every ``ValueError`` out of ``json.loads`` is by construction a
+        statement about the BYTES. Nothing that indicts the service is a ``ValueError``, so
+        ``OSError`` still escapes untouched — ``test_an_OSError_from_the_READ_is_not_normalized_
+        into_a_verdict`` is what holds that line.
 
         Raises:
-            ValueError: ``path`` is unreadable as JSON — malformed, or nested past what this
-                interpreter can decode — or does not hold an object. Corruption is never reported
-                as absence: a slot that reads as "missing" would be a slot that permits a fresh
-                settle.
+            ValueError: ``path`` is unreadable as JSON — malformed, nested past what this
+                interpreter can decode, or carrying a number it refuses to parse — or does not hold
+                an object. Corruption is never reported as absence: a slot that reads as "missing"
+                would be a slot that permits a fresh settle.
         """
         text = path.read_text(encoding="utf-8")
         try:
@@ -397,6 +433,10 @@ class ReceiptStore:
             raise ValueError(f"commit-store artifact {path.name} is not readable JSON") from error
         except RecursionError as error:
             raise ValueError(f"commit-store artifact {path.name} is nested too deeply to parse") from error
+        except ValueError as error:
+            # Ordered last on purpose: ``JSONDecodeError`` is a ``ValueError``, so its clause has to
+            # come first or this one would swallow the malformed case and lose its message.
+            raise ValueError(f"commit-store artifact {path.name} carries a number this reader cannot parse") from error
         if not isinstance(loaded, dict):
             raise ValueError(f"commit-store artifact {path.name} must hold a JSON object")
         return loaded
