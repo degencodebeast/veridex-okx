@@ -366,6 +366,57 @@ def full_pack_qualified_with_brier_ties() -> _OraclePack:
     )
 
 
+#: Every trial in the ACTIVE-COUNT fixture settles profitable-to-follow. That is what lets two
+#: agents reach an IDENTICAL capped markout on DIFFERENT numbers of decisions: every active trial
+#: pays the same capped +500, so the mean is 500 regardless of how many were taken.
+_OUTCOMES_ALL_PROFITABLE: tuple[int, ...] = (1,) * 44
+
+
+@pytest.fixture
+def pack_tied_on_brier_and_markout() -> _OraclePack:
+    """44 trials where two qualified agents tie on Brier AND markout, differing ONLY on active count.
+
+    **This fixture exists because rank term 3 was unpinned in DIRECTION, and no fixture could see
+    it.** A mutant flipping only the sign of ``-row.active_decisions`` SURVIVED the entire 819-test
+    suite, load-proven. It hid because term 3 never decided anything: in ``full_pack_qualified``
+    every qualified row has a distinct Brier, and in ``full_pack_qualified_with_brier_ties`` the
+    Brier tie is broken by markout before term 3 is ever consulted. A mutant without a
+    discriminating fixture only re-reports SURVIVED — it proves the gap rather than closing it.
+
+    The construction, with every quantity exact in binary floating point:
+
+    * every trial settles profitable-to-follow, so EVERY active decision pays a capped ``+500`` and
+      the mean markout is 500 for ANY number of decisions — that is what unties markout from count;
+    * ``zz_active_32`` FOLLOWs at ``p=0.75`` on 32 trials and abstains on 12:
+      ``32*(0.75-1)**2 + 12*0.25 == 32*0.0625 + 3 == 2 + 3 == 5``;
+    * ``aa_active_24`` FOLLOWs at ``p=1.00`` on 24 trials and abstains on 20:
+      ``24*0 + 20*0.25 == 5``.
+
+    Both Brier sums are EXACTLY 5.0 — not approximately — because 0.0625 and 0.25 are exact binary
+    fractions, so the tie cannot drift with summation order. Both clear the gate (active 32 and 24
+    are >= 20; coverage 32/44 and 24/44 are >= 0.50). Term 3 is therefore the ONLY key left that
+    can order them.
+
+    **The names are load-bearing and deliberately anti-alphabetical.** Correct order is
+    ``zz_active_32`` first (more active decisions rank higher). Alphabetically ``aa_`` sorts BEFORE
+    ``zz_``, so the final ``agent_id`` term would produce the WRONG order. That makes the fixture
+    discriminate against BOTH failure modes: flipping term 3's sign, and deleting term 3 entirely
+    so that ``agent_id`` decides. A fixture that only caught the sign flip would be half a pin.
+    """
+    active_high = (0.75,) * 32 + (0.5,) * 12
+    active_low = (1.0,) * 24 + (0.5,) * 20
+    return _build_pack(
+        "season-active-count",
+        "qualified",
+        _OUTCOMES_ALL_PROFITABLE,
+        win_entry=_BIG_WIN_ENTRY,
+        diagnostic_agents=(
+            DiagnosticAgent(agent_id="zz_active_32", probabilities=active_high),
+            DiagnosticAgent(agent_id="aa_active_24", probabilities=active_low),
+        ),
+    )
+
+
 # ==============================================================================================
 # REGION A — THE PLAN'S MANDATED RED BLOCK, VERBATIM (frozen plan lines 639-685).
 # The two import lines belonging to this block are at the top of the file, unmodified.
@@ -822,11 +873,19 @@ def test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_dire
     deviation from frozen plan line 633 — see the DECLARED DEVIATION section of ``scoring``'s module
     docstring for why it stays. It was previously unpinned in BOTH directions, and this closes both.
 
-    **Why nothing else could close them.** Under the frozen thresholds the shipped ordering and the
-    pure frozen ordering COINCIDE on the qualified subsequence, and every existing rank test —
-    including the plan's own mandated ``test_rank_key_is_brier_then_capped_markout`` — filters to
-    qualified rows before looking. So no existing test can see the term at all: not that it is
-    there, and not that it has left the frozen order intact behind it.
+    **DIRECTION 2 is what this test uniquely contributes. DIRECTION 1 is REDUNDANT against this
+    fixture set, and that is recorded rather than left to imply otherwise.** Measured:
+    ``test_rank_key_is_brier_then_capped_markout`` and ``test_rank_order_is_exactly_the_designed_order``
+    already catch the same key-order swap DIRECTION 1 catches, so DIRECTION 1 fires but is not
+    independently load-bearing. It is kept because it states the property where a reader looks for
+    it, not because it closes a gap of its own. **It also does NOT catch the term-3 DIRECTION
+    defect** — that needed its own fixture and pin
+    (``test_active_count_is_the_THIRD_rank_key_and_sorts_DESCENDING``).
+
+    **Why DIRECTION 2 could not be closed by anything existing.** Under the frozen thresholds the
+    shipped ordering and the pure frozen ordering COINCIDE on the qualified subsequence, and every
+    existing rank test — including the plan's own mandated one — filters to qualified rows before
+    looking. So nothing else can see the partition term at all.
     """
     season = score_season(full_pack_qualified)
     shipped = [row.agent_id for row in season.rows]
@@ -867,6 +926,49 @@ def test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_dire
     frozen_order = [row.agent_id for row in sorted(season.rows, key=_frozen_rank_key)]
     assert shipped != frozen_order, "the partition term must be observable somewhere"
     assert [a for a in shipped if rows[a].qualified] == [a for a in frozen_order if rows[a].qualified]
+
+
+def test_active_count_is_the_THIRD_rank_key_and_sorts_DESCENDING(pack_tied_on_brier_and_markout):
+    """PIN (finding B): rank term 3 is ACTIVE COUNT DESCENDING, and its DIRECTION is pinned.
+
+    **This closes a real gap rather than restating a covered one.** A mutant flipping only the sign
+    of ``-row.active_decisions`` SURVIVED the entire 819-test suite at two consecutive heads,
+    load-proven — so it was a genuine SURVIVED, not an inconclusive. No fixture exercised term 3:
+    everywhere else the first two keys had already decided the order before it was reached.
+
+    Three assertions, each closing a different way term 3 can be wrong:
+
+    * the two rows really are tied on keys 1 and 2 (otherwise this test is about something else);
+    * MORE active decisions ranks HIGHER — the direction the frozen rule mandates;
+    * the winner is the alphabetically LATER id, so the result cannot be produced by the
+      ``agent_id`` term standing in for a deleted term 3.
+    """
+    season = score_season(pack_tied_on_brier_and_markout)
+    rows = {row.agent_id: row for row in season.rows}
+    high, low = rows["zz_active_32"], rows["aa_active_24"]
+
+    assert high.qualified is True and low.qualified is True, "both must be RANKED for term 3 to apply"
+
+    # Keys 1 and 2 are EXACTLY tied — asserted with `==`, not approx, because the construction is
+    # exact in binary floating point. If either ever drifts, this test is silently about key 1 or 2.
+    assert high.avg_brier == low.avg_brier, "key 1 (avg Brier) must be exactly tied"
+    assert high.capped_avg_markout_bps == low.capped_avg_markout_bps, "key 2 (markout) must be tied"
+    assert high.avg_brier == pytest.approx(5 / 44)
+    assert high.capped_avg_markout_bps == 500
+
+    # Key 3 differs, and it is the only thing left that can order them.
+    assert high.active_decisions == 32
+    assert low.active_decisions == 24
+
+    ranked = [row.agent_id for row in season.rows if row.qualified]
+    assert ranked.index("zz_active_32") < ranked.index("aa_active_24"), (
+        "MORE active decisions must rank HIGHER: term 3 is DESCENDING"
+    )
+    assert ranked.index("aa_active_24") == ranked.index("zz_active_32") + 1, "the tied pair ranks adjacently"
+
+    # DISCRIMINATION against term-3 DELETION, not just sign inversion: the correct winner is the
+    # alphabetically LATER id, so a key that fell through to `agent_id` would order them backwards.
+    assert "zz_active_32" > "aa_active_24", "the fixture's names are deliberately anti-alphabetical"
 
 
 def test_markout_breaks_a_brier_tie_before_active_count(full_pack_qualified_with_brier_ties):
