@@ -3296,8 +3296,16 @@ async def test_a_SLASH_BEARING_id_never_reaches_this_route_and_still_does_not_ec
     The attribution matters and an earlier version of this docstring got it wrong, blaming the client.
     Saying "the client did it" implies no client could ever reach this boundary, when the real
     mechanism is server-side path normalization — which is security-relevant precisely because
-    proxies and servers DIFFER in whether they decode ``%2F`` before routing. A deployment fronted by
-    something that does not normalize would route this to the handler instead.
+    proxies and servers differ in whether they decode ``%2F`` before routing. **Here the deciding
+    party is the ASGI server**: uvicorn unquotes ``raw_path`` into ``scope["path"]``
+    (``h11_impl.py:202``, ``httptools_impl.py:260``) and Starlette matches on that and never on
+    ``raw_path``, so a slash-bearing id cannot reach this handler however the deployment is fronted —
+    only a RE-ENCODING front, or an ASGI layer that routes on ``raw_path``, would change that.
+
+    A previous version of this paragraph said the opposite: that a front which does NOT normalize
+    would deliver the id to the handler. That is inverted. A non-normalizing proxy forwards ``%2F``
+    intact, uvicorn then unquotes it into extra path segments, and no route matches — which is exactly
+    why the ONE form that does reach the handler is the double-encoded ``%252F`` used above.
 
     That is worth pinning for two reasons. The SECURITY property still holds — the framework's 404
     does not echo the caller's bytes either, which is the claim AC3 actually makes — but a frontend
