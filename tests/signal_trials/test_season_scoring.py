@@ -234,18 +234,25 @@ def _t0_for(position: int) -> int:
     return (position + 2) * _BAR_MS
 
 
-def _candles(trial_count: int) -> CandleSeries:
-    """A confirmed, gapless series covering every trial's ext lookback and settlement bar."""
+def _candles(trial_count: int, closes: tuple[float, ...] | None = None) -> CandleSeries:
+    """A confirmed, gapless series covering every trial's ext lookback and settlement bar.
+
+    ``closes`` supplies a per-candle close so a fixture can make ``ext`` VARY across trials. The
+    default flat series holds ``ext`` at 0 everywhere, which is what every fixture but
+    ``pack_ext_varies_by_trial`` wants — a constant ``ext`` keeps the ext-dependent contestants on
+    a fixed probability so the other pins can reason about them.
+    """
+    prices = closes if closes is not None else (_CLOSE,) * (trial_count + 2)
     return CandleSeries(
         bar=_BAR,
         bar_ms=_BAR_MS,
         candles=tuple(
             Candle(
                 ts_open_ms=index * _BAR_MS,
-                open=_CLOSE,
-                high=_CLOSE,
-                low=_CLOSE,
-                close=_CLOSE,
+                open=prices[index],
+                high=prices[index],
+                low=prices[index],
+                close=prices[index],
                 vol=1.0,
                 vol_usd=100.0,
                 confirmed=True,
@@ -279,17 +286,29 @@ def _build_pack(
     loss_entry: float = _LOSS_ENTRY,
     unsettled_positions: frozenset[int] = frozenset(),
     diagnostic_agents: tuple[DiagnosticAgent, ...] = (),
+    closes: tuple[float, ...] | None = None,
 ) -> _OraclePack:
     """Assemble a synthetic pack whose settled outcomes are exactly ``outcomes``.
 
-    Each trial's entry price is chosen from the declared outcome: ``win_entry`` for a 1 and
-    ``loss_entry`` for a 0. Trials at ``unsettled_positions`` are pointed at a token with no
-    settlement series, which is what makes them UNSCORED.
+    With a flat price series each trial's entry comes from the declared outcome: ``win_entry`` for
+    a 1 and ``loss_entry`` for a 0. Trials at ``unsettled_positions`` are pointed at a token with
+    no settlement series, which is what makes them UNSCORED.
+
+    When ``closes`` supplies a RISING series the fixed entries would no longer produce the declared
+    outcomes, so each entry is derived from that trial's own settlement close instead —
+    ``close * 0.99`` for a declared 1 and ``close * 1.01`` for a 0. Those factors give gross moves
+    of +101 and -99 bps at EVERY price level, so the oracle holds however far the series has run.
     """
+    def _entry(position: int, outcome: int) -> float:
+        if closes is None:
+            return win_entry if outcome == 1 else loss_entry
+        # Trial ``position`` settles against the candle at ``position + 2``.
+        return closes[position + 2] * (0.99 if outcome == 1 else 1.01)
+
     trials = tuple(
         _signal(
             _t0_for(position),
-            win_entry if outcome == 1 else loss_entry,
+            _entry(position, outcome),
             token=_UNSETTLED_TOKEN if position in unsettled_positions else _TOKEN,
         )
         for position, outcome in enumerate(outcomes)
@@ -298,7 +317,7 @@ def _build_pack(
         ref=PackRef(dir=Path("/nonexistent/fixture") / season_id, content_hash="0" * 64),
         meta=_meta(season_id, season_status),
         trials=trials,
-        settlement={_TOKEN: _candles(len(outcomes))},
+        settlement={_TOKEN: _candles(len(outcomes), closes)},
         diagnostic_agents=diagnostic_agents,
         outcomes=outcomes,
     )
@@ -374,6 +393,49 @@ def full_pack_qualified_with_brier_ties() -> _OraclePack:
 #: agents reach an IDENTICAL capped markout on DIFFERENT numbers of decisions: every active trial
 #: pays the same capped +500, so the mean is 500 regardless of how many were taken.
 _OUTCOMES_ALL_PROFITABLE: tuple[int, ...] = (1,) * 44
+
+
+#: A +50% step every OTHER candle. ``compute_ext`` compares the close at ``t0`` against the close
+#: one hour earlier, and those two land on consecutive candles here, so the step makes ``ext``
+#: alternate 0,1,0,1,… across trials instead of sitting at 0 everywhere.
+_RISING_CLOSES: tuple[float, ...] = tuple(100.0 * (1.5 ** (index // 2)) for index in range(46))
+
+#: The ext each trial is CONSTRUCTED to see, declared rather than derived from the code under test.
+#: ``test_scorer_feeds_each_trial_its_OWN_ext`` verifies this against ``compute_ext`` before using
+#: it, so it is a checked property of the fixture and not an assumption about it.
+_EXT_ALTERNATING: tuple[int, ...] = tuple(0 if position % 2 == 0 else 1 for position in range(44))
+
+
+@pytest.fixture
+def pack_ext_varies_by_trial() -> _OraclePack:
+    """44 trials on a RISING price series, so each trial's correct ``ext`` differs from its neighbour.
+
+    **This fixture exists because every other fixture in this module supplies ``ext == 0`` on every
+    trial, and that made the scorer's per-trial ``ext`` wiring untestable.** §5.3 makes ``ext`` a
+    load-bearing input to CrowdingFader and SelectiveCalibrator. H3.3 tests ``compute_ext`` and both
+    formulas in isolation, and this module tested them by calling all three DIRECTLY — never through
+    ``score_season``. The function was right, the formulas were right, and the WIRING BETWEEN THEM
+    was unpinned.
+
+    Measured on the unmodified head: forcing ``ext = 1`` on a single trial inside ``_settle``, after
+    the real ``compute_ext`` call, moved ``crowding_fader``'s Brier from 0.3905090909090909 to
+    0.39723636363636367 and ``selective_calibrator``'s from 0.20552499999999999 to
+    0.20777499999999993 — the PRIMARY RANK METRIC — while the whole suite stayed green at 825.
+
+    A flat price series cannot see that: with ``ext`` constant, the two contestants emit a constant
+    probability and their Brier is invariant to WHICH trial got which ``ext``. The rising series
+    makes ``ext`` alternate, so the two contestants take DIFFERENT probabilities on adjacent trials
+    and any mis-wiring changes their scores.
+
+    Entries are derived from each trial's own settlement close (see ``_build_pack``), so the
+    declared outcome oracle holds unchanged however far the price has run.
+    """
+    return _build_pack(
+        "season-ext",
+        "qualified",
+        _OUTCOMES_QUALIFIED,
+        closes=_RISING_CLOSES,
+    )
 
 
 @pytest.fixture
@@ -557,6 +619,58 @@ def test_fixture_contestant_probabilities_are_as_designed(full_pack_qualified):
     assert 0.40 < _EXPECTED_SELECTIVE_CALIBRATOR_P < 0.60
 
 
+def test_scorer_feeds_each_trial_its_OWN_ext(pack_ext_varies_by_trial):
+    """PIN (CODEX R2 MAJOR): the scorer feeds each contestant the ``ext`` of THAT trial.
+
+    **Observed THROUGH ``score_season``, not around it.** The pre-existing check called
+    ``compute_ext`` and the contestant formulas directly, so it could confirm the function and the
+    formulas while saying nothing about the wiring between them — and every fixture supplied
+    ``ext == 0`` everywhere, so no datum could have made a wiring error visible anyway.
+
+    Structure of the comparison, which keeps the two sides independent:
+      * the DECLARED ext vector is verified against ``compute_ext`` over the fixture's own candles,
+        so the expectation is a checked property of the fixture rather than an assumption;
+      * the EXPECTED Brier is then computed from that declared vector through the frozen §5.3
+        formulas;
+      * the ACTUAL Brier comes out of ``score_season``, which derived its own ``ext`` internally.
+    Feed a trial the wrong ``ext`` and the two diverge.
+    """
+    from veridex.signal_trials.contestants import compute_ext, crowding_fader, selective_calibrator
+
+    pack = pack_ext_varies_by_trial
+    trials = sorted(pack.trials, key=lambda trial: trial.t0_ms)
+    series = pack.settlement[_TOKEN]
+
+    # The fixture really does vary ext, and the declared vector really is what compute_ext sees.
+    derived = [compute_ext(series, trial.t0_ms) for trial in trials]
+    assert derived == list(_EXT_ALTERNATING), "the fixture's construction must produce the declared ext"
+    assert derived.count(0) == 22 and derived.count(1) == 22, "BOTH ext values must be present"
+
+    season = score_season(pack)
+    for agent_id, formula in (("crowding_fader", crowding_fader), ("selective_calibrator", selective_calibrator)):
+        expected = sum(
+            (formula(signal, ext) - outcome) ** 2
+            for signal, ext, outcome in zip(trials, _EXT_ALTERNATING, pack.outcomes, strict=True)
+        ) / len(pack.outcomes)
+        row = next(r for r in season.rows if r.agent_id == agent_id)
+        assert row.avg_brier == pytest.approx(expected), (
+            f"{agent_id}'s season Brier does not match the frozen formula evaluated on each trial's "
+            f"OWN ext; the scorer is feeding some trial the wrong ext"
+        )
+
+    # DISCRIMINATION: the assertion above must be capable of failing. Evaluating the same formulas
+    # against the INVERTED ext vector — the cheapest possible wiring error — gives a different
+    # number, so agreement above is evidence rather than arithmetic that could not have differed.
+    inverted = tuple(1 - ext for ext in _EXT_ALTERNATING)
+    for agent_id, formula in (("crowding_fader", crowding_fader), ("selective_calibrator", selective_calibrator)):
+        wrong = sum(
+            (formula(signal, ext) - outcome) ** 2
+            for signal, ext, outcome in zip(trials, inverted, pack.outcomes, strict=True)
+        ) / len(pack.outcomes)
+        row = next(r for r in season.rows if r.agent_id == agent_id)
+        assert row.avg_brier != pytest.approx(wrong), f"{agent_id} cannot distinguish the ext vector"
+
+
 def test_scorer_derived_outcome_COUNTS_match_the_declared_oracle(full_pack_qualified):
     """PIN: the scorer derives the right NUMBER of profitable and unprofitable trials.
 
@@ -615,11 +729,27 @@ def test_each_outcome_is_joined_to_ITS_OWN_signal_not_merely_counted(pack_signal
         "than the one it was derived from"
     )
 
-    # DISCRIMINATION, stated as arithmetic rather than run as a mutation: transposing any two
-    # positions with OPPOSITE outcomes makes the witness wrong at both, so its Brier becomes
-    # 2/44 — a value this assertion rejects. Positions 1 and 7 are such a pair in this oracle.
+    # DISCRIMINATION, RUN rather than asserted as arithmetic. An earlier version of this block
+    # ended with `assert 2 / len(_OUTCOMES_QUALIFIED) != 0.0`, which is true of the integer 2 and
+    # says nothing about the scorer — a tautology, and the only one in this file.
+    #
+    # The real check: build a pack whose SETTLEMENT is constructed from a transposed oracle, and
+    # score the witness vector derived from the ORIGINAL oracle against it. The witness is then
+    # confidently wrong at exactly the two transposed positions, so its Brier is exactly 2/44 —
+    # the value the `== 0.0` assertion above rejects, produced by the scorer rather than by hand.
     assert _OUTCOMES_QUALIFIED[1] != _OUTCOMES_QUALIFIED[7], "the fixture must contain such a pair"
-    assert 2 / len(_OUTCOMES_QUALIFIED) != 0.0
+    transposed = list(_OUTCOMES_QUALIFIED)
+    transposed[1], transposed[7] = transposed[7], transposed[1]
+    original_witness = tuple(1.0 if outcome == 1 else 0.0 for outcome in _OUTCOMES_QUALIFIED)
+    mismatched = _build_pack(
+        "season-join-transposed",
+        "qualified",
+        tuple(transposed),
+        diagnostic_agents=(DiagnosticAgent(agent_id="join_witness", probabilities=original_witness),),
+    )
+    stale = next(r for r in score_season(mismatched).rows if r.agent_id == "join_witness")
+    assert stale.avg_brier == pytest.approx(2 / len(_OUTCOMES_QUALIFIED))
+    assert stale.avg_brier != witness.avg_brier, "the two must be distinguishable, which is the point"
 
 
 # --- B2. The C52 DISCRIMINATION control Region A is missing.
@@ -993,6 +1123,7 @@ def _frozen_rank_key(row):
         "full_pack_qualified_with_brier_ties",
         "pack_tied_on_brier_and_markout",
         "pack_signal_join_observable",
+        "pack_ext_varies_by_trial",
     ],
 )
 def test_the_frozen_four_term_ordering_holds_within_the_qualified_set(fixture_name, request):
