@@ -3232,9 +3232,10 @@ async def test_a_known_trial_with_no_finalized_commitments_is_200_AND_AN_EMPTY_A
     ("requested", "marker"),
     [
         pytest.param("trial_h43_never_opened", "never_opened", id="unknown"),
-        # DOUBLE-encoded on purpose. A single `%2F` is decoded by the CLIENT before the request is
-        # sent, so `..%2F..%2Fsecrets` becomes three extra path segments and never reaches this
-        # route at all — see the companion test below. `%252F` keeps the traversal attempt inside
+        # DOUBLE-encoded on purpose. A single `%2F` survives on the wire — `raw_path` keeps it — and
+        # is decoded SERVER-SIDE when ASGI builds `scope["path"]`, which is what Starlette routes on.
+        # So `..%2F..%2Fsecrets` becomes extra path segments during normalization and never reaches
+        # this route at all — see the companion test below. `%252F` keeps the traversal attempt inside
         # ONE segment, which is the only form that actually exercises this handler's refusal.
         pytest.param("..%252F..%252Fsecrets", "secrets", id="traversal"),
         # Slash-free for the same reason: the closing `</script>` carried a `%2F`.
@@ -3253,8 +3254,18 @@ async def test_an_unknown_or_malformed_trial_id_is_the_existing_NON_ECHOING_404(
     into a second field or a header-shaped envelope fails here rather than passing on the JSON.
 
     Driven through the REAL :class:`~veridex.signal_trials.live.LiveTrialRepository` rather than the
-    test double, because the malformed cases are refused by ITS traversal guard: a double that
-    answered ``None`` for every unknown id would report these as 404 without the guard existing.
+    test double for REALISM ONLY. **This test does not exercise the traversal guard, and an earlier
+    version of this docstring claimed it did.** Measured: ``_trial_path`` raises only for an empty id
+    or one containing a separator or equal to ``.``/``..``, and after a single decode none of these
+    three payloads contains a separator — so all three are refused by ordinary FILE ABSENCE, exactly
+    as the double would have refused them.
+
+    It is stronger than that, and worth stating so nobody re-adds the claim: through this route the
+    guard is UNOBSERVABLE. ``repo.get()`` catches the guard's ``ValueError`` and answers ``None``,
+    which is the same answer it gives for a merely absent trial, so both arrive here as one 404. A
+    test asserting through this route cannot distinguish guard-refusal from absence at all. Covering
+    the guard needs a unit test against ``_trial_path``, not a request.
+
     The published trial in the same client is the ACCEPTANCE CONTROL — it proves this route can
     answer 200 at all, so the 404s are a statement about the ids and not about a route that is
     permanently absent or permanently refusing.
@@ -3276,10 +3287,17 @@ async def test_an_unknown_or_malformed_trial_id_is_the_existing_NON_ECHOING_404(
 async def test_a_SLASH_BEARING_id_never_reaches_this_route_and_still_does_not_echo(tmp_path: Path) -> None:
     """AC3, the boundary the parametrized test above CANNOT reach, recorded rather than hidden.
 
-    A single ``%2F`` is decoded by the CLIENT before the request leaves it, so
-    ``..%2F..%2Fsecrets`` is sent as three additional path segments and matches no route at all. The
-    refusal therefore comes from the FRAMEWORK, not from this handler, and its body is a different
-    shape: ``{"detail": "Not Found"}`` rather than ``{"error": "trial_not_found"}``.
+    A single ``%2F`` is NOT decoded by the client — ``raw_path`` carries it intact onto the wire. It
+    is decoded SERVER-SIDE, when ASGI constructs ``scope["path"]``, and Starlette routes on that
+    normalized value: ``..%2F..%2Fsecrets`` becomes additional path segments and matches no route at
+    all. The refusal therefore comes from the FRAMEWORK, not from this handler, and its body is a
+    different shape: ``{"detail": "Not Found"}`` rather than ``{"error": "trial_not_found"}``.
+
+    The attribution matters and an earlier version of this docstring got it wrong, blaming the client.
+    Saying "the client did it" implies no client could ever reach this boundary, when the real
+    mechanism is server-side path normalization — which is security-relevant precisely because
+    proxies and servers DIFFER in whether they decode ``%2F`` before routing. A deployment fronted by
+    something that does not normalize would route this to the handler instead.
 
     That is worth pinning for two reasons. The SECURITY property still holds — the framework's 404
     does not echo the caller's bytes either, which is the claim AC3 actually makes — but a frontend
@@ -3463,6 +3481,17 @@ async def test_an_ABSENT_store_refuses_rather_than_claiming_that_nobody_committe
     assert absent.json() == {"error": "participant_store_unavailable"}
     assert mounted.status_code == 200
     assert mounted.json() == []
+
+    # The CHECK ORDER is load-bearing and was unpinned until the SPEC reviewer asked for it. An
+    # UNKNOWN trial on a store-less deployment must still answer 404, because "this trial does not
+    # exist" is the more specific true statement and 503 would blame the wrong precondition. Hoisting
+    # the store check above the trial check would silently flip every such request from 404 to 503,
+    # and nothing else here would notice: the assertions above only ask about a KNOWN trial, and the
+    # AC3 tests always mount a store.
+    async with _client(_app(store=None, live_trials=_OneTrialRepo(trial))) as client:
+        unknown_and_storeless = await client.get(_receipts_path("trial_that_was_never_opened"))
+    assert unknown_and_storeless.status_code == 404
+    assert unknown_and_storeless.json() == {"error": "trial_not_found"}
 
 
 async def test_a_CORRUPT_finalized_row_FAILS_the_request_instead_of_shrinking_the_participant_set(
