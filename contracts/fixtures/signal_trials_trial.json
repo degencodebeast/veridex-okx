@@ -1,0 +1,26 @@
+{
+  "trial_id": "trial-0k9f2c",
+  "trial_mode": "live",
+  "t0_ms": 1700000000000,
+  "commit_deadline_ms": 1700000300000,
+  "evidence": {
+    "symbol": "AAA",
+    "chain_index": "501",
+    "market_cap_usd": 1234567.5,
+    "holders": 842,
+    "trigger_price": 0.0041732,
+    "amount_usd": 25000.0
+  },
+  "evidence_hash": "3f1c8a5e0b47d29c6ea1b3f85d0c47921e6ab8d35c0f4172e9b6d84a3c15f072",
+  "outcome": {
+    "trial_id": "trial-0k9f2c",
+    "status": "settled",
+    "entry": 0.0041732,
+    "future": 0.0041904,
+    "close_ts_ms": 1700000360000,
+    "observation_lag_ms": 60000,
+    "follow_markout_bps": 41,
+    "fade_markout_bps": -41,
+    "follow_profitable": true
+  }
+}
