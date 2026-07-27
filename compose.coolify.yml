@@ -43,6 +43,28 @@ services:
       # WAL_DIR reconciles with the wal-spool mount below AND Dockerfile.api's ENV default (/data/wal)
       # so the I-4 WAL writes to a DURABLE volume, never the ephemeral container layer (AC-13).
       WAL_DIR: ${WAL_DIR:-/data/wal}
+      # --- signal-trials / x402 (added after the Gate A readiness audit found NONE of this wired) ---
+      # SIGNAL_TRIALS_DATA_DIR reconciles with the signal-trials-data mount below. WITHOUT THAT
+      # VOLUME A REDEPLOY DISCARDS THE PUBLISHED SEASON AND EVERY RECEIPT — the same durability
+      # argument wal-spool and replay-capture already carry, applied to the newest data root.
+      SIGNAL_TRIALS_DATA_DIR: ${SIGNAL_TRIALS_DATA_DIR:-/var/lib/veridex/signal-trials}
+      # OKX credentials are `:-` and NOT `:?` ON PURPOSE. The app has a TESTED graceful path for
+      # absent credentials — run_preflight raises MissingCredentialError and exits with a status a
+      # shell can read — and a fail-closed compose guard would replace that tested behaviour with a
+      # stack that refuses to start. Plumb them through; let the application's own contract decide.
+      # VALUES ARE OPERATOR-SUPPLIED. Nothing here bakes a secret.
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
+      # ONE OPERATOR INPUT, TWO CONSUMER NAMES. veridex/api/server.py:291 reads OKX_SECRET while
+      # scripts/signal_trials/run_preflight.py reads OKX_SECRET_KEY — a genuine divergence the Gate A
+      # audit found. Resolving it in CODE would mean editing a payments-lane file that is mid-review,
+      # so it is bridged here instead: the operator sets OKX_SECRET_KEY once and both consumers see
+      # it. THIS IS A BRIDGE, NOT THE FIX — the lane should converge on one name, and this comment
+      # should be deleted when it does.
+      OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
+      OKX_SECRET: ${OKX_SECRET_KEY:-}
+      X402_FACILITATOR_URL: ${X402_FACILITATOR_URL:-}
+      X402_PAY_TO_ADDRESS: ${X402_PAY_TO_ADDRESS:-}
       # Seed-pack catalog the /readyz ReplayPack check + demo/backtest surfaces resolve. The leaf dir
       # name IS the pack_id, so the demo_pack_real leaf catalogs as pack_id="demo_pack_real" — the id the
       # F1 Official-Replay-League seed's phase-1 assert_pack requires (kept in sync with Dockerfile.api).
@@ -56,6 +78,11 @@ services:
       - wal-spool:/data/wal
       # Writable ReplayPack capture root (R-0b/R-2) — live captures must survive redeploys.
       - replay-capture:/var/lib/veridex/replay-packs/capture
+      # Published season + receipt store. Reconciles with SIGNAL_TRIALS_DATA_DIR above. This is the
+      # ONLY durable record that a trial was opened, paid for and settled — a receipt whose store is
+      # gone cannot be verified by anyone, so losing it on redeploy would silently void the Fair-Play
+      # claim rather than break anything visibly.
+      - signal-trials-data:/var/lib/veridex/signal-trials
       # Seed packs — READ-ONLY. Bind-mounts the I-10 pinned demo pack locally; the operator repoints this
       # source at the provisioned pack directory in production. The mount-target LEAF is demo_pack_real so
       # the catalog derives pack_id="demo_pack_real" (matches Dockerfile.api's bake + the F1 seed pin).
@@ -126,3 +153,5 @@ volumes:
   wal-spool:
   # Writable ReplayPack capture root (R-0b/R-2).
   replay-capture:
+  # Signal-trials published season + receipt store (SIGNAL_TRIALS_DATA_DIR).
+  signal-trials-data:

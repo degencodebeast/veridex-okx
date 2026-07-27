@@ -8,13 +8,21 @@ FROM python:3.11-slim AS base
 WORKDIR /app
 
 # Install the package with the extras the serving import path needs:
-#   api      — FastAPI + uvicorn + PyJWT[crypto] (the Privy ES256 auth boundary the app imports)
-#   postgres — psycopg[binary] + psycopg-pool (the durable pooled PostgresStore)
-#   live     — httpx (the live TxLINE/venue async HTTP the router imports)
+#   api           — FastAPI + uvicorn + PyJWT[crypto] (the Privy ES256 auth boundary the app imports)
+#   postgres      — psycopg[binary] + psycopg-pool (the durable pooled PostgresStore)
+#   live          — httpx (the live TxLINE/venue async HTTP the router imports)
+#   signal-trials — okxweb3-app-x402 + httpx + websockets. THE PAID COMMIT PATH.
+#
+# signal-trials was ADDED after the Gate A readiness audit found the API image could not import
+# okxweb3-app-x402 at all: the dependency lives ONLY behind this extra (pyproject.toml
+# `signal-trials = ["okxweb3-app-x402==0.1.1", ...]`), and this list omitted it. Every test in the
+# suite passes in a venv that HAS the extra, so nothing in the review chain could surface it — a
+# test suite validates the SOURCE TREE and only a build validates the IMAGE. If the x402 middleware
+# import ever starts failing in a deployed container, check this line first.
 COPY pyproject.toml ./
 COPY veridex ./veridex
 COPY veridex_agent ./veridex_agent
-RUN pip install --no-cache-dir ".[api,postgres,live,agent]"
+RUN pip install --no-cache-dir ".[api,postgres,live,agent,signal-trials]"
 
 # R-2 — bake the pinned, GENUINE seed pack (demo_pack_real: the verified WC /odds/updates backfill)
 # into the image so the ReplayPack catalog is SELF-CONTAINED: a bare `docker run` (no compose
@@ -46,6 +54,16 @@ COPY scripts/seed_official_replay_league.py /opt/veridex/scripts/
 # sealed artifacts resolve under /app/scripts/txline_live/cp1/. Task 2 verifies this empirically.
 COPY scripts/txline_live/cp1/maker-arena-result.json /app/scripts/txline_live/cp1/maker-arena-result.json
 COPY scripts/txline_live/cp1/fixtures.json /app/scripts/txline_live/cp1/fixtures.json
+
+# H6 OPERATOR ENTRY POINTS. run_preflight.py, open_live_trial.py and settle_live_trials.py are the
+# commands an operator runs INSIDE the deployed container to select a season, open a live trial and
+# settle outcomes. They were absent from this image entirely — the Gate A audit found H6 had no way
+# to execute its own frozen steps against production. Copied as a DIRECTORY so a script added by a
+# later task ships without another Dockerfile edit; that is deliberate, because the alternative is a
+# per-file list that goes stale silently the way the web image's commented-out public/ COPY did.
+# Importing these modules has no side effects (all work sits under a __main__ guard), so the layer is
+# inert until an operator invokes one.
+COPY scripts/signal_trials /app/scripts/signal_trials
 
 # Network binding (overridable). The process is the isolation boundary, so bind all interfaces.
 ENV HOST=0.0.0.0 \
