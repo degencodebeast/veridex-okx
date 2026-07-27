@@ -56,6 +56,8 @@ a fixture attribute and no behaviour.
 from __future__ import annotations
 
 import json
+import re
+import socket
 from dataclasses import dataclass, fields, replace
 from importlib import util as importlib_util
 from pathlib import Path
@@ -1684,3 +1686,310 @@ def test_a_settlement_is_recomputable_from_the_finalized_commit_and_the_recorded
     store.record_settlement(recomputed)
     assert store.settlement(record.receipt_id) == recomputed
     assert isinstance(recomputed, ParticipantSettlement)
+
+
+# ==================================================================================================
+# QUALITY F2 — the operator script's controls are WIRED, not merely present.
+#
+# ``settle_live_trials.py`` is +337 lines on the operator path, and before this block the only thing
+# any test in this repository touched was the pure predicate ``series_covers_settlement``. Four
+# mutants of the script therefore survived the whole 856-test suite: the coverage gate deleted from
+# ``_record_one``, ``redact()`` deleted from the failure path, ``return 2`` on a missing credential
+# softened to ``return 0``, and ``_eligible``'s horizon-and-terminal filtering deleted.
+#
+# A GUARD THAT IS TESTED BUT NOT WIRED IS NOT A GUARD, and this program has already written that
+# lesson down — about the SISTER script, at ``test_preflight.py:2158``, where deleting the
+# ``redact()`` call at ``run_preflight.py:218`` left 463 tests green. ``settle_live_trials.py:33-38``
+# declares its own ``redact`` and credential reader a deliberate LOCAL COPY of that script's,
+# "noted here so a change to the credential contract is known to have two sites". The copy was made
+# and the pin was not. Both sites carry one now.
+#
+# GATE A — no test below can reach a live endpoint, and this is enforced three ways rather than
+# assumed: ``httpx.AsyncClient`` and ``OKXMarketClient`` are both replaced in the module namespace,
+# ``socket.socket.connect``/``connect_ex`` are tripwires, and every credential is a SENTINEL string
+# that no exchange issued. The tripwire derives from ``BaseException`` deliberately — ``main()``
+# wraps the entire run in ``except Exception``, so a tripwire raising an ordinary exception would be
+# CAUGHT BY THE CODE IT GUARDS and rendered as a tidy "settlement FAILED": the safety mechanism
+# fires and the suite stays green. ``test_preflight.py:2094`` records that as a measurement, not a
+# worry, and it is the same handler shape here.
+# ==================================================================================================
+
+
+class _LiveConnectionAttempted(BaseException):
+    """Raised if anything in these tests tries to open a real connection. See GATE A above."""
+
+
+def _refuse_connection(*args: object, **kwargs: object) -> None:
+    raise _LiveConnectionAttempted("TRIPWIRE: a test attempted a real network connection")
+
+
+class _NoNetworkAsyncClient:
+    """Stands in for ``httpx.AsyncClient`` so the script's ``async with`` has something to hold.
+
+    It carries no ``request`` method at all, so a run that routed a call through the transport
+    instead of through the stubbed market client fails with ``AttributeError`` here rather than
+    reaching an endpoint.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    async def __aenter__(self) -> _NoNetworkAsyncClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+class _StubMarketClient:
+    """Serves one prepared series for every trial, and records what it was asked for.
+
+    The call log is what makes the "nothing was written" assertions non-vacuous: without it, a run
+    that never reached the fetch at all would satisfy them for entirely the wrong reason.
+    """
+
+    def __init__(self, series: CandleSeries) -> None:
+        self._series = series
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def get_candles(self, chain_index: str, token: str, bar: str, *, limit: int = 100) -> CandleSeries:
+        self.calls.append((chain_index, token, bar))
+        return self._series
+
+
+def _set_sentinel_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Credentials that are self-evidently not credentials, and are greppable if one ever escapes."""
+    monkeypatch.setenv("OKX_API_KEY", "SENTINEL-KEY-DO-NOT-LEAK")
+    monkeypatch.setenv("OKX_SECRET_KEY", "SENTINEL-SECRET-DO-NOT-LEAK")
+    monkeypatch.setenv("OKX_PASSPHRASE", "SENTINEL-PASS-DO-NOT-LEAK")
+
+
+@pytest.fixture
+def settle_operator(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The settle script loaded BY PATH with every network seam closed and the credential env cleared.
+
+    Cleared rather than left alone so an operator's real environment cannot leak into a test run,
+    and so the credential-abort test asserts against a known-empty environment.
+    """
+    module = _settle_script()
+    monkeypatch.setattr(module.httpx, "AsyncClient", _NoNetworkAsyncClient)
+    monkeypatch.setattr(socket.socket, "connect", _refuse_connection)
+    monkeypatch.setattr(socket.socket, "connect_ex", _refuse_connection)
+    for name in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE", "OKX_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    return module
+
+
+def _covering_series() -> CandleSeries:
+    """A well-formed fetch that STRADDLES the settlement window and still holds no eligible candle.
+
+    Confirmed closes at ``T - bar`` and ``T + bar``: the first proves the fetch reached back past
+    the window, the second that it reached forward past it, and neither lands inside ``[T, T + bar)``.
+    This is the genuine absence §12 reserves UNSCORED for — an illiquid token with no trades in that
+    minute — as opposed to a fetch that simply did not answer the question.
+    """
+    return CandleSeries(
+        bar="1m", bar_ms=60_000, candles=tuple(_candle(ts_open_ms=T + o - 60_000) for o in (-60_000, 60_000))
+    )
+
+
+@pytest.mark.parametrize(
+    ("series_factory", "expected_status", "expected_recorded", "expected_on_disk"),
+    [
+        (_empty_series, "coverage_gap", False, None),
+        (_covering_series, "UNSCORED", True, "UNSCORED"),
+    ],
+    ids=["unproven-fetch-records-NOTHING", "proven-gap-records-UNSCORED"],
+)
+def test_the_coverage_gate_is_WIRED_into_the_write_path(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    series_factory: Any,
+    expected_status: str,
+    expected_recorded: bool,
+    expected_on_disk: str | None,
+) -> None:
+    """The script's headline safety property, asserted where it is DECIDED rather than where it is computed.
+
+    The module docstring's strongest claim is that "the one thing this script must never do is
+    manufacture an UNSCORED", and ``series_covers_settlement`` is what enforces it. That predicate
+    has three direct tests above; its WIRING had none, so deleting the gate from ``_record_one``
+    left all 856 tests green — and the artifact that mutant produces is a terminal, published,
+    permanently false statement about a trial that settled perfectly well.
+
+    The two rows are an acceptance/discrimination pair over the ONE thing that differs between them.
+    Both series are past the UNSCORED boundary and both make the law return UNSCORED; only one of
+    them PROVES the window was covered. So a gate that always refused would fail the second row and
+    a gate that never refused would fail the first, and neither row can pass by the run having
+    quietly done nothing — ``client.calls`` pins that the fetch was actually reached.
+    """
+    data_dir = tmp_path
+    trial = _trial()
+    LiveTrialRepository(data_dir / settle_operator.LIVE_SUBDIR).publish(trial)
+    _set_sentinel_credentials(monkeypatch)
+
+    client = _StubMarketClient(series_factory())
+    monkeypatch.setattr(settle_operator, "OKXMarketClient", lambda transport, creds: client)
+
+    now_ms = T + 60_000 + FETCH_GRACE_MS
+    exit_code = settle_operator.main(
+        ["--data-dir", str(data_dir), "--chain-index", "196", "--bar", "1m", "--now-ms", str(now_ms)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    # ACCEPTANCE CONTROL: the run reached the network path for exactly this trial. Without it, every
+    # assertion below is also satisfied by a run that never got that far.
+    assert client.calls == [("196", trial.sig.token_address, "1m")]
+
+    payload = json.loads(captured.out)
+    assert payload["eligible"] == 1
+    (summary,) = payload["trials"]
+    assert summary["status"] == expected_status
+    assert summary["recorded"] is expected_recorded
+
+    # The only assertion that matters to an agent who paid: what is TERMINALLY on disk.
+    outcome = ReceiptStore(data_dir).outcome(TRIAL_ID)
+    if expected_on_disk is None:
+        assert outcome is None, "an unproven fetch wrote a terminal outcome; the coverage gate is not wired"
+    else:
+        assert outcome is not None and outcome.status == expected_on_disk
+
+
+def test_main_REDACTS_credentials_out_of_the_failure_report(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE credential-surface pin for this script, and it exists because the sister script needed one.
+
+    Deleting the ``redact()`` call from this script's failure path left all 856 tests green, exactly
+    as deleting it from ``run_preflight.py:218`` once left 463 green. ``redact`` itself is a local
+    copy, tested in isolation three times over on the other script and wired nowhere here.
+
+    The failure is injected at ``_settle_all`` because that is the vector the module docstring names:
+    "a traceback from httpx can carry a signed URL". The message below is shaped like one — a query
+    string carrying two of the three credential values — so this asserts against the real hazard and
+    not against a string that merely happens to contain the sentinel.
+    """
+    _set_sentinel_credentials(monkeypatch)
+
+    async def exploding_settle_all(trials: Any, store: Any, creds: Any, args: Any, *, now_ms: int) -> Any:
+        raise RuntimeError(
+            "HTTPStatusError for GET /api/v5/wallet/token/candles"
+            "?apiKey=SENTINEL-KEY-DO-NOT-LEAK&sign=SENTINEL-SECRET-DO-NOT-LEAK"
+        )
+
+    monkeypatch.setattr(settle_operator, "_settle_all", exploding_settle_all)
+    exit_code = settle_operator.main(
+        ["--data-dir", str(tmp_path), "--chain-index", "196", "--bar", "1m", "--now-ms", str(T)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == "", "a failed run must print no summary a shell could read as a settled season"
+    assert "SENTINEL" not in captured.err, "a credential value reached the operator's terminal"
+    assert "settlement FAILED" in captured.err
+    # STANDING LESSON 62: a guard firing is not the guard under test. `except Exception` catches
+    # everything, so exit 1 plus "settlement FAILED" is reachable by any error at all — including a
+    # bug in this test's own setup. Identify the exception that was actually injected.
+    assert "RuntimeError" in captured.err, f"a different guard fired: {captured.err}"
+    assert "***" in captured.err, "the reason must be REDACTED, not merely emptied"
+    assert "HTTPStatusError for GET" in captured.err, "redaction must not destroy the diagnostic"
+
+
+def test_main_ABORTS_with_a_status_a_shell_cannot_read_as_a_settled_season(
+    settle_operator: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit ``2`` is a contract, not an implementation detail, and softening it left 856 tests green.
+
+    ``main()``'s docstring fixes the two failure statuses differently on purpose so an operator can
+    tell a missing variable from a failed run. The mutant that returns ``0`` here is not a cosmetic
+    one: exit 0 is exactly what a shell running ``settle.py && publish.py`` reads as a settled
+    season, so the softened script publishes a season it never settled.
+    """
+    exit_code = settle_operator.main(
+        ["--data-dir", str(tmp_path), "--chain-index", "196", "--bar", "1m", "--now-ms", str(T)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2, "a credential abort must not be readable as a successful run"
+    assert captured.out == "", "an aborted run must print no summary"
+    assert "aborted before any request" in captured.err
+    # Exit 2 alone cannot say WHICH guard produced it, and an operator who has set two of three
+    # variables needs to be told which one is missing rather than that something is.
+    for variable in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"):
+        assert variable in captured.err, f"the abort did not name {variable}"
+
+
+def test_only_trials_PAST_their_horizon_and_NOT_already_terminal_are_settled(
+    settle_operator: Any, store: _TamperableStore
+) -> None:
+    """``_eligible`` is what decides which trials a run touches at all, and it had no test.
+
+    Deleting both filters left 856 tests green. The consequence is not merely wasted requests: a
+    re-fetch of an already-terminal trial produces a run whose every line is a refusal from
+    ``record_outcome``, which is precisely the output the docstring says the filter exists to spare
+    an operator from reading past.
+
+    ``trial_pending`` is the discrimination control and it is the one that matters. A filter written
+    against "has an outcome recorded" rather than against TERMINAL_STATUSES passes every other row
+    here and silently strands every pending trial — permanently, because a pending trial's outcome
+    only becomes settleable on a LATER run than the one that recorded it.
+    """
+    now_ms = T + 60_000 + FETCH_GRACE_MS
+    past = _trial(trial_id="trial_past")
+    settled_already = _trial(trial_id="trial_settled")
+    unscored_already = _trial(trial_id="trial_unscored")
+    still_pending = _trial(trial_id="trial_pending")
+    not_yet = replace(_trial(trial_id="trial_not_yet"), t0_ms=now_ms - FROZEN_HORIZON_MS + 1)
+
+    store.record_outcome("trial_settled", _settled_outcome_from(_series(), trial_id="trial_settled"))
+    store.record_outcome("trial_unscored", settle_trial(unscored_already, _empty_series(), now_ms=now_ms))
+    store.record_outcome("trial_pending", settle_trial(still_pending, _empty_series(), now_ms=T0 + 60_000))
+    pending_payload = store.outcome_payload("trial_pending")
+    assert pending_payload is not None and pending_payload["status"] == "pending", "the control row is not pending"
+
+    trials = [past, settled_already, unscored_already, still_pending, not_yet]
+    eligible = settle_operator._eligible(trials, store, now_ms=now_ms, trial_id=None)
+    assert [trial.trial_id for trial in eligible] == ["trial_past", "trial_pending"]
+
+    # The `--trial-id` selector narrows the same set rather than bypassing either filter.
+    assert settle_operator._eligible(trials, store, now_ms=now_ms, trial_id="trial_pending") == [still_pending]
+    assert settle_operator._eligible(trials, store, now_ms=now_ms, trial_id="trial_settled") == []
+
+
+def test_the_published_check_names_match_the_frozen_tuples(
+    store: _TamperableStore, committed_receipt: CommitRecord
+) -> None:
+    """QUALITY F6. ``checks`` freezes its VALUES in the annotation and cannot freeze its KEYS.
+
+    ``dict[str, Literal["pass", "fail", "pending"]]`` publishes unconstrained keys, so H5.1's mirror
+    receives ``Record<string, …>`` and would have to re-declare the eight names out of band — a
+    second site that can drift from :data:`VERIFY_COMMIT_CHECKS` / :data:`VERIFY_OUTCOME_CHECKS`
+    with nothing able to notice, in the one surface whose whole purpose is that the frontend keeps
+    no second copy of anything.
+
+    A ``Literal``-keyed annotation was the obvious fix and is not available: ``signal_trials_schemas``
+    imports nothing from ``signal_trials`` and CANNOT, because ``live.py`` imports ``CommitRequest``
+    from it and the dependency runs one way only. A hand-written ``Literal`` would therefore be a
+    copy of the eight names living at the same distance from the tuples as the docstring list, with
+    the identical drift exposure — and it would additionally turn a name drift into a 500 on the
+    verify route, whose stated design is that a finding about a receipt is never an outage.
+
+    So the published key list is prose, and this test is what makes it a contract instead of a
+    comment. It asserts the exact names IN ORDER, so a name added on the receipts side and not here
+    fails, and a name listed here that no longer exists fails too.
+    """
+    published = VerifyReceiptResponse.__doc__
+    assert published is not None
+    marker = "**The key set is exactly these eight names, in this order:**"
+    _, _, tail = published.partition(marker)
+    assert tail, "the published key list is gone — a mirror has nothing authoritative to read"
+    listed = tuple(re.findall(r"``([a-z_]+)``", tail.split(".", 1)[0]))
+    assert listed == (*VERIFY_COMMIT_CHECKS, *VERIFY_OUTCOME_CHECKS)
+
+    # And the list describes what the VERIFIER actually serves, not merely what the tuples declare.
+    # Without this the test pins two declarations to each other and neither to a response, which is
+    # the shape of pin that stays green while the thing it is about drifts.
+    assert listed == tuple(_verdict(committed_receipt.receipt_id, store))

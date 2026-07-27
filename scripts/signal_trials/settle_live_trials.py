@@ -290,9 +290,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Settle the eligible trials and print a JSON summary. Returns a process exit status.
 
     Exit codes are distinguishable because they are fixed differently: ``2`` is a missing
-    credential (an operator sets three variables), ``1`` is a failure during the run (the summary
-    on stderr names it, redacted). Refusals reach stderr and a non-zero status so a shell driving
-    this cannot mistake a failed run for a settled season.
+    credential (an operator sets three variables), ``1`` is a failure during the run (the reason
+    reaches stderr, redacted). Neither writes anything to stdout, so a shell driving this cannot
+    mistake an ABORTED or a FAILED run for a settled season.
+
+    A COVERAGE GAP is the third refusal in this file's vocabulary and it deliberately exits ``0``,
+    which is worth stating because the other two do not. Exit status here is a claim about the RUN,
+    and a run that fetched, applied the law and correctly declined to write is a run that did its
+    job; a later invocation settles the trial. The consequence is the part a driver has to know:
+    ``&&`` cannot separate a fully-settled season from a partially-settled one, so a shell that
+    must not publish a partial season reads ``trials[].status`` for ``coverage_gap`` rather than
+    the exit code.
     """
     args = _parse_args(argv)
     now_ms = int(time.time() * 1000) if args.now_ms is None else args.now_ms

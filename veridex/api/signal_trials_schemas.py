@@ -166,6 +166,28 @@ class CommitReceiptResponse(BaseModel):
     a display of the caller's own probability and not a Veridex recommendation (§3.8).
 
     ``brier`` and ``chosen_markout_bps`` are ``None`` unless ``status == "settled"``.
+
+    ``status`` COLLAPSES two states that :class:`TrialResponse` three models up is careful to keep
+    apart, and the collapse is stated here because that model teaches the reader to expect the
+    distinction. A commitment against a trial with NO outcome recorded at all reads ``"pending"``,
+    identically to one against a recorded ``pending`` outcome — both carry ``brier`` and
+    ``chosen_markout_bps`` as ``null``, and the two are indistinguishable on this wire.
+    ``"pending"`` is the honest word for both, because nothing has been settled; it is stated
+    rather than left absent because the commitment itself is real and was paid for. What it does
+    NOT assert is that a settler has run. A consumer needing that distinction reads the trial's
+    ``outcome`` field, which is ``null`` in the first case and populated in the second.
+
+    ``commit_deadline_ms`` and ``trial_mode`` are nullable HERE and not on
+    :class:`OpenTrialResponse` or :class:`TrialResponse`, and those are the only two field names in
+    this surface whose annotation differs between models. The divergence is faithful: this model is
+    rendered from the STORED commit row and passes both through uncoerced, so ``null`` means that
+    row lacks the key. A well-formed receipt always carries both. ``null`` is therefore not
+    "optional, render a dash" — it is a corruption or tamper signal, and the ``deadline_respected``
+    and ``live_mode`` checks served in the very same response read ``fail`` beside it.
+
+    ``trial_mode`` is widened to ``str`` for that reason alone and §11's live-only constraint still
+    holds: a paid external commit can only ever have been taken against a live trial, so any value
+    other than ``"live"`` is a finding about the stored row rather than a variant to switch on.
     """
 
     receipt_id: str
@@ -212,7 +234,24 @@ class VerifyReceiptResponse(BaseModel):
     """The verdict on one receipt: every Fair-Play check, and the receipt it is about.
 
     ``checks`` is a mapping rather than named fields because a consumer's job is to
-    display or audit them uniformly. It is THREE-valued. ``pending`` is not a hedge: the
+    display or audit them uniformly.
+
+    **The key set is exactly these eight names, in this order:** ``body_hash``,
+    ``manifest``, ``deadline_respected``, ``live_mode``, ``bar_version``,
+    ``law_version``, ``evidence_equality``, ``outcome_source``. The four commit-time
+    checks come first, then the four settlement-time ones. The ANNOTATION cannot say
+    this — it publishes unconstrained ``str`` keys, and it is the one place in this
+    surface where the contract is looser than the thing it describes. The reason is
+    structural rather than an oversight: this module imports nothing from
+    ``signal_trials`` and cannot, so it cannot reach the ``VERIFY_COMMIT_CHECKS`` and
+    ``VERIFY_OUTCOME_CHECKS`` tuples that are the source of truth, and a hand-written
+    ``Literal`` key type would be a second copy of those names carrying exactly the drift
+    exposure this list would otherwise have. So the list is held to the tuples by
+    ``test_the_published_check_names_match_the_frozen_tuples`` instead: a name added on
+    the receipts side and not here fails the suite. A mirror reads its key names from
+    HERE and declares nothing out of band.
+
+    It is THREE-valued. ``pending`` is not a hedge: the
     four commit-time checks read facts the receipt itself carries and are therefore always
     decidable, while the four outcome checks have nothing to re-derive until a settled
     outcome exists. Reporting them as ``fail`` before then would tell a receipt holder

@@ -107,12 +107,20 @@ def _trial_response(trial: LiveTrial, outcome: TrialOutcome | None) -> TrialResp
 def _commit_receipt_response(receipt_id: str, store: ReceiptStore) -> CommitReceiptResponse | None:
     """Render one finalized receipt joined to its trial's outcome, or ``None`` if unreadable.
 
-    ``None`` means there is no renderable receipt, and it covers three states that are all that
-    same fact: the row does not exist, its bytes cannot be read, or it parses into values that
-    cannot be coerced into a record. Letting any of those escape would answer 500 for a receipt
-    whose verify report has eight perfectly good verdicts to publish — the exact
-    tampering-versus-outage conflation this route exists to avoid. Rendering a partial receipt out
-    of the wreckage was the alternative and is worse: it would serve fields nothing can re-derive.
+    ``None`` means there is no renderable receipt. Two states reach it and they are the same fact
+    to a caller: the row's bytes cannot be read, or it parses into values that cannot be coerced
+    into a record. Letting either escape would answer 500 for a receipt whose verify report has
+    eight perfectly good verdicts to publish — the exact tampering-versus-outage conflation this
+    route exists to avoid. Rendering a partial receipt out of the wreckage was the alternative and
+    is worse: it would serve fields nothing can re-derive.
+
+    The ``record is None`` branch is a third path to ``None`` and deliberately NOT a third
+    published meaning. The only caller answers 404 for an id it holds no row for, before this
+    helper renders anything, so the branch is reachable only when the row is unlinked BETWEEN that
+    check and this read — it is the guard for exactly that race and nothing else.
+    :class:`~veridex.api.signal_trials_schemas.VerifyReceiptResponse` states the frozen contract,
+    and it says an ABSENT receipt is never a ``null`` here. Do not widen this prose back into a
+    claim that absence is one of the states served.
 
     **The catch is bounded, and this names the boundary.** Building a record out of an untrusted
     parsed row fails in three ways: ``ValueError`` (a row that is not readable JSON, or a value
