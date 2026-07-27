@@ -43,7 +43,12 @@ from veridex.api.signal_trials_schemas import (
     TrialResponse,
     VerifyReceiptResponse,
 )
-from veridex.signal_trials.live import build_agent_record, settle_commit, unsettled_commit
+from veridex.signal_trials.live import (
+    build_agent_record,
+    finalized_commits_for_trial,
+    settle_commit,
+    unsettled_commit,
+)
 from veridex.signal_trials.published import read_season, read_state
 from veridex.signal_trials.receipts import verify_receipt
 
@@ -52,7 +57,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from veridex.signal_trials.live import LiveTrial, LiveTrialRepository
-    from veridex.signal_trials.receipts import ReceiptStore, TrialOutcome
+    from veridex.signal_trials.receipts import CommitRecord, ReceiptStore, TrialOutcome
 
 #: Every route this lane owns lives under this prefix.
 SIGNAL_TRIALS_PREFIX = "/signal-trials"
@@ -158,26 +163,45 @@ def _commit_receipt_response(receipt_id: str, store: ReceiptStore) -> CommitRece
         record = store.record(receipt_id)
         if record is None:
             return None
-        outcome = store.outcome(record.trial_id)
-        settlement = unsettled_commit(record) if outcome is None else settle_commit(record, outcome)
-        return CommitReceiptResponse(
-            receipt_id=record.receipt_id,
-            trial_id=record.trial_id,
-            payer=record.payer,
-            p_follow_profitable=record.p_follow_profitable,
-            methodology_version=record.methodology_version,
-            action=settlement.action,
-            status=settlement.status,
-            brier=settlement.brier,
-            chosen_markout_bps=settlement.chosen_markout_bps,
-            committed_at_ms=record.committed_at_ms,
-            commit_deadline_ms=record.commit_deadline_ms,
-            trial_mode=record.trial_mode,
-            body_hash=record.body_hash,
-            payment_tx_hash=record.payment_tx_hash,
-        )
+        return _render_commit_receipt(record, store)
     except (ValueError, TypeError, RecursionError):
         return None
+
+
+def _render_commit_receipt(record: CommitRecord, store: ReceiptStore) -> CommitReceiptResponse:
+    """Join one finalized ``record`` to its trial's outcome and render it. RAISES on an unreadable row.
+
+    Extracted from :func:`_commit_receipt_response` so the FIELD MAPPING EXISTS EXACTLY ONCE while
+    two callers get the two different failure meanings they each need:
+
+    * the verify route wraps this in its bounded catch and serves ``None``, because a receipt whose
+      bytes are damaged still has eight perfectly good verdicts to publish about that damage;
+    * the participant-join route calls it BARE, because an unreadable row there must fail the whole
+      request rather than quietly shrink a published participant set.
+
+    The alternative was a second copy of the fourteen-field construction, which is how two spellings
+    of one thing drift apart — the defect class this milestone has already paid for more than once.
+    Extracting keeps ``_commit_receipt_response``'s guard spanning both the READ and the JOIN AND the
+    MODEL exactly as before: nothing about what it catches has changed, only where the body lives.
+    """
+    outcome = store.outcome(record.trial_id)
+    settlement = unsettled_commit(record) if outcome is None else settle_commit(record, outcome)
+    return CommitReceiptResponse(
+        receipt_id=record.receipt_id,
+        trial_id=record.trial_id,
+        payer=record.payer,
+        p_follow_profitable=record.p_follow_profitable,
+        methodology_version=record.methodology_version,
+        action=settlement.action,
+        status=settlement.status,
+        brier=settlement.brier,
+        chosen_markout_bps=settlement.chosen_markout_bps,
+        committed_at_ms=record.committed_at_ms,
+        commit_deadline_ms=record.commit_deadline_ms,
+        trial_mode=record.trial_mode,
+        body_hash=record.body_hash,
+        payment_tx_hash=record.payment_tx_hash,
+    )
 
 
 def register_signal_trials_routes(
@@ -303,6 +327,51 @@ def register_signal_trials_routes(
             return _error(404, "trial_not_found")
         commit_store = _store()
         return _trial_response(trial, None if commit_store is None else commit_store.outcome(trial.trial_id))
+
+    @app.get(f"{SIGNAL_TRIALS_PREFIX}/trials/{{trial_id}}/receipts", response_model=None)
+    async def signal_trials_trial_receipts(trial_id: str) -> JSONResponse | list[CommitReceiptResponse]:
+        """Serve the FINALIZED participant commitments on one trial, in stable receipt order.
+
+        This is the JOIN the frozen models deliberately leave out. ``TrialOutcomeModel`` carries no
+        payer, probability or Brier because two agents who committed opposite probabilities against
+        one event share exactly that outcome and differ only in their participant records — so the
+        event level stays event-level and the join lives here, in its own route, rather than as an
+        array bolted onto ``TrialResponse``.
+
+        **Finalized ONLY, and by construction rather than by this route remembering.**
+        :func:`~veridex.signal_trials.live.finalized_commits_for_trial` reads
+        :meth:`~veridex.signal_trials.receipts.ReceiptStore.finalized`, the store's single public
+        visibility gate, so a staged, in-flight, settle-attempted or quarantined row cannot appear
+        here. The private slot iterator reads every state and was the first thing proposed for this
+        route; using it would have published commitments that were never paid for.
+
+        **An absent store is 503, NEVER ``200 []``.** An empty array is a positive claim — nobody
+        committed to this trial — and a deployment with no store mounted has no basis for it. 404 is
+        equally wrong when the trial itself is known, so the refusal names its own missing
+        precondition, the way the commit route already separates "no trials" from "no payment gate".
+
+        **A row nothing can read fails the whole request.** ``finalized()`` does not swallow, and
+        :func:`_render_commit_receipt` is called BARE here, so a corrupt receipt or outcome row
+        raises instead of dropping out of the array. Serving the survivors would publish a
+        complete-looking participant set that is missing a paid commitment — smaller and cleaner than
+        the artifacts support, and indistinguishable to a caller from a trial that only ever had one
+        participant. This route has no verdict to publish about the damage; that is the verify
+        route's job. The honest answer is that the set cannot be served.
+
+        The id is never echoed into the refusal: it arrives from a URL path segment, so echoing it
+        would reflect caller-controlled text back into logs and responses.
+        """
+        repo = _live_trials()
+        trial = None if repo is None else repo.get(trial_id)
+        if trial is None:
+            return _error(404, "trial_not_found")
+        commit_store = _store()
+        if commit_store is None:
+            return _error(503, "participant_store_unavailable")
+        return [
+            _render_commit_receipt(record, commit_store)
+            for record in finalized_commits_for_trial(commit_store, trial_id)
+        ]
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/agents/{{payer_id}}", response_model=None)
     async def signal_trials_agent(payer_id: str) -> JSONResponse | AgentRecordResponse:

@@ -3157,3 +3157,362 @@ def test_a_run_at_the_DECLARED_cost_records_and_the_row_verifies(
     assert stored is not None and stored["cost_bps"] == DECLARED_COST_BPS
     # The whole point: a row the REAL operator wrote passes the REAL verifier's cost binding.
     assert _verdict(receipt.receipt_id, store) == _clean()
+
+
+# ==================================================================================================
+# H4.4 — the participant JOIN route: `GET /signal-trials/trials/{trial_id}/receipts` (PKT-DEC-C65).
+#
+# The gap C65 adjudicated: no frozen model and no route joined a trial to the agents who committed
+# against it, so nothing could reach a receipt id without already holding one. The join is served as
+# an array of the ALREADY-FROZEN `CommitReceiptResponse` — no ninth model, and still no participants
+# array on `TrialResponse`, whose separation from participant data is deliberate and stays.
+#
+# The route is a free read, and its correctness boundary is security-relevant in two directions.
+# Both are pinned below. Reading the wrong source method publishes commitments nobody paid for:
+# `ReceiptStore._iter_slots()` sees staged, in-flight, settle-attempted and quarantined rows, and it
+# is the read C65 rejected. Silently dropping an unreadable row publishes a participant set smaller
+# and cleaner than the artifacts support, which is the route-family rule H4.3 established.
+# ==================================================================================================
+
+
+def _receipts_path(trial_id: str) -> str:
+    """The participant-join path for ``trial_id``."""
+    return f"/signal-trials/trials/{trial_id}/receipts"
+
+
+async def test_the_receipts_route_serves_both_finalized_commitments_in_receipt_id_ORDER(
+    store: _TamperableStore,
+) -> None:
+    """AC1. Two paid commitments on one trial, as two whole frozen receipts, deterministically ordered.
+
+    The staging ids are chosen so the fixture DISCRIMINATES rather than agreeing by construction:
+    ``s_one`` is written FIRST and by :data:`PAYER`, and its receipt id sorts SECOND. Receipt-id
+    order is therefore the reverse of both the write order and the payer order here, so a route that
+    served either of those instead would fail this assertion. The guard on the two ids says so out
+    loud, because a future change to :func:`~veridex.signal_trials.receipts.receipt_id_for` could
+    quietly collapse the three orders into one and leave this test passing for no reason.
+
+    The two probabilities differ for the same reason: this is a PER-PARTICIPANT join, and a route
+    that rendered one receipt twice would satisfy an assertion on the ids alone.
+    """
+    trial = _trial()
+    first = _commit(store, trial, staging_id="s_one", p=0.8)
+    second = _commit(store, trial, staging_id="s_two", p=0.3, payer=OTHER_PAYER)
+    assert first.receipt_id > second.receipt_id, "the fixture no longer discriminates receipt-id order"
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
+        response = await client.get(_receipts_path(TRIAL_ID))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["receipt_id"] for row in body] == [second.receipt_id, first.receipt_id]
+    assert [row["payer"] for row in body] == [OTHER_PAYER, PAYER]
+    assert [row["p_follow_profitable"] for row in body] == [0.3, 0.8]
+    # Every element is the WHOLE frozen model. A trimmed projection would leave H5.3 unable to reach
+    # `GET /receipts/{id}/verify`, which is the entire reason the array element is this model.
+    assert all(set(row) == set(CommitReceiptResponse.model_fields) for row in body)
+
+
+async def test_a_known_trial_with_no_finalized_commitments_is_200_AND_AN_EMPTY_ARRAY(
+    store: _TamperableStore,
+) -> None:
+    """AC2. "Nobody committed" is a successful empty answer — the store is mounted and readable.
+
+    Paired with the absent-store test below, which must NOT answer this way. ``[]`` asserts that
+    nobody committed, and a deployment that cannot read its participant store does not know that.
+    """
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(_trial()))) as client:
+        response = await client.get(_receipts_path(TRIAL_ID))
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.parametrize(
+    ("requested", "marker"),
+    [
+        pytest.param("trial_h43_never_opened", "never_opened", id="unknown"),
+        # DOUBLE-encoded on purpose. A single `%2F` is decoded by the CLIENT before the request is
+        # sent, so `..%2F..%2Fsecrets` becomes three extra path segments and never reaches this
+        # route at all — see the companion test below. `%252F` keeps the traversal attempt inside
+        # ONE segment, which is the only form that actually exercises this handler's refusal.
+        pytest.param("..%252F..%252Fsecrets", "secrets", id="traversal"),
+        # Slash-free for the same reason: the closing `</script>` carried a `%2F`.
+        pytest.param("%3Cscript%3Ealert(1)", "script", id="markup"),
+    ],
+)
+async def test_an_unknown_or_malformed_trial_id_is_the_existing_NON_ECHOING_404(
+    tmp_path: Path, requested: str, marker: str
+) -> None:
+    """AC3. One refusal code for both, and the caller's own text is never reflected back at them.
+
+    The id arrives from a URL path segment, so echoing it would put caller-controlled bytes into the
+    response and the access log. The body is asserted by EQUALITY, which is the strongest form of
+    that claim — nothing caller-controlled can be present in a body that is exactly two known
+    tokens — and the marker assertion states it again against the raw text, so a route that echoed
+    into a second field or a header-shaped envelope fails here rather than passing on the JSON.
+
+    Driven through the REAL :class:`~veridex.signal_trials.live.LiveTrialRepository` rather than the
+    test double, because the malformed cases are refused by ITS traversal guard: a double that
+    answered ``None`` for every unknown id would report these as 404 without the guard existing.
+    The published trial in the same client is the ACCEPTANCE CONTROL — it proves this route can
+    answer 200 at all, so the 404s are a statement about the ids and not about a route that is
+    permanently absent or permanently refusing.
+    """
+    trial = _trial()
+    repo = LiveTrialRepository(tmp_path / "live")
+    repo.publish(trial)
+
+    async with _client(_app(store=_TamperableStore(tmp_path / "store"), live_trials=repo)) as client:
+        served = await client.get(_receipts_path(TRIAL_ID))
+        response = await client.get(_receipts_path(requested))
+
+    assert served.status_code == 200, "the acceptance control failed: this route never answers 200"
+    assert response.status_code == 404
+    assert response.json() == {"error": "trial_not_found"}
+    assert marker not in response.text
+
+
+async def test_a_SLASH_BEARING_id_never_reaches_this_route_and_still_does_not_echo(tmp_path: Path) -> None:
+    """AC3, the boundary the parametrized test above CANNOT reach, recorded rather than hidden.
+
+    A single ``%2F`` is decoded by the CLIENT before the request leaves it, so
+    ``..%2F..%2Fsecrets`` is sent as three additional path segments and matches no route at all. The
+    refusal therefore comes from the FRAMEWORK, not from this handler, and its body is a different
+    shape: ``{"detail": "Not Found"}`` rather than ``{"error": "trial_not_found"}``.
+
+    That is worth pinning for two reasons. The SECURITY property still holds — the framework's 404
+    does not echo the caller's bytes either, which is the claim AC3 actually makes — but a frontend
+    branching on an ``error`` key would not recognise this body, so the difference is a real contract
+    fact rather than a curiosity. And the original version of the parametrized test asserted this
+    route's body against these payloads, which could never have passed: it was measuring the client's
+    URL handling and reporting it as a defect in the route.
+    """
+    trial = _trial()
+    repo = LiveTrialRepository(tmp_path / "live")
+    repo.publish(trial)
+
+    async with _client(_app(store=_TamperableStore(tmp_path / "store"), live_trials=repo)) as client:
+        served = await client.get(_receipts_path(TRIAL_ID))
+        framework = await client.get(_receipts_path("..%2F..%2Fsecrets"))
+
+    assert served.status_code == 200, "the acceptance control failed: this route never answers 200"
+    assert framework.status_code == 404
+    assert framework.json() == {"detail": "Not Found"}, "the framework's 404 shape changed"
+    assert "secrets" not in framework.text, "the framework echoed caller-controlled bytes"
+
+
+async def test_no_STAGED_IN_FLIGHT_SETTLE_ATTEMPTED_or_QUARANTINED_row_is_ever_served(
+    store: _TamperableStore,
+) -> None:
+    """AC4. The finalized-only gate, measured against a store that actually holds all four states.
+
+    This is the test that would have caught the read C65 rejected. Every non-finalized row here is
+    CONSTRUCTED, and the slot iterator is asserted to see all of the ones that take a slot, so the
+    exclusions are proven rather than inherited from a store that had nothing to exclude. A route
+    built on ``_iter_slots()`` would serve four participants where one was paid for.
+
+    Order matters in the fixture and is not incidental. :meth:`ReceiptStore.reconcile` is what turns
+    an attempted slot into a quarantined one, and the same call would RELEASE a stale in-flight slot
+    and SWEEP a stale staged row — so those two are created after it, or the controls they provide
+    would be deleted before the assertion ran.
+    """
+    trial = _trial()
+    # Quarantined: a settle was attempted and no journal entry proves how it ended. Never served,
+    # and never deleted, because the facilitator may be holding a real payment.
+    store.stage(staging_id="s_quarantined", trial_id=TRIAL_ID, payer="0xq", body=_req(0.5), staged_at_ms=T0)
+    store.mark_settle_attempted("s_quarantined")
+    store.reconcile(now_ms=10**15)
+    # Staged: received, never paid for.
+    store.stage(staging_id="s_staged", trial_id=TRIAL_ID, payer="0xs", body=_req(0.6), staged_at_ms=T0)
+    # In flight: the slot is taken and nothing has been written behind it.
+    store.acquire_slot("0xi", TRIAL_ID, now_ms=T0)
+    # Settle-attempted: past the durable marker, outcome not yet known.
+    store.stage(staging_id="s_attempted", trial_id=TRIAL_ID, payer="0xa", body=_req(0.4), staged_at_ms=T0)
+    store.mark_settle_attempted("s_attempted")
+    paid = _commit(store, trial, staging_id="s_paid", p=0.8)
+
+    # The controls exist. Without these four assertions the test below could pass against a store
+    # holding nothing but the paid row.
+    assert store.count_quarantined() == 1
+    assert store.count_settle_attempted() == 1
+    assert store.slot_state("0xi", TRIAL_ID) == "in_flight"
+    assert store.count_pending() == 3
+    # DISCRIMINATION: the private read path C65 rejected sees FOUR slot rows where the public gate
+    # serves one, so "only one is served" is a property of the SOURCE METHOD and not of a store with
+    # nothing else in it. Four and not five: the STAGED row never takes a slot, so `_iter_slots()`
+    # cannot see it — which is why `count_pending()` above is the control that proves it exists.
+    # Sorted order, and PAYER is "0xb", so the finalized row lands SECOND. (The first version of this
+    # list was written in authoring order with the finalized row last and compared against sorted(),
+    # so it failed for its own ordering rather than for anything about the route.)
+    assert sorted((row["payer"], row["state"]) for row in store._iter_slots()) == [
+        ("0xa", "settle_attempted"),
+        (PAYER, "finalized"),
+        ("0xi", "in_flight"),
+        ("0xq", "quarantined"),
+    ]
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
+        response = await client.get(_receipts_path(TRIAL_ID))
+
+    assert response.status_code == 200
+    assert [row["receipt_id"] for row in response.json()] == [paid.receipt_id]
+    assert [row["payer"] for row in response.json()] == [PAYER]
+
+
+async def test_a_finalized_commitment_on_ANOTHER_trial_is_never_served(store: _TamperableStore) -> None:
+    """AC5. The join filters by trial, and each trial's request returns only its own participant.
+
+    Both receipts are served SOMEWHERE, each under its own trial, which is what makes this a filter
+    test rather than a test that one of the two rows is unreadable: a route that returned an empty
+    array for everything would satisfy "the other trial's receipt is absent" perfectly.
+    """
+    trial = _trial()
+    other = _trial(trial_id=OTHER_TRIAL_ID)
+    mine = _commit(store, trial, staging_id="s_mine", p=0.8)
+    theirs = _commit(store, other, staging_id="s_theirs", p=0.3, payer=OTHER_PAYER)
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
+        response = await client.get(_receipts_path(TRIAL_ID))
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(other))) as client:
+        other_response = await client.get(_receipts_path(OTHER_TRIAL_ID))
+
+    assert [row["receipt_id"] for row in response.json()] == [mine.receipt_id]
+    assert [row["receipt_id"] for row in other_response.json()] == [theirs.receipt_id]
+
+
+@pytest.mark.parametrize(
+    ("recorded", "status", "brier", "markout"),
+    [
+        pytest.param("none", "pending", None, None, id="no-outcome-recorded"),
+        pytest.param("pending", "pending", None, None, id="recorded-pending"),
+        pytest.param("unscored", "UNSCORED", None, None, id="recorded-UNSCORED"),
+        pytest.param("settled", "settled", pytest.approx((0.8 - 1) ** 2), FOLLOW_BPS, id="settled"),
+    ],
+)
+async def test_every_participant_STATE_renders_with_the_frozen_nullability(
+    store: _TamperableStore, recorded: str, status: str, brier: Any, markout: int | None
+) -> None:
+    """AC6. ``pending``, ``settled`` and ``UNSCORED`` all render, and the metrics are null only where
+    there is no result.
+
+    The settled row is the DISCRIMINATION CONTROL for the other three: without it, a route that
+    hard-coded both metrics to ``null`` would pass every case here. With it, the same route fails,
+    because a settled commitment carries a real Brier and a real chosen leg.
+
+    ``no-outcome-recorded`` and ``recorded-pending`` are two different backend states that this model
+    deliberately COLLAPSES to one wire value, and both are exercised so the collapse is a pinned
+    property rather than an accident of whichever one the tests happened to use.
+
+    Every key is asserted present, so a metric is served as an explicit ``null`` rather than omitted:
+    a consumer reading a missing key cannot tell "no result" from "a field I do not know about".
+    """
+    trial = _trial()
+    _commit(store, trial, staging_id="s_state", p=0.8)
+    if recorded == "pending":
+        store.record_outcome(TRIAL_ID, _settle(trial, _empty_series(), now_ms=T0 + 60_000))
+    elif recorded == "unscored":
+        store.record_outcome(TRIAL_ID, _settle(trial, _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS))
+    elif recorded == "settled":
+        store.record_outcome(TRIAL_ID, _settled_outcome_from(_series()))
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
+        response = await client.get(_receipts_path(TRIAL_ID))
+
+    assert response.status_code == 200
+    (row,) = response.json()
+    assert row["status"] == status
+    assert row["brier"] == brier
+    assert row["chosen_markout_bps"] == markout
+    assert set(row) == set(CommitReceiptResponse.model_fields)
+    # Derived from the payer's own probability at commit time, so it does not wait on the market and
+    # is present in every state — including the two that carry no metrics at all.
+    assert row["action"] == "FOLLOW"
+
+
+def test_every_field_of_the_frozen_receipt_model_is_REQUIRED_with_no_default() -> None:
+    """AC6, the schema half. **PIN, not a RED** (C46): this passed the instant it was written.
+
+    Recorded as a pin because it constrains a model this task must not touch. A nullable field that
+    acquired a default would let a renderer omit it and have pydantic fill the null back in, which is
+    exactly how "no result" and "this route did not serve the field" become indistinguishable on the
+    wire — and the array element is now consumed by a second route, so there are two renderers that
+    could drift into relying on it.
+    """
+    assert [name for name, field in CommitReceiptResponse.model_fields.items() if not field.is_required()] == []
+
+
+async def test_an_ABSENT_store_refuses_rather_than_claiming_that_nobody_committed(tmp_path: Path) -> None:
+    """AC7. No participant store is an honest refusal, and specifically NOT ``200 []``.
+
+    ``[]`` is a positive claim — nobody committed to this trial — and a deployment with no store
+    mounted has no basis for it. The trial itself is known here, so 404 would be a second false
+    claim; 503 with its own code names the missing precondition, which is how the commit route
+    already distinguishes "no trials" from "no payment gate".
+
+    The mounted-but-empty request is the DISCRIMINATION CONTROL: the same trial, the same route, and
+    the answer differs. Without it, a route that always refused would pass.
+    """
+    trial = _trial()
+    async with _client(_app(store=None, live_trials=_OneTrialRepo(trial))) as client:
+        absent = await client.get(_receipts_path(TRIAL_ID))
+    async with _client(_app(store=_TamperableStore(tmp_path), live_trials=_OneTrialRepo(trial))) as client:
+        mounted = await client.get(_receipts_path(TRIAL_ID))
+
+    assert absent.status_code == 503
+    assert absent.json() == {"error": "participant_store_unavailable"}
+    assert mounted.status_code == 200
+    assert mounted.json() == []
+
+
+async def test_a_CORRUPT_finalized_row_FAILS_the_request_instead_of_shrinking_the_participant_set(
+    store: _TamperableStore,
+) -> None:
+    """AC8, the receipt half. A row nothing can read must not be quietly dropped from the array.
+
+    Serving the survivor alone would publish a complete-looking participant set that is missing a
+    paid commitment — a smaller, cleaner record than the artifacts support, and indistinguishable to
+    the caller from a trial that only ever had one participant. This route has no verdict to publish
+    about the damage; that is the verify route's job. So it refuses the whole answer.
+
+    The intact request first is the ACCEPTANCE CONTROL: two receipts are genuinely servable here, so
+    the 500 is caused by the corruption and not by a route that fails on two rows.
+    """
+    trial = _trial()
+    intact = _commit(store, trial, staging_id="s_intact", p=0.8)
+    broken = _commit(store, trial, staging_id="s_broken", p=0.3, payer=OTHER_PAYER)
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial)), raise_app_exceptions=False) as client:
+        before = await client.get(_receipts_path(TRIAL_ID))
+        (Path(store.root) / _FINALIZED_DIRNAME / f"{broken.receipt_id}.json").write_text("{not json", encoding="utf-8")
+        after = await client.get(_receipts_path(TRIAL_ID))
+
+    assert before.status_code == 200 and len(before.json()) == 2
+    assert after.status_code == 500
+    assert intact.receipt_id not in after.text, "the surviving receipt was served as if it were the whole set"
+
+
+async def test_a_CORRUPT_outcome_row_FAILS_the_request_and_is_not_served_as_pending(
+    store: _TamperableStore,
+) -> None:
+    """AC8, the outcome half — and the sharper of the two, because a plausible wrong answer exists.
+
+    A destroyed outcome could be rendered as ``pending`` with null metrics, which is well-formed,
+    reasonable-looking and false: ``pending`` says the trial has not settled, when in fact it settled
+    and the record was destroyed. The trial route already refuses that trade and this one matches it.
+
+    The settled request first is the ACCEPTANCE CONTROL, and it is what makes ``pending`` the wrong
+    answer rather than an untested one: the same row rendered ``settled`` moments earlier.
+    """
+    trial = _trial()
+    _commit(store, trial, staging_id="s_outcome", p=0.8)
+    store.record_outcome(TRIAL_ID, _settled_outcome_from(_series()))
+
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial)), raise_app_exceptions=False) as client:
+        before = await client.get(_receipts_path(TRIAL_ID))
+        store.corrupt_outcome(TRIAL_ID, raw="{not json")
+        after = await client.get(_receipts_path(TRIAL_ID))
+
+    assert before.status_code == 200 and before.json()[0]["status"] == "settled"
+    assert after.status_code == 500
+    assert "pending" not in after.text, "a destroyed settlement was rendered as an unsettled one"
