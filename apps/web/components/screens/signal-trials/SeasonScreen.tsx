@@ -165,7 +165,10 @@ function NoSeasonState() {
           (PKT-DEC-C64) in the same commit as this line, which is what makes the link true.
           `.probeSummary` is reused rather than given a class of its own: it is the style the
           sibling action on this same copy line already uses, and the two are meant to read as a
-          pair. `not_built` carries NO actions line and must not borrow this one. */}
+          pair. Reusing the class was NOT sufficient to make them match — the rule was authored for
+          a `<summary>`, which carries no UA underline, and this app has no global anchor reset, so
+          the class also had to gain `text-decoration: none` for the pairing to be real rather than
+          merely intended. `not_built` carries NO actions line and must not borrow this one. */}
       <a
         className={styles.probeSummary}
         href="/SKILL.md"

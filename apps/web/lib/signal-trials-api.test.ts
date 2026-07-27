@@ -847,12 +847,17 @@ describe('getTrialReceipts fails closed on a non-array 200', () => {
 // H5.5 — the public `SKILL.md`, and the image that must actually carry it.
 // ===========================================================================
 //
-// WHY THESE TESTS LIVE IN THE ADAPTER'S TEST FILE and not beside the document: the endpoint list
-// below is DERIVED from `SIGNAL_TRIALS_PATHS`, the same constant every fetcher above binds to. A
-// hand-retyped list would be a second spelling of the routes with nothing able to notice a drift
-// between them — precisely the CF-5 failure the check-keys constant exists to prevent. Deriving it
-// here means a route rename in `lib/signal-trials-api.ts` breaks the DOCUMENT'S test, which is the
-// only mechanism that keeps the public onboarding artifact honest about the API it describes.
+// WHY THESE TESTS LIVE IN THE ADAPTER'S TEST FILE: the packet REQUIRES it. `PKT-TASK-H5-5`'s
+// owned-files list reads `EXTEND apps/web/lib/signal-trials-api.test.ts`, quoting frozen plan
+// L1061 — "Test extends `apps/web/lib/signal-trials-api.test.ts`" — and rules that an earlier
+// removal of this file from the owned set "went one step too far". Placement is mandated, not
+// chosen.
+//
+// It is worth being precise that co-location is NOT what buys the drift detection, because the
+// obvious-sounding argument is wrong: `SIGNAL_TRIALS_PATHS` is an export, so a separate
+// `lib/skill-md.test.ts` could import it and obtain the identical property. What buys drift
+// detection is DERIVING the list instead of retyping it, which is a separate point and is argued
+// at the list itself.
 //
 // C64 IS THE REASON THE DOCKERFILE IS ASSERTED AT ALL. `apps/web/public/SKILL.md` existing in the
 // source tree is NOT acceptance: `pnpm test`, `pnpm build` and `docker build` all pass while the
@@ -894,7 +899,13 @@ const PATH_PARAM = 'PARAM';
 // one route here whose spelling this test cannot keep in step with the client automatically.
 type SkillEndpoint = { readonly method: string; readonly path: string };
 
-// `{`, `}` and `$` all carry regex meaning and all occur in these paths (`{id}`, `{payer}`).
+// `{` and `}` carry regex meaning and both occur in these paths (`{id}`, `{payer}`). This is the
+// standard escape rather than a two-character special case for those two, so a path that later
+// gains a `.` or a `+` is handled without anyone having to remember to revisit this.
+//
+// `/` and `-` are deliberately NOT escaped and do not need to be: `/` is only special inside a
+// regex LITERAL and these patterns are built through the `RegExp` constructor from a string, and
+// `-` is only special inside a character class.
 function escapeForRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1081,6 +1092,49 @@ describe('SKILL.md language guard — paper-markout only, no trading claim', () 
   });
 });
 
+// ---------------------------------------------------------------------------
+// The skill frontmatter. `frozen-spec.md:197` places this file in the integration
+// table as the OnchainOS Skill for one-prompt agent onboarding, and an agent
+// runtime that ingests skills ROUTES ON THE `description` FIELD. Without it the
+// file loads as prose and cannot be dispatched to, which defeats the purpose the
+// frozen spec assigns it. Shape verified against OKX's own OnchainOS skills
+// (`okx-agentic-wallet`, `okx-guide`, `okx-dex-market`), the closest comparable.
+// ---------------------------------------------------------------------------
+
+// PARSED, not grepped: an anchored block match, so a stray `---` anywhere in the body — a markdown
+// horizontal rule, of which this document has several — cannot satisfy the predicate.
+function frontmatterOf(text: string): string | null {
+  const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
+  return m === null ? null : m[1];
+}
+
+describe('SKILL.md carries the skill frontmatter an agent runtime routes on', () => {
+  it('opens with a frontmatter block', () => {
+    expect(frontmatterOf(SKILL_MD)).not.toBeNull();
+  });
+
+  it('declares name and description — description is the field a skill runtime routes on', () => {
+    const fm = frontmatterOf(SKILL_MD) ?? '';
+    expect(fm).toMatch(/^name:\s*\S+/m);
+    expect(fm).toMatch(/^description:\s*\S+/m);
+  });
+
+  // The description is the SHORTEST thing most agents will ever read of this file — for many it is
+  // the only thing, since routing happens before ingestion. So the honesty boundary has to hold
+  // INSIDE the routing field and not merely in the body underneath it.
+  it('carries the §3.8 sentence inside the description itself, not only in the body', () => {
+    expect(frontmatterOf(SKILL_MD) ?? '').toContain(SECTION_3_8);
+  });
+
+  // C52 — the discrimination control. Stripping the block must defeat the predicate; otherwise the
+  // predicate is satisfied by the document's markdown rules rather than by its frontmatter.
+  it('the predicate FAILS on the same document with its frontmatter stripped', () => {
+    const body = SKILL_MD.replace(/^---\n[\s\S]*?\n---\n/, '');
+    expect(body).not.toEqual(SKILL_MD); // C41 — the mutation landed
+    expect(frontmatterOf(body)).toBeNull();
+  });
+});
+
 // The binding from the H4.3 milestone Codex: the eight checks are REPRODUCIBILITY CHECKS OVER
 // RECORDED EVIDENCE. They re-derive a receipt's claims from the stored artifacts. That is NOT proof
 // against a malicious storage operator, and no copy in this program may say otherwise — least of
@@ -1120,8 +1174,12 @@ describe('SKILL.md describes verification as reproducibility, never as tamper-pr
 
 // An ACTIVE `COPY` of `public` into the runner stage. Anchored to the start of a line and allowing
 // only whitespace before `COPY`, so a `#` in front of it does NOT match — which is the entire point
-// of the assertion. `[^#\n]*` after COPY keeps a trailing-comment form from matching a commented
-// line that happens to contain the word COPY later on.
+// of the assertion, and which on its own already rejects a commented line that merely mentions COPY
+// later on (`# note: COPY --from=build /app/public ./public`).
+//
+// `[^#\n]*` does a DIFFERENT job: it stops the middle segment from crossing a `#` mid-line, so a
+// line whose path text only appears inside a trailing comment — `COPY x # /app/public ./public` —
+// cannot satisfy the pattern either.
 const ACTIVE_PUBLIC_COPY = /^[ \t]*COPY[^#\n]*\/app\/public\s+\.\/public[ \t]*$/m;
 
 describe('C64: the Dockerfile actually ships public/ — a source-tree file is not acceptance', () => {

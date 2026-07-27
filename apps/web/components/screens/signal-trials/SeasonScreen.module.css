@@ -75,7 +75,12 @@
 .stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
 
 .probeCounts { font-size: 11px; color: var(--text-2); }
-.probeSummary { cursor: pointer; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.06em; color: var(--accent-2); }
+/* `text-decoration: none` is required, not cosmetic: H5.5 applies this class to an <a> as well as
+   to the <summary> it was authored for, and the two are the paired actions of one copy line. A
+   <summary> carries no UA underline and an <a> does, and there is no global anchor reset anywhere
+   in this app — so without this the pair renders mismatched. No :hover underline, deliberately:
+   the sibling <summary> signals hover by colour, and adding one here would re-break the pairing. */
+.probeSummary { cursor: pointer; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.06em; color: var(--accent-2); text-decoration: none; }
 .probeSummary:hover, .probeSummary:focus-visible { color: var(--accent-hi); }
 
 .retry {
