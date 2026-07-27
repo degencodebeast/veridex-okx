@@ -369,8 +369,15 @@ function TrialHead({ trial }: { trial: TrialCard }) {
           Two kinds of sentence want to live here and they are NOT the same claim:
 
             CONSTRUCTION — what this trial record IS. It carries one sealed evidence payload, one
-            commit deadline, one settlement law, one outcome. True from the record alone, true
-            whatever any verdict says, and stated unconditionally below.
+            commit deadline and one settlement law. Those three are true from the record alone,
+            true whatever any verdict says, and stated unconditionally below.
+
+            The OUTCOME is NOT one of them. `TrialCard.outcome` is nullable, and `null` means
+            nothing was computed at all — a state this component renders as "No outcome record
+            exists for this trial". So the outcome half of the summary line below is a DIRECT READ
+            of that one field, not an unconditional statement, and the ternary that produces it is
+            load-bearing: an earlier revision of this block claimed "one outcome" unconditionally
+            and that is exactly the claim the milestone review found false. Do not collapse it.
 
             VERIFICATION — what is true OF A PARTICULAR RECEIPT: that it really re-derives against
             that record, really binds this trial, really arrived before the deadline. NOTHING on
@@ -414,7 +421,7 @@ function TrialHead({ trial }: { trial: TrialCard }) {
           <span className={styles.hashLabel}>ONE RECORD · ONE HASH</span>
         </div>
         <p className={styles.footNote}>
-          This trial has one sealed evidence payload, one commit deadline and one settlement rule.
+          This trial has one sealed evidence payload, one commit deadline and one settlement law.
           That is the structure of the record, not a finding about any receipt.
         </p>
         {/* Was "…and they are what every commitment below is scored against." Two things were
