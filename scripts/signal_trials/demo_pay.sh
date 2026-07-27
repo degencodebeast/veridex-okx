@@ -7,27 +7,33 @@
 # that the resulting receipt is publicly verifiable.
 #
 # WHAT IT DOES
-#   1. POST the commitment unpaid          -> expect 402 with a payment challenge
-#   2. Pay the challenge via the onchainos CLI, from the SECOND wallet
-#   3. Replay the identical request with the payment signature -> expect 200
-#   4. Decode the settlement header and print the transaction hash and receipt id
+#   1. POST the commitment unpaid          -> require 402 and a PAYMENT-REQUIRED header
+#   2. Select the payer account, then sign the challenge with the onchainos CLI
+#   3. Replay the identical request with PAYMENT-SIGNATURE -> require 200
+#   4. Require a decodable PAYMENT-RESPONSE with a real transaction, then print it
 #
-# SECRETS
-#   This script holds none and prints none. The wallet lives entirely inside the
-#   onchainos CLI's own configuration; nothing here reads a key, an address or a
-#   funding value. If a value cannot come from the environment, that is a defect to
-#   report rather than a constant to add.
+# SECRETS — what is and is not guaranteed
+#   No key material is read, stored or printed by this script; the wallet lives
+#   inside the onchainos CLI's own configuration. The signed authorization IS
+#   spendable, so xtrace is disabled around it: bash xtrace expands assignment
+#   values and would otherwise print the authorization even though no echo does.
+#   That is enforced below, not merely asserted.
 #
 # USAGE
-#   BASE_URL=https://api.proofarena.xyz TRIAL_ID=<id> ./demo_pay.sh
-#   BASE_URL=https://api.proofarena.xyz TRIAL_ID=<id> P_FOLLOW=0.62 ./demo_pay.sh
+#   BASE_URL=https://api.proofarena.xyz \
+#   TRIAL_ID=<id> \
+#   ONCHAINOS_ACCOUNT_ID=<payer account id> \
+#     ./demo_pay.sh
 #
 set -euo pipefail
 
 BASE_URL="${BASE_URL:?BASE_URL is required, e.g. https://api.proofarena.xyz}"
 TRIAL_ID="${TRIAL_ID:?TRIAL_ID is required — get one from GET /signal-trials/open-trial}"
+# The CLI signs with the CURRENTLY SELECTED account and has no per-invocation wallet
+# flag, so the payer must be selected explicitly. This is a real account id; the
+# label "second" is not one.
+ACCOUNT_ID="${ONCHAINOS_ACCOUNT_ID:?ONCHAINOS_ACCOUNT_ID is required — the payer account id, not a label}"
 P_FOLLOW="${P_FOLLOW:-0.62}"
-WALLET="${ONCHAINOS_WALLET:-second}"
 
 COMMIT_URL="${BASE_URL%/}/signal-trials/commit"
 BODY="$(printf '{"trial_id":"%s","p_follow_profitable":%s}' "$TRIAL_ID" "$P_FOLLOW")"
@@ -37,12 +43,18 @@ need curl
 need jq
 need onchainos
 
-# The commit window is 300s and live-only, so a stale trial id fails here rather
-# than after a payment has already been made.
-echo "==> 1/4  unpaid POST ${COMMIT_URL}"
+header_value() {
+  # Case-insensitive header lookup; HTTP header casing is not significant.
+  awk -v want="$1" 'BEGIN{IGNORECASE=1}
+    tolower($0) ~ "^" tolower(want) ":" { sub(/^[^:]*:[ ]*/, ""); gsub(/\r/, ""); print; exit }' "$2"
+}
+
 HDRS="$(mktemp)"; BODY_OUT="$(mktemp)"
 trap 'rm -f "$HDRS" "$BODY_OUT"' EXIT
 
+# The commit window is 300s and live-only, so a stale trial id fails here rather
+# than after a payment has already been made.
+echo "==> 1/4  unpaid POST ${COMMIT_URL}"
 STATUS="$(curl -sS -o "$BODY_OUT" -D "$HDRS" -w '%{http_code}' \
   -X POST "$COMMIT_URL" \
   -H 'content-type: application/json' \
@@ -50,27 +62,53 @@ STATUS="$(curl -sS -o "$BODY_OUT" -D "$HDRS" -w '%{http_code}' \
 
 if [ "$STATUS" != "402" ]; then
   echo "FATAL: expected 402 Payment Required, got ${STATUS}" >&2
-  # A 503 here means the deployment has no payment gate configured, which is a
+  # 503 here means the deployment has no payment gate configured, which is a
   # different failure from an unpaid request being allowed through.
   jq . < "$BODY_OUT" 2>/dev/null || cat "$BODY_OUT" >&2
   exit 1
 fi
 echo "    402 received"
 
-# The challenge is served in the payment-required header; the body carries the same
-# accepts block. Prefer the header, fall back to the body.
-CHALLENGE="$(awk 'BEGIN{IGNORECASE=1} /^payment-required:/{sub(/^[^:]*:[ ]*/,""); gsub(/\r/,""); print; exit}' "$HDRS")"
-if [ -z "$CHALLENGE" ]; then
-  CHALLENGE="$(jq -r '.accepts // empty | if type=="array" then .[0] else . end | @base64' < "$BODY_OUT")"
-fi
-[ -n "$CHALLENGE" ] || { echo "FATAL: no payment challenge in the 402 response" >&2; exit 1; }
-echo "    challenge extracted (${#CHALLENGE} chars)"
+# The complete encoded challenge is carried ONLY in PAYMENT-REQUIRED. The 402 body
+# is {"error": ...} and contains no usable challenge, so there is no fallback to
+# take: absence of the header is a hard failure.
+CHALLENGE="$(header_value 'payment-required' "$HDRS")"
+[ -n "$CHALLENGE" ] || {
+  echo "FATAL: the 402 carried no PAYMENT-REQUIRED header — nothing to pay" >&2
+  exit 1
+}
+echo "    challenge extracted from PAYMENT-REQUIRED (${#CHALLENGE} chars)"
 
-echo "==> 2/4  paying from the '${WALLET}' wallet via onchainos"
-# The CLI signs with its own configured key. No key material passes through this
-# script, so a shell trace of this file cannot leak one.
-SIGNATURE="$(onchainos payment pay --wallet "$WALLET" --payload "$CHALLENGE")"
-[ -n "$SIGNATURE" ] || { echo "FATAL: onchainos returned an empty payment signature" >&2; exit 1; }
+echo "==> 2/4  selecting payer account and signing"
+onchainos wallet switch "$ACCOUNT_ID" >/dev/null
+SELECTED="$(onchainos wallet current 2>/dev/null | jq -r '.account_id // .accountId // empty' || true)"
+if [ -n "$SELECTED" ] && [ "$SELECTED" != "$ACCOUNT_ID" ]; then
+  echo "FATAL: wallet selection did not take — asked for ${ACCOUNT_ID}, active is ${SELECTED}" >&2
+  exit 1
+fi
+
+# xtrace off from here: it expands assignment values and curl arguments, and the
+# authorization below is spendable. This is the enforcement behind the claim above.
+XTRACE_WAS_ON=0
+case "$-" in *x*) XTRACE_WAS_ON=1 ;; esac
+set +x
+
+# v2 output contract: {authorization_header, header_name, scheme, wallet}. The raw
+# authorization is one FIELD of that document, not the document.
+PAY_JSON="$(onchainos payment pay --payload "$CHALLENGE")"
+HEADER_NAME="$(printf '%s' "$PAY_JSON" | jq -r '.header_name // empty')"
+if [ "$HEADER_NAME" != "PAYMENT-SIGNATURE" ]; then
+  set +x
+  echo "FATAL: CLI returned header_name '${HEADER_NAME:-<absent>}', expected PAYMENT-SIGNATURE" >&2
+  exit 1
+fi
+AUTHORIZATION="$(printf '%s' "$PAY_JSON" | jq -r '.authorization_header // empty')"
+[ -n "$AUTHORIZATION" ] || {
+  set +x
+  echo "FATAL: CLI returned an empty authorization_header" >&2
+  exit 1
+}
+unset PAY_JSON
 echo "    signed"
 
 echo "==> 3/4  replaying the identical request with PAYMENT-SIGNATURE"
@@ -78,8 +116,10 @@ echo "==> 3/4  replaying the identical request with PAYMENT-SIGNATURE"
 STATUS="$(curl -sS -o "$BODY_OUT" -D "$HDRS" -w '%{http_code}' \
   -X POST "$COMMIT_URL" \
   -H 'content-type: application/json' \
-  -H "PAYMENT-SIGNATURE: ${SIGNATURE}" \
+  -H "PAYMENT-SIGNATURE: ${AUTHORIZATION}" \
   --data "$BODY")"
+unset AUTHORIZATION
+[ "$XTRACE_WAS_ON" -eq 1 ] && set -x
 
 if [ "$STATUS" != "200" ]; then
   echo "FATAL: expected 200 after payment, got ${STATUS}" >&2
@@ -89,27 +129,30 @@ fi
 echo "    200 received"
 
 echo "==> 4/4  settlement"
-SETTLE="$(awk 'BEGIN{IGNORECASE=1} /^payment-response:/{sub(/^[^:]*:[ ]*/,""); gsub(/\r/,""); print; exit}' "$HDRS")"
-TX_HASH=""
-if [ -n "$SETTLE" ]; then
-  # The header is base64-encoded JSON. Decode strictly: a header that does not
-  # decode is a settlement we cannot read, and reporting it as absent would be a
-  # quieter lie than saying so.
-  if ! DECODED="$(printf '%s' "$SETTLE" | base64 --decode 2>/dev/null)"; then
-    echo "FATAL: payment-response header is present but is not valid base64" >&2
-    exit 1
-  fi
-  TX_HASH="$(printf '%s' "$DECODED" | jq -r '.transaction // .txHash // .transaction_hash // empty')"
+# A 200 alone does not mean THIS request settled a payment: the route deliberately
+# omits PAYMENT-RESPONSE on an idempotent replay, because no new payment occurred.
+# Printing success for that case would claim a settlement the response disproves.
+SETTLE="$(header_value 'payment-response' "$HDRS")"
+[ -n "$SETTLE" ] || {
+  echo "FATAL: 200 with no PAYMENT-RESPONSE — this request settled no payment." >&2
+  echo "       An idempotent replay looks like this. It is not a demonstration of payment." >&2
+  exit 1
+}
+if ! DECODED="$(printf '%s' "$SETTLE" | base64 --decode 2>/dev/null)"; then
+  echo "FATAL: PAYMENT-RESPONSE is present but is not valid base64" >&2
+  exit 1
 fi
-RECEIPT_ID="$(jq -r '.receipt_id // empty' < "$BODY_OUT")"
+TX_HASH="$(printf '%s' "$DECODED" | jq -r '.transaction // .txHash // .transaction_hash // empty')"
+[ -n "$TX_HASH" ] || { echo "FATAL: PAYMENT-RESPONSE carries no transaction" >&2; exit 1; }
 
-# Both values are public: a settled X Layer transaction and a receipt id that the
-# verify endpoint serves to anyone. Neither is a secret.
+RECEIPT_ID="$(jq -r '.receipt_id // empty' < "$BODY_OUT")"
+[ -n "$RECEIPT_ID" ] || { echo "FATAL: 200 returned no receipt_id" >&2; exit 1; }
+
+# Both values are public: a settled X Layer transaction and a receipt id the verify
+# endpoint serves to anyone. Neither is a secret.
 echo
-echo "    receipt id : ${RECEIPT_ID:-<absent>}"
-echo "    tx hash    : ${TX_HASH:-<absent — no payment-response header>}"
+echo "    receipt id : ${RECEIPT_ID}"
+echo "    tx hash    : ${TX_HASH}"
 echo "    verify     : ${BASE_URL%/}/signal-trials/receipts/${RECEIPT_ID}/verify"
 echo
-
-[ -n "$RECEIPT_ID" ] || { echo "FATAL: 200 returned no receipt_id" >&2; exit 1; }
 echo "OK: paid commitment settled and is publicly verifiable."

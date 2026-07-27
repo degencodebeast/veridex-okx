@@ -84,10 +84,13 @@ def _printed_arguments(text: str) -> list[str]:
 def test_the_payment_signature_is_never_printed(source: str) -> None:
     """ACCEPTANCE — the signature is sent in a header and never echoed.
 
-    A shell trace of a leaking script would publish a spendable authorization into
-    whatever captures the demo's output.
+    This covers EXPLICIT prints only. It cannot see xtrace disclosure, which expands
+    assignments and curl arguments regardless of what any echo does — an earlier
+    version of this docstring claimed otherwise. ``test_demo_pay_contract.py`` runs
+    the script under ``bash -x`` and asserts a sentinel never appears; that is the
+    test which actually covers tracing.
     """
-    leaks = [arg for arg in _printed_arguments(source) if "SIGNATURE}" in arg or "$SIGNATURE" in arg]
+    leaks = [arg for arg in _printed_arguments(source) if "AUTHORIZATION}" in arg or "$AUTHORIZATION" in arg]
     assert leaks == [], f"the signature reaches a printing statement: {leaks}"
 
 
@@ -98,14 +101,14 @@ def test_the_leak_check_would_actually_catch_a_leak(tmp_path: Path, source: str)
     because the pattern never matches anything, not because the script is safe.
     """
     mutated = source.replace(
-        '[ -n "$SIGNATURE" ]',
-        'echo "signature is ${SIGNATURE}"\n[ -n "$SIGNATURE" ]',
+        'echo "    signed"',
+        'echo "authorization is ${AUTHORIZATION}"',
         1,
     )
     assert mutated != source, "the mutation did not apply — the control proves nothing"
 
     leaks = [
-        arg for arg in _printed_arguments(mutated) if "SIGNATURE}" in arg or "$SIGNATURE" in arg
+        arg for arg in _printed_arguments(mutated) if "AUTHORIZATION}" in arg or "$AUTHORIZATION" in arg
     ]
     assert leaks, "the leak check failed to detect a deliberately leaking script"
 
@@ -120,10 +123,17 @@ def test_it_asserts_the_402_then_the_200(source: str) -> None:
     assert '!= "200"' in source, "the paid replay must be asserted to return 200"
 
 
-def test_it_pays_from_the_second_wallet(source: str) -> None:
-    """Plan L243: the payer is the SECOND wallet, not the operator's funding wallet."""
+def test_it_selects_the_payer_account_rather_than_inventing_a_flag(source: str) -> None:
+    """Plan L243: the payer is the SECOND wallet, not the operator's funding wallet.
+
+    The CLI has NO per-invocation wallet flag — it signs with the currently selected
+    account — so selection is a separate command. An earlier version invented
+    ``payment pay --wallet``, which the installed CLI rejects outright.
+    """
     assert "onchainos payment pay" in source
-    assert "ONCHAINOS_WALLET" in source, "the wallet must come from the environment"
+    assert "--wallet" not in source, "the CLI has no --wallet flag; it rejects the argument"
+    assert "onchainos wallet switch" in source, "the payer account must be selected explicitly"
+    assert "ONCHAINOS_ACCOUNT_ID" in source, "the account id must come from the environment"
 
 
 def test_it_prints_the_transaction_hash_and_receipt_id(source: str) -> None:
