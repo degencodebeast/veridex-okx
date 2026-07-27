@@ -81,11 +81,23 @@ echo "    challenge extracted from PAYMENT-REQUIRED (${#CHALLENGE} chars)"
 
 echo "==> 2/4  selecting payer account and signing"
 onchainos wallet switch "$ACCOUNT_ID" >/dev/null
-SELECTED="$(onchainos wallet current 2>/dev/null | jq -r '.account_id // .accountId // empty' || true)"
-if [ -n "$SELECTED" ] && [ "$SELECTED" != "$ACCOUNT_ID" ]; then
+
+# Verify the switch actually took, and treat an unreadable status as a FAILURE
+# rather than a skip. Suppressing this read would mean signing with whatever
+# account happened to be selected — which spends from the wrong wallet while the
+# script claims it checked. The read command is `wallet status`; the selected id
+# lives at .data.currentAccountId, not at the root.
+STATUS_JSON="$(onchainos wallet status)"
+SELECTED="$(printf '%s' "$STATUS_JSON" | jq -r '.data.currentAccountId // empty')"
+[ -n "$SELECTED" ] || {
+  echo "FATAL: could not read .data.currentAccountId from 'onchainos wallet status'" >&2
+  exit 1
+}
+if [ "$SELECTED" != "$ACCOUNT_ID" ]; then
   echo "FATAL: wallet selection did not take — asked for ${ACCOUNT_ID}, active is ${SELECTED}" >&2
   exit 1
 fi
+echo "    payer account ${SELECTED} selected and verified"
 
 # xtrace off from here: it expands assignment values and curl arguments, and the
 # authorization below is spendable. This is the enforcement behind the claim above.

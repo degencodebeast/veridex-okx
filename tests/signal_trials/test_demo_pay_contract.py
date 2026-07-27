@@ -33,11 +33,23 @@ SENTINEL_AUTH = "SENTINEL-SPENDABLE-AUTHORIZATION-9f3a"
 RECEIPT_ID = "rcpt_test_0001"
 TX_HASH = "0xfeedfacefeedfacefeedfacefeedfacefeedface"
 
+# STATEFUL by design. An earlier version of this fake reported the account straight
+# from the environment, so it would have confirmed the desired selection even if the
+# script had passed `wallet switch` the WRONG account — the harness could not observe
+# the very thing it existed to prove. `wallet switch` now RECORDS its argument and
+# `wallet status` reports that recorded state.
 FAKE_ONCHAINOS = """#!/usr/bin/env bash
 set -euo pipefail
+STATE="$ONCHAINOS_STATE"
 case "$1 ${2:-}" in
-  "wallet switch") echo "switched" ;;
-  "wallet current") printf '{"account_id":"%s"}\\n' "${ONCHAINOS_ACCOUNT_ID}" ;;
+  "wallet switch")
+    # @@SWITCH_NOTE@@
+    printf '%s' @@SWITCH_RECORDS@@ > "$STATE"
+    echo "switched" ;;
+  "wallet status")
+    # Real 4.4.1 schema: the selected id is at .data.currentAccountId, not the root.
+    printf '{"ok":true,"data":{"accountCount":2,"currentAccountId":"%s","loggedIn":true}}\\n' \\
+      "$(cat "$STATE" 2>/dev/null)" ;;
   "payment pay")
     # v2 output contract: the authorization is ONE FIELD of this document.
     printf '{"authorization_header":"%s","header_name":"%s","scheme":"exact","wallet":"w"}\\n' \\
@@ -96,14 +108,28 @@ def harness(tmp_path: Path):
         header_name: str = "PAYMENT-SIGNATURE",
         transaction: str | None = TX_HASH,
         trace: bool = False,
+        switch_obeys: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         bindir = tmp_path / "bin"
         bindir.mkdir(exist_ok=True)
         log = tmp_path / "sent_headers.txt"
         log.write_text("")
 
+        state = tmp_path / "wallet_state"
+        # Obedient: record the id the script actually passed. Disobedient: record a
+        # DIFFERENT id, modelling a switch that silently did not take.
+        records = '"$3"' if switch_obeys else '"acct_WRONG_9999"'
+        note = (
+            "record the account the script actually asked for"
+            if switch_obeys
+            else "deliberately ignore the argument — models a switch that did not take"
+        )
         _write_exec(
-            bindir / "onchainos", FAKE_ONCHAINOS.replace("@@AUTH@@", auth).replace("@@HEADER_NAME@@", header_name)
+            bindir / "onchainos",
+            FAKE_ONCHAINOS.replace("@@AUTH@@", auth)
+            .replace("@@HEADER_NAME@@", header_name)
+            .replace("@@SWITCH_RECORDS@@", records)
+            .replace("@@SWITCH_NOTE@@", note),
         )
         _write_exec(
             bindir / "curl",
@@ -118,6 +144,7 @@ def harness(tmp_path: Path):
             "TRIAL_ID": "trial_test",
             "ONCHAINOS_ACCOUNT_ID": "acct_second_0001",
             "CURL_LOG": str(log),
+            "ONCHAINOS_STATE": str(state),
         }
         cmd = ["bash", "-x", str(SCRIPT)] if trace else ["bash", str(SCRIPT)]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
@@ -199,4 +226,34 @@ def test_the_trace_harness_would_actually_catch_a_leak(harness) -> None:
     combined = proc.stdout + proc.stderr
     assert RECEIPT_ID in combined, (
         "the harness sees no traced output at all, so the leak assertion proves nothing"
+    )
+
+
+def test_the_selected_account_is_read_from_wallet_status(harness) -> None:
+    """ACCEPTANCE — verification uses the REAL read command and the REAL field.
+
+    ``wallet current`` does not exist in onchainos 4.4.1. The selected id lives at
+    ``.data.currentAccountId``; an earlier version parsed root-level fields that are
+    never populated, so verification silently produced an empty value and was
+    skipped while the script claimed it had checked.
+    """
+    proc, _ = harness()
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    assert "acct_second_0001 selected and verified" in proc.stdout
+
+
+def test_a_switch_that_does_not_take_aborts_before_signing(harness) -> None:
+    """DISCRIMINATION — the whole point of verifying the selection.
+
+    The fake ignores the requested account and reports a different one. The script
+    must refuse: signing here would spend from the wrong wallet while reporting
+    success. This is the control the previous harness could not express, because it
+    reported the account from the environment rather than from the switch argument.
+    """
+    proc, sent = harness(switch_obeys=False)
+    assert proc.returncode != 0, "a switch that did not take must abort"
+    assert "wallet selection did not take" in proc.stderr
+    assert "acct_WRONG_9999" in proc.stderr, "the error must name what is actually selected"
+    assert not [h for h in sent if h.lower().startswith("payment-signature:")], (
+        "nothing may be signed or sent once the payer account is wrong"
     )
