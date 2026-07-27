@@ -70,13 +70,18 @@ services:
       # signal-trials path reads; there is no facilitator variable at all, because the facilitator is
       # BUILT from the OKX credentials by _build_okx_facilitator(), not configured by URL.
       #
-      # These use `:?` where the OKX credentials above use `:-`, and the difference is deliberate:
-      # run_preflight is an OPERATOR COMMAND with a tested MissingCredentialError path, while this is
-      # the SERVED MONEY PATH, which payments.py:240,245 makes RAISE under APP_ENV=production. The
-      # app fails closed either way; a `:?` moves that failure to compose render, where the message
-      # names the variable instead of surfacing as a startup traceback.
-      X402_ENABLED: ${X402_ENABLED:?X402_ENABLED is required (payments.py raises when APP_ENV is production and x402 is disabled)}
-      PAY_TO_ADDRESS: ${PAY_TO_ADDRESS:?PAY_TO_ADDRESS is required (a valid payee; payments.py rejects a malformed one in production)}
+      # `:-`, MATCHING THE OKX CREDENTIALS ABOVE. An earlier head used `:?` here and argued the
+      # served money path was different from an operator command. A reviewer measured the premise and
+      # it does not hold: _build_okx_facilitator hands the values straight to the pinned SDK, which
+      # REFUSES blank credentials with a ValueError, so BOTH sets already fail closed AT STARTUP on the
+      # served path. What `:?` bought was a better error message. What it COST was the local-boot
+      # contract this file promises at :11-14 and all six @docker_required tests in
+      # tests/test_d1_compose_deploy.py, whose LOCAL_TEST_ENV carries neither key and which run with
+      # APP_ENV=development where no payment gate is wanted at all. That breakage was LATENT here —
+      # every one of those tests SKIPS without a docker daemon, and `docker compose config` needs no
+      # daemon, which is how the reviewer proved it. Let the app's own tested loader raise.
+      X402_ENABLED: ${X402_ENABLED:-false}
+      PAY_TO_ADDRESS: ${PAY_TO_ADDRESS:-}
       # `:-` here on purpose: payments.py:236 falls back to DEFAULT_COMMIT_PRICE, so an unset value
       # is a real default rather than a missing configuration.
       SIGNAL_TRIALS_COMMIT_PRICE: ${SIGNAL_TRIALS_COMMIT_PRICE:-}

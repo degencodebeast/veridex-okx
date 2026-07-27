@@ -55,12 +55,20 @@ COPY scripts/seed_official_replay_league.py /opt/veridex/scripts/
 COPY scripts/txline_live/cp1/maker-arena-result.json /app/scripts/txline_live/cp1/maker-arena-result.json
 COPY scripts/txline_live/cp1/fixtures.json /app/scripts/txline_live/cp1/fixtures.json
 
-# H6 OPERATOR ENTRY POINTS. run_preflight.py, open_live_trial.py and settle_live_trials.py are the
-# commands an operator runs INSIDE the deployed container to select a season, open a live trial and
-# settle outcomes. They were absent from this image entirely — the Gate A audit found H6 had no way
-# to execute its own frozen steps against production. Copied as a DIRECTORY so a script added by a
-# later task ships without another Dockerfile edit; that is deliberate, because the alternative is a
-# per-file list that goes stale silently the way the web image's commented-out public/ COPY did.
+# H6 OPERATOR ENTRY POINTS — the commands an operator runs INSIDE the deployed container.
+# PRESENT IN THIS WORKTREE: run_preflight.py (select a season) and open_live_trial.py (open a live
+# trial). settle_live_trials.py (settle outcomes) is NOT in this worktree — it lives on the payments
+# lane and arrives only in the assembled Gate-3 candidate, which is the tree this image is actually
+# built from. An earlier version of this comment named all three flatly, which was FALSE HERE and
+# true only of the merged tree; a reviewer checked the name against this tree and was right to flag
+# it. The COPY below is a DIRECTORY copy, so whichever of the three exist in the build context ship
+# and the build never breaks on an absent one — which is exactly why the false name cost nothing at
+# build time and everything at reading time.
+#
+# These entry points were absent from the image entirely until the Gate A audit found H6 had no way to
+# execute its own frozen steps against production. The directory copy is deliberate: a script added by
+# a later task ships without another Dockerfile edit, whereas a per-file list goes stale silently the
+# way the web image's commented-out public/ COPY did.
 # Importing these modules has no side effects (all work sits under a __main__ guard), so the layer is
 # inert until an operator invokes one.
 COPY scripts/signal_trials /app/scripts/signal_trials
