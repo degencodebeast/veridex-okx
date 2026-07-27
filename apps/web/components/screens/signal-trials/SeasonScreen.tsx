@@ -158,6 +158,21 @@ function NoSeasonState() {
           manifest.
         </p>
       </details>
+      {/* PROOFARENA-EXACT-COPY.md:107 — `no_season`'s SECOND action, and the one H5.2 deliberately
+          did not ship. `apps/web/public` did not exist then, so this link would have 404'd, and a
+          dead link on the honesty surface is worse than a missing one. H5.5 creates
+          `public/SKILL.md` and uncomments the Dockerfile COPY that carries it into the image
+          (PKT-DEC-C64) in the same commit as this line, which is what makes the link true.
+          `.probeSummary` is reused rather than given a class of its own: it is the style the
+          sibling action on this same copy line already uses, and the two are meant to read as a
+          pair. `not_built` carries NO actions line and must not borrow this one. */}
+      <a
+        className={styles.probeSummary}
+        href="/SKILL.md"
+        target="_blank"
+        rel="noreferrer"
+        data-testid="season-skill-md"
+      >READ SKILL.md ↗</a>
     </>
   );
 }

@@ -490,3 +490,42 @@ describe('H5.2 the /trials page', () => {
     expect(fetchedPaths().some((p) => p.includes('/signal-trials/season'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GROUP G (H5.5) — the deferred `READ SKILL.md ↗` action, added now that the
+// link resolves to a real document.
+// ---------------------------------------------------------------------------
+// PROOFARENA-EXACT-COPY.md:107 gives `no_season` TWO actions: `VIEW PROBE COUNTS →` and
+// `READ SKILL.md ↗`. H5.2 shipped the first and REFUSED the second, because
+// `apps/web/public` did not exist and the link would have 404'd — a dead link on the honesty
+// surface is worse than a missing one. SPEC ruled that refusal correct. H5.5 creates
+// `apps/web/public/SKILL.md` AND uncomments the Dockerfile `COPY` that puts it in the image
+// (PKT-DEC-C64), so this is the one commit in which the link becomes true, and the refusal and
+// the fix are one decision seen at two times.
+describe('H5.5 the no_season state offers READ SKILL.md, now that the target exists', () => {
+  it('renders the action as a real link to /SKILL.md', async () => {
+    stubRoutes({ season: SEASON_404, health: () => jsonResponse({ ok: true, season_state: 'no_season' }) });
+    await panel();
+    const link = screen.getByTestId('season-skill-md');
+    // Character-for-character, INCLUDING the U+2197 arrow: `toHaveTextContent` normalises
+    // whitespace and matches substrings, so it would pass on copy this exact-copy line forbids.
+    expect(link.textContent).toBe('READ SKILL.md ↗');
+    // The href is the whole point of the deferral. `public/SKILL.md` is served from the image
+    // root, so this is the path the H6.0 Step 0 smoke curls.
+    expect(link).toHaveAttribute('href', '/SKILL.md');
+  });
+
+  // C46 — this control was GREEN when written, because at that point the action existed in no
+  // state at all. It becomes load-bearing the moment the action lands: it fails if the link is
+  // added to a shared branch of `SeasonBody` rather than to `NoSeasonState` alone.
+  //
+  // C52 — the discrimination control, and it is a copy rule rather than a preference:
+  // PROOFARENA-EXACT-COPY.md gives `not_built` NO actions line at all. This state is reachable in
+  // production for every failed, refused or aborted probe (C54), and it must not borrow
+  // `no_season`'s affordances any more than it may borrow its copy.
+  it('not_built does NOT carry the action', async () => {
+    stubRoutes({ season: SEASON_404, health: () => jsonResponse({ ok: true, season_state: 'not_built' }) });
+    await panel();
+    expect(screen.queryByTestId('season-skill-md')).not.toBeInTheDocument();
+  });
+});

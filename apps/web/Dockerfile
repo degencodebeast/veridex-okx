@@ -61,9 +61,13 @@ RUN apk add --no-cache --virtual .build-deps python3 make g++ \
 # a root-owned .next would EACCES under USER node.
 COPY --from=build --chown=node:node /app/.next ./.next
 COPY next.config.mjs ./
-# apps/web has no public/ today. The day it appears, uncomment — otherwise
-# the image silently drops static assets with no build error:
-# COPY --from=build --chown=node:node /app/public ./public
+# public/ exists as of H5.5 and carries SKILL.md, the one-prompt onboarding artifact the
+# marketplace listing links to. WITHOUT this COPY the image silently drops it with no build
+# error — `next start` serves public/ from the image, and every source-tree gate (pnpm test,
+# pnpm build, docker build, /readyz) stays green while https://proofarena.xyz/SKILL.md 404s.
+# PKT-DEC-C64 makes this line and the file a single acceptance criterion; lib/signal-trials-api.test.ts
+# asserts this COPY is ACTIVE, so re-commenting it fails the suite rather than the deploy.
+COPY --from=build --chown=node:node /app/public ./public
 USER node
 EXPOSE 3000
 # Invoke the next binary directly — pnpm/corepack must NOT be on the runtime

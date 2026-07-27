@@ -842,3 +842,258 @@ describe('getTrialReceipts fails closed on a non-array 200', () => {
     await expect(getTrialReceipts('t_9')).resolves.toEqual([]);
   });
 });
+
+// ===========================================================================
+// H5.5 — the public `SKILL.md`, and the image that must actually carry it.
+// ===========================================================================
+//
+// WHY THESE TESTS LIVE IN THE ADAPTER'S TEST FILE and not beside the document: the endpoint list
+// below is DERIVED from `SIGNAL_TRIALS_PATHS`, the same constant every fetcher above binds to. A
+// hand-retyped list would be a second spelling of the routes with nothing able to notice a drift
+// between them — precisely the CF-5 failure the check-keys constant exists to prevent. Deriving it
+// here means a route rename in `lib/signal-trials-api.ts` breaks the DOCUMENT'S test, which is the
+// only mechanism that keeps the public onboarding artifact honest about the API it describes.
+//
+// C64 IS THE REASON THE DOCKERFILE IS ASSERTED AT ALL. `apps/web/public/SKILL.md` existing in the
+// source tree is NOT acceptance: `pnpm test`, `pnpm build` and `docker build` all pass while the
+// deployed `/SKILL.md` 404s, because the runner stage copies `.next` and never `public`. Every gate
+// this task has is a SOURCE-TREE gate; the 404 appears only when something requests the file from
+// the running image, and the first thing to do that is the H6.0 Step 0 smoke at the eligibility
+// clock. So the second describe below asserts the COPY is active, and — per C66 — proves the
+// assertion discriminates by re-commenting the line and watching it fail.
+
+const SKILL_MD = readFileSync(resolve(__dirname, '../public/SKILL.md'), 'utf8');
+const DOCKERFILE = readFileSync(resolve(__dirname, '../Dockerfile'), 'utf8');
+
+// A URI-safe stand-in for a path parameter. `SIGNAL_TRIALS_PATHS` runs `encodeURIComponent` over
+// its argument, so `{id}` would arrive as `%7Bid%7D`; an alphanumeric sentinel passes through
+// untouched and is then swapped for the placeholder spelling the document uses.
+const PATH_PARAM = 'PARAM';
+
+// THE SIX ENDPOINTS `SKILL.md` MUST NAME.
+//
+// The frozen plan (L1061) says the test asserts the file "names the FIVE endpoints". Integration
+// enumerated the same plan's Step-1 prose and it specifies SIX distinct paths; PKT-TASK-H5-5 rules
+// that all six are named, because omitting a real endpoint to match a miscount is the worse error.
+//
+// FIVE of the six are derived from `SIGNAL_TRIALS_PATHS`. `POST /signal-trials/commit` is a
+// LITERAL and cannot be derived: the path map belongs to a READ client that never calls the paid
+// route (see `getOpenTrial`'s note on the two 503s it therefore never sees), so no entry exists to
+// derive from. That is a disclosed gap in the binding, not an oversight — the commit path is the
+// one route here whose spelling this test cannot keep in step with the client automatically.
+//
+// `SIGNAL_TRIALS_PATHS` also carries a SEVENTH route, `trialReceipts`, added by the route-contract
+// addendum after the plan froze. It is deliberately absent: the packet enumerated six from Step 1,
+// and adding a route the ruling did not name would be this test widening its own scope.
+const SKILL_MD_ENDPOINTS: readonly { readonly method: string; readonly path: string }[] = [
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.openTrial() },
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.season() },
+  { method: 'POST', path: '/signal-trials/commit' },
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.trial(PATH_PARAM).replace(PATH_PARAM, '{id}') },
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.agent(PATH_PARAM).replace(PATH_PARAM, '{payer}') },
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.verifyReceipt(PATH_PARAM).replace(PATH_PARAM, '{id}') },
+];
+
+function endpointLine(e: { method: string; path: string }) {
+  return `${e.method} ${e.path}`;
+}
+
+describe('public SKILL.md names the API surface it claims to document', () => {
+  it('exists and carries content — the file the deploy smoke will request', () => {
+    expect(SKILL_MD.trim().length).toBeGreaterThan(0);
+  });
+
+  // SIX, not five. One assertion per endpoint so a drop is attributable to the endpoint dropped
+  // rather than to "the list changed".
+  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e)] as const))(
+    'names %s',
+    (line) => {
+      expect(SKILL_MD).toContain(line);
+    },
+  );
+
+  // C66 — the discrimination control for the predicate above, and the direct answer to "would this
+  // fail if an endpoint were dropped?". Each endpoint's line is DELETED from a copy of the document
+  // and the same predicate is re-run: it must fail. A `toContain` over a document that happens to
+  // mention a path proves nothing on its own; this is what makes the six load-bearing.
+  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e)] as const))(
+    'a document with %s removed FAILS the same predicate',
+    (line) => {
+      const without = SKILL_MD.split(line).join('');
+      expect(without).not.toEqual(SKILL_MD); // the mutation demonstrably landed
+      expect(without).not.toContain(line);
+    },
+  );
+
+  // Plan Step 1's commit terms. Split per term for the same attributability reason.
+  it('states the $0.01 price', () => {
+    expect(SKILL_MD).toContain('$0.01');
+  });
+
+  it('states the 300-second decision window', () => {
+    expect(SKILL_MD).toMatch(/300\s*seconds/);
+  });
+
+  it('states the commit body fields by their wire names', () => {
+    expect(SKILL_MD).toContain('trial_id');
+    expect(SKILL_MD).toContain('p_follow_profitable');
+  });
+
+  it('states that paid commits are live-only', () => {
+    expect(SKILL_MD).toMatch(/live[- ]only/i);
+  });
+
+  // The honest empty state on discovery. A caller that reads a 404 here as an outage will retry a
+  // quiet period forever, which is why the code is named in the document rather than implied.
+  it('names the no_open_trial 404 as an honest state', () => {
+    expect(SKILL_MD).toContain('no_open_trial');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The language guard. This is the most externally-read artifact in the build.
+// ---------------------------------------------------------------------------
+
+// The §3.8 listing sentence, VERBATIM from `authority/frozen-spec.md`. It is quoted here rather
+// than paraphrased because H6.0 Step 4 submits this exact copy to the marketplace listing.
+const SECTION_3_8 =
+  'Veridex provides reproducible agent benchmarking and auditable calibration records from frozen ' +
+  'market evidence. It does not execute trades, provide personalized investment advice, or claim ' +
+  'proven alpha.';
+
+// C44: the word list is the SEARCH SPACE and the banned trading SENSE is the discriminator.
+const BANNED_TRADING_WORDS = /\b(verified|edges?|fills?|filled|PnL|proven|profit\w*|ROI|positions?|alpha)\b/gi;
+
+// The two exemptions, each an ordinary-language or wire-name use rather than a trading claim.
+// Stripped BEFORE the predicate runs so the predicate itself stays blunt and unarguable.
+//
+//   * `p_follow_profitable` / `follow_profitable` — REQUIRED wire field names. A document that
+//     cannot spell the field a caller must POST is unusable, and the field name asserts nothing
+//     about anyone having made money.
+//   * the §3.8 sentence — every banned word in it ("proven alpha") appears under NEGATION. It is
+//     the frozen listing copy and is the strongest honesty statement in the file, so a grep that
+//     failed the document for containing its own disclaimer would be the instrument misfiring.
+function strippedOfExemptions(text: string): string {
+  return text.split('p_follow_profitable').join('').split('follow_profitable').join('').split(SECTION_3_8).join('');
+}
+
+describe('SKILL.md language guard — paper-markout only, no trading claim', () => {
+  it('carries the §3.8 listing sentence verbatim', () => {
+    expect(SKILL_MD).toContain(SECTION_3_8);
+  });
+
+  // C46 — LABELLED PIN. This was GREEN against the empty placeholder that produced the captured
+  // RED, because an empty document contains no banned word. Its RED is UNOBTAINABLE in the units of
+  // the claim: the only document that fails it is one that already carries the violation, and
+  // writing a violation in order to watch the test catch it would then have to be un-written. Its
+  // discrimination is supplied instead by the two paired controls below, which run the SAME
+  // predicate over text that must trip it. It DID catch a real hit during authoring: an earlier
+  // draft read "never filled in", and `filled` is in the search space. Per C44 that was an
+  // ordinary-English homonym rather than the banned trading sense — a false positive of the
+  // instrument — and it was resolved by rewording to "never invented" rather than by adding a third
+  // exemption, so the predicate stays blunt for the next editor.
+  it('contains no banned trading word outside the two disclosed exemptions', () => {
+    expect(strippedOfExemptions(SKILL_MD).match(BANNED_TRADING_WORDS)).toBeNull();
+  });
+
+  // C52/C46 — a discrimination CONTROL, green by construction and by design. The predicate above is
+  // worth nothing unless this demonstrates it fires on the sentence it exists to forbid.
+  it('the banned-word predicate fires on a real trading claim', () => {
+    expect(strippedOfExemptions('this agent made a 12% profit on a filled position')).toMatch(
+      BANNED_TRADING_WORDS,
+    );
+  });
+
+  // C52/C46 — the second control, also green by construction. The exemption is SCOPED, not a hole:
+  // the field NAME is stripped, a profit CLAIM standing next to it still trips the predicate.
+  it('the exemption does not license a profit claim that merely sits next to the field name', () => {
+    expect(strippedOfExemptions('p_follow_profitable — how much profit you made')).toMatch(
+      BANNED_TRADING_WORDS,
+    );
+  });
+
+  it('uses the one permitted markout label, spelled from the adapter constant', () => {
+    expect(SKILL_MD).toContain(SIGNAL_TRIALS_MARKOUT_LABEL);
+  });
+
+  it('states that qualified is false on live records', () => {
+    expect(SKILL_MD).toMatch(/`qualified`[^.]*`false`[^.]*live/i);
+  });
+});
+
+// The binding from the H4.3 milestone Codex: the eight checks are REPRODUCIBILITY CHECKS OVER
+// RECORDED EVIDENCE. They re-derive a receipt's claims from the stored artifacts. That is NOT proof
+// against a malicious storage operator, and no copy in this program may say otherwise — least of
+// all the file a judge reads first.
+const STORAGE_OVERCLAIM =
+  /\btamper[-\s]?(proof|evident|resistant)\b|\bimmutab\w*|\bcannot be (altered|changed|edited|tampered)\b/i;
+
+describe('SKILL.md describes verification as reproducibility, never as tamper-proofing', () => {
+  // `\s+` rather than a literal space, and `[^.]` rather than `.`, so the assertion survives the
+  // document being re-wrapped. A copy test that breaks when a paragraph reflows trains an editor to
+  // weaken the test instead of fixing the copy, which is the opposite of what it is for.
+  it('makes the reproducibility-over-recorded-evidence claim explicitly', () => {
+    expect(SKILL_MD).toMatch(/reproducibility[^.]*recorded\s+evidence/i);
+  });
+
+  // C46 — LABELLED PIN, same shape as the banned-word assertion above and for the same reason: it
+  // was green against the empty placeholder, and its RED is unobtainable without first writing the
+  // overclaim it forbids. The three controls beneath it carry the discrimination.
+  it('makes no tamper-proofing or immutability claim', () => {
+    expect(SKILL_MD).not.toMatch(STORAGE_OVERCLAIM);
+  });
+
+  // C52/C46 — controls, green by construction: the overclaim predicate demonstrably fires on each
+  // of the three claims the H4.3 milestone Codex forbids this program from making.
+  it.each([
+    'receipts are tamper-proof',
+    'the record is immutable once written',
+    'a published outcome cannot be altered',
+  ])('the overclaim predicate fires on %s', (claim) => {
+    expect(claim).toMatch(STORAGE_OVERCLAIM);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C64 — the file must reach the IMAGE, not merely the source tree.
+// ---------------------------------------------------------------------------
+
+// An ACTIVE `COPY` of `public` into the runner stage. Anchored to the start of a line and allowing
+// only whitespace before `COPY`, so a `#` in front of it does NOT match — which is the entire point
+// of the assertion. `[^#\n]*` after COPY keeps a trailing-comment form from matching a commented
+// line that happens to contain the word COPY later on.
+const ACTIVE_PUBLIC_COPY = /^[ \t]*COPY[^#\n]*\/app\/public\s+\.\/public[ \t]*$/m;
+
+describe('C64: the Dockerfile actually ships public/ — a source-tree file is not acceptance', () => {
+  // The defect this exists for: `pnpm test`, `pnpm build` and `docker build` all pass, the
+  // container starts, `/readyz` is green — and `https://proofarena.xyz/SKILL.md` 404s, because
+  // `next start` serves `public` from the image and the runner stage never copied it.
+  it('carries an ACTIVE, uncommented COPY of public into the runner stage', () => {
+    expect(DOCKERFILE).toMatch(ACTIVE_PUBLIC_COPY);
+  });
+
+  // C66, and the direct answer to "would this fail if someone re-commented the COPY?". The real
+  // Dockerfile text is mutated — the matched line is commented back out — and the same predicate is
+  // re-run against the mutant. The inequality assertion proves the mutant actually loaded (C41):
+  // without it, a regex that silently matched nothing would pass this test by doing nothing.
+  it('FAILS when that COPY is commented back out', () => {
+    const recommented = DOCKERFILE.replace(ACTIVE_PUBLIC_COPY, (line) => `# ${line.trim()}`);
+    expect(recommented).not.toEqual(DOCKERFILE);
+    expect(recommented).not.toMatch(ACTIVE_PUBLIC_COPY);
+  });
+
+  // C52/C46 — a control, green by construction. The predicate must not be satisfiable by the
+  // COMMENT that stood in this file before H5.5. Reconstructing that exact prior line and asserting
+  // it fails is what separates "an active COPY exists" from "the word COPY appears near public".
+  it('is not satisfied by the pre-H5.5 commented placeholder', () => {
+    expect('# COPY --from=build --chown=node:node /app/public ./public').not.toMatch(ACTIVE_PUBLIC_COPY);
+  });
+
+  // The pairing C64 makes an acceptance criterion, asserted as one fact: the COPY without the file
+  // breaks the build on a missing directory, and the file without the COPY ships a 404 at the
+  // eligibility gate. Neither half is allowed to land alone.
+  it('ships the COPY and the file together', () => {
+    expect(DOCKERFILE).toMatch(ACTIVE_PUBLIC_COPY);
+    expect(SKILL_MD.trim().length).toBeGreaterThan(0);
+  });
+});
