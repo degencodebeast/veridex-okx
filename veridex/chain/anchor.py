@@ -38,6 +38,9 @@ def run_manifest_hash(manifest: dict[str, Any]) -> str:
     Canonical form: json.dumps with sort_keys=True and compact separators — deterministic
     across processes and Python versions.
     """
+    # NOT only determinism: the DEFAULT ensure_ascii=True / allow_nan=True here are load-bearing for
+    # the receipt verifier's honesty guarantee — see ``veridex.signal_trials.receipts._rehash_reproduces``,
+    # whose RecursionError-only guard is complete only while this pair cannot raise a ValueError.
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
