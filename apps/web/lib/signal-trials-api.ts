@@ -20,11 +20,11 @@
 // absence into a value, because "the backend omitted this" and "the backend reported nothing was
 // computed" are different claims and merging them fabricates the second. It also never lets the
 // violation surface as an anonymous `TypeError`, which names whichever field the code happened to
-// dereference first rather than the one actually missing. The three sites are the absent `outcome`
-// key (`adaptTrial`), the absent `checks` map (`adaptVerifyReceipt`) and an unrecognised
-// `season_state` (`getSeasonHealth`). Unrecognised check KEYS are the deliberate exception: they
-// are surfaced in `unexpectedKeys` rather than thrown, because an extra key invalidates nothing
-// that was served alongside it.
+// dereference first rather than the one actually missing. The four sites are the absent `outcome`
+// key (`adaptTrial`), the absent `checks` map (`adaptVerifyReceipt`), an unrecognised
+// `season_state` (`getSeasonHealth`) and a non-array receipts body (`getTrialReceipts`).
+// Unrecognised check KEYS are the deliberate exception: they are surfaced in `unexpectedKeys`
+// rather than thrown, because an extra key invalidates nothing that was served alongside it.
 import { ApiError } from '@/lib/api';
 import type * as W from '@/lib/wire';
 import type {
@@ -58,6 +58,15 @@ export const SIGNAL_TRIALS_CHECK_KEYS = [
 // markouts over recorded bars after modeled costs — never a realized fill, position or PnL.
 export const SIGNAL_TRIALS_MARKOUT_LABEL = 'paper markout (bps, after modeled costs)';
 
+// The wire code for `GET /signal-trials/trials/{id}/receipts`'s 503, spelled ONCE.
+//
+// The route-contract addendum requires the frontend to match this string EXACTLY, and records a
+// naming caveat carried but not closed (QUALITY Q3): the backend module elsewhere calls this object
+// the *commit store*, and the family's other 503 codes are state-shaped. If it is ever renamed to
+// `commit_store_unavailable`, the addendum must be revised FIRST — this constant plus its test are
+// the frontend's half of that gate, which is why the match is exact rather than "any 503".
+export const SIGNAL_TRIALS_PARTICIPANT_STORE_UNAVAILABLE = 'participant_store_unavailable';
+
 const SIGNAL_TRIALS_PREFIX = '/signal-trials';
 
 // Centralized path map — the binding points. A route change is a one-line edit.
@@ -66,6 +75,8 @@ export const SIGNAL_TRIALS_PATHS = {
   season: () => `${SIGNAL_TRIALS_PREFIX}/season`,
   openTrial: () => `${SIGNAL_TRIALS_PREFIX}/open-trial`,
   trial: (trialId: string) => `${SIGNAL_TRIALS_PREFIX}/trials/${encodeURIComponent(trialId)}`,
+  trialReceipts: (trialId: string) =>
+    `${SIGNAL_TRIALS_PREFIX}/trials/${encodeURIComponent(trialId)}/receipts`,
   agent: (payer: string) => `${SIGNAL_TRIALS_PREFIX}/agents/${encodeURIComponent(payer)}`,
   verifyReceipt: (receiptId: string) =>
     `${SIGNAL_TRIALS_PREFIX}/receipts/${encodeURIComponent(receiptId)}/verify`,
@@ -121,6 +132,38 @@ async function getJson<T>(path: string): Promise<T> {
   const res = await signalTrialsGet(path);
   if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
   return (await res.json()) as T;
+}
+
+// The participant set could not be served because no participant store is mounted.
+//
+// This is a REFUSAL, and it is emphatically NOT an empty participant set: `[]` is a positive claim
+// that nobody has paid to commit, and a deployment with no store mounted has no basis for it.
+// Carrying a distinct type is what lets a screen render an UNAVAILABILITY state — the one honest
+// rendering — instead of an empty leaderboard. `code` is the wire code verbatim so a consumer can
+// see WHICH refusal it was rather than inferring it from the 503 alone.
+export class SignalTrialsUnavailableError extends ApiError {
+  constructor(readonly code: string, message: string) {
+    super(503, message);
+    this.name = 'SignalTrialsUnavailableError';
+  }
+}
+
+// Read the backend's refusal code out of an error response. The envelope is `{"error": code}`
+// (signal_trials_router.py `_error`), deliberately NOT HTTPException's `{"detail": ...}`.
+//
+// Returns null when the body is absent, unparseable, or shaped otherwise — an intermediary's 503
+// is not the route's 503, and a caller must be able to tell "the route named this refusal" apart
+// from "something returned this status". It never throws: a failure to read the body must not
+// replace the status the caller is trying to report.
+async function readSignalTrialsErrorCode(res: Response): Promise<string | null> {
+  try {
+    const body: unknown = await res.json();
+    if (typeof body !== 'object' || body === null) return null;
+    const code = (body as { error?: unknown }).error;
+    return typeof code === 'string' ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 // 404 is a legitimate DOMAIN state on every Signal Trials resource route, and the backend says so
@@ -362,4 +405,98 @@ export async function getAgentRecord(payer: string): Promise<AgentRecord | null>
 export async function verifyReceipt(receiptId: string): Promise<VerifyChecks | null> {
   const w = await getJsonOrNullOn404<W.VerifyReceiptWire>(SIGNAL_TRIALS_PATHS.verifyReceipt(receiptId));
   return w === null ? null : adaptVerifyReceipt(w);
+}
+
+// GET /signal-trials/trials/{trial_id}/receipts → this trial's participant set.
+//
+// AUTHORITY: PKT-ROUTE-CONTRACT-ADDENDUM-TRIAL-RECEIPTS (sha256 e03ef362…), not any message.
+// SCHEMA_FREEZE is NOT amended by it — the array element is the already-frozen
+// `CommitReceiptResponse`, so `CommitReceiptWire` is the element, `adaptCommitReceipt` above is the
+// one adapter for it, and no new type is introduced on either side of the boundary. `receipt_id`
+// per element is the join key that makes the frozen verify route reachable per participant.
+//
+// FINALIZED-ONLY VISIBILITY is this route's trust boundary. It reads `finalized_commits_for_trial`
+// → `ReceiptStore.finalized()` → `_public_iter()`, the store's single public visibility gate, so
+// staged, in-flight, settle-attempted and quarantined rows cannot appear by construction. A free
+// read therefore serves PAID commitments only, and "every row here is a commitment that was
+// actually paid for" is a true statement the UI may make. It is NOT a statement about tamper-
+// proofing or immutability: what the verify route establishes is REPRODUCIBILITY OVER RECORDED
+// EVIDENCE, never proof against a malicious storage operator, and no copy built on this array may
+// say otherwise.
+//
+// FOUR ANSWERS. Collapsing any pair of them publishes a claim the backend never made:
+//
+//   200 [...]   the participant set, IN THE BACKEND'S ORDER (ascending `receipt_id`)
+//   200 []      resolves to `[]`   — nobody has paid to commit on this trial. A REAL state,
+//                                    neither an error nor a loading state.
+//   404         resolves to `null` — this trial is unknown.
+//   503 / 5xx   THROWS             — no basis for any claim about who committed.
+//
+// `[]` is a POSITIVE claim. A trial that does not exist and a deployment with no participant store
+// mounted have equally no basis for making it, which is exactly why neither resolves to `[]` here.
+export async function getTrialReceipts(trialId: string): Promise<CommitReceipt[] | null> {
+  const path = SIGNAL_TRIALS_PATHS.trialReceipts(trialId);
+  const res = await signalTrialsGet(path);
+
+  // 404 — the trial is unknown, in EITHER of the two body shapes this route can produce.
+  //
+  // The route's own refusal is `{"error": "trial_not_found"}`. The framework's is
+  // `{"detail": "Not Found"}`, and a trial id containing `/` reaches it: `encodeURIComponent`
+  // sends `%2F`, uvicorn then UNQUOTES `raw_path` into `scope["path"]` (h11_impl.py:202,
+  // httptools_impl.py:260), and Starlette routes on `scope["path"]` and never on `raw_path` — so
+  // the id becomes extra path segments and matches no route at all. (Measured during H4.4, where
+  // an earlier comment had this mechanism exactly backwards until a reviewer caught it.)
+  //
+  // Branching on the STATUS and never on an `error` key is deliberate, and both shapes therefore
+  // mean the same thing here. A consumer branching on `error` would not recognise the framework's
+  // shape and would fall through to a throw, reporting an outage for what is really an
+  // unaddressable id. "No such trial is reachable" is the true statement in both cases, and the
+  // addendum's non-echo rule holds either way because `null` reflects nothing back from the body.
+  if (res.status === 404) return null;
+
+  // 503 — no participant store is mounted. Never an empty set: see the header above.
+  //
+  // The named code is matched EXACTLY. A 503 carrying anything else is still a refusal and still
+  // throws, but it is not reported as the named state, because the backend did not tell us the
+  // participant store is unmounted and claiming it did would be inventing the diagnosis.
+  if (res.status === 503) {
+    const code = await readSignalTrialsErrorCode(res);
+    if (code === SIGNAL_TRIALS_PARTICIPANT_STORE_UNAVAILABLE) {
+      throw new SignalTrialsUnavailableError(
+        code,
+        `GET ${path} failed: 503 ${code}. No participant store is mounted, so this trial's ` +
+          'participant set is UNAVAILABLE. That is not an empty set: `[]` would assert that ' +
+          'nobody has paid to commit, which nothing here supports.',
+      );
+    }
+    throw new ApiError(503, `GET ${path} failed: 503`);
+  }
+
+  // Every other non-ok status, the 500 included, throws WITHOUT a diagnosis.
+  //
+  // CARRIED LIMITATION Q1, disclosed and not closed: `store.finalized()` reads every finalized row
+  // and only then filters by `trial_id`, so a single unreadable row anywhere in the store fails
+  // this request for EVERY trial — measured at 200 → 500 with the requested trial's own set fully
+  // intact. A 500 therefore implies NOTHING about the trial that was asked for, and neither this
+  // message nor any screen built on it may say "this trial's data is corrupt". The refusal is
+  // conservative and never a false publication, which is why it surfaces as a plain failure.
+  if (!res.ok) throw new ApiError(res.status, `GET ${path} failed: ${res.status}`);
+
+  // The contract body is the BARE array. An enveloped `{"receipts": [...]}` is non-conforming, and
+  // `.map` on it would surface as an anonymous TypeError naming `map` — pointing a debugger at
+  // this client rather than at the response shape. Named here instead, per the module's uniform
+  // non-conformance posture. An empty array is conforming data and passes straight through.
+  const w: unknown = await res.json();
+  if (!Array.isArray(w)) {
+    throw new Error(
+      `GET ${path} did not return an array. The frozen contract serves a bare array of ` +
+        'CommitReceiptResponse; a non-array body is a non-conforming response and is not treated ' +
+        'as an absence of participants.',
+    );
+  }
+
+  // Served order is preserved verbatim. The backend guarantees ascending `receipt_id` and it is
+  // the backend's guarantee to keep — re-sorting here would silently repair a drifted order and
+  // destroy the only evidence that it drifted.
+  return (w as W.CommitReceiptWire[]).map(adaptCommitReceipt);
 }
