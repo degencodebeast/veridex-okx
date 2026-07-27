@@ -809,6 +809,256 @@ def test_the_unreadable_row_tolerance_is_SCOPED_to_the_verifier(committed_receip
         store.record(committed_receipt.receipt_id)
 
 
+# --- a row that is SYNTACTICALLY valid JSON but nested past the recursion budget ---
+#
+# The previous block's rows are all rejected by the DECODER as malformed. These are not: every row
+# below is a well-formed JSON object. What defeats them is depth — CPython raises ``RecursionError``
+# rather than ``JSONDecodeError``, and ``RecursionError`` is a ``RuntimeError``, so the
+# ``except ValueError`` that catches every other unreadable row does not see it. Before the fix the
+# direct call raised and the route answered 500.
+#
+# MEASURED on this head (CPython 3.11.15, recursion limit 1000, C ``_json`` accelerator present),
+# sweeping depths 940-1059 over both nesting shapes through the real reader, with every
+# ``RecursionError`` attributed to the frame that raised it:
+#
+#   depth <= 990   the row parses; all four checks report their own real result
+#   depth >= 991   ``RecursionError`` out of ``ReceiptStore._read_json``
+#   no depth       reaches ``run_manifest_hash`` / ``canonical_body_hash``
+#
+# The second boundary is REAL but is not reachable from disk bytes here, and the reason is worth
+# recording: the decode sits two frames DEEPER than the re-hash (``verify_receipt`` ->
+# ``finalized_payload`` -> ``_read_json`` -> ``json.loads`` versus ``verify_receipt`` ->
+# ``run_manifest_hash`` -> ``json.dumps``), so it exhausts the budget first and a row deep enough to
+# defeat a re-hash is always deep enough to defeat the read. Two frames is the whole margin —
+# calling ``verify_receipt`` from two frames further down moves the transition by two levels, which
+# is exactly what happens under the ASGI stack. Both boundaries are therefore guarded and both are
+# tested, the post-parse one through the read seam rather than through bytes, because on this build
+# no bytes can reach it. See ``test_a_value_that_defeats_ONE_canonical_rehash_fails_only_THAT_check``.
+
+#: Past any reader on this interpreter: the recursion limit is 1000, so nothing parses this.
+_NEST_BEYOND_ANY_READER = 2_000
+
+#: Deep, and comfortably WITHIN the budget at any plausible stack depth. The discrimination
+#: control: proves the repair did not turn "deeply nested" into a blanket four-``fail``.
+_NEST_WITHIN_BUDGET = 500
+
+#: Depths straddling the measured transition. Which side of it a given depth lands on shifts with
+#: the caller's stack, so these are pinned to the invariant that holds on BOTH sides rather than to
+#: a verdict that only holds on one — a test asserting the 991 boundary itself would be asserting
+#: this machine's frame count.
+_BOUNDARY_DEPTHS = [985, 988, 990, 991, 992, 995, 1_000, 1_005]
+
+#: Both JSON container shapes. Swept because the decoder has a separate parse routine for each and
+#: a guard that covered only arrays would leave objects escaping.
+_DEEP_ROW_SHAPES = [pytest.param("array", id="deep_array"), pytest.param("object", id="deep_object")]
+
+#: A field bound by exactly ONE canonical re-hash, and the check that re-hash produces. ``payer`` is
+#: in :data:`COMMIT_MANIFEST_FIELDS` and not in :data:`COMMIT_BODY_FIELDS`; ``p_follow_profitable``
+#: is the reverse, because the manifest binds the commitment by reference through ``body_hash``.
+#: That separation is what makes "only the affected check fails" a decidable claim rather than a
+#: hope — each row here names a check that MUST flip and three that must NOT.
+_ONE_REHASH_DEFEATED = [
+    pytest.param("payer", "manifest", id="manifest_only"),
+    pytest.param("p_follow_profitable", "body_hash", id="body_hash_only"),
+]
+
+
+def _nested_text(depth: int, shape: str) -> str:
+    """Return JSON TEXT nested ``depth`` levels, built by string repetition.
+
+    Text rather than ``json.dumps`` of a nested object because the encoder recurses too: dumping a
+    992-deep value raises ``RecursionError`` in the TEST, before the row is ever written. The
+    fixture has to be able to write rows the interpreter cannot round-trip.
+    """
+    opener, closer = ("[", "]") if shape == "array" else ('{"a": ', "}")
+    return opener * depth + '"x"' + closer * depth
+
+
+def _nest_row_field(store: _TamperableStore, receipt_id: str, *, field: str, depth: int, shape: str) -> None:
+    """Replace one field of a finalized row with ``depth`` levels of nesting, as raw bytes.
+
+    Not :meth:`_TamperableStore.tamper`, for the reason in :func:`_nested_text` — that method
+    round-trips the whole row through ``json.dumps`` and cannot express these depths at all.
+    """
+    path = Path(store.root) / _FINALIZED_DIRNAME / f"{receipt_id}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop(field, None)
+    head = json.dumps(payload, sort_keys=True)[:-1]
+    store.corrupt(receipt_id, raw=f"{head}, {json.dumps(field)}: {_nested_text(depth, shape)}}}")
+
+
+def _nested_value(depth: int) -> Any:
+    """Return a Python value nested ``depth`` levels, built ITERATIVELY.
+
+    A loop rather than a recursive helper, so constructing the fixture cannot itself be what raises.
+    """
+    value: Any = "x"
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize("shape", _DEEP_ROW_SHAPES)
+def test_a_row_nested_beyond_any_reader_verifies_as_four_fails(committed_receipt, store, shape):
+    """Well-formed JSON that no reader on this interpreter can parse is still an unreadable row.
+
+    The bytes are a valid JSON object — a decoder with an unlimited budget would accept them — so
+    this is not the malformed case the previous block covers. Nothing in it can be re-derived, which
+    is what four ``fail``s mean, and the depth is what makes it so rather than the syntax.
+    """
+    _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_BEYOND_ANY_READER, shape=shape)
+    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+
+
+@pytest.mark.parametrize("shape", _DEEP_ROW_SHAPES)
+async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_a_row_nested_beyond_any_reader(
+    committed_receipt, store, shape
+):
+    """The public surface, on the path that produced the reported 500.
+
+    Through the transport that reports what a deployed server reports, because the defect WAS a 500
+    and a transport that re-raises cannot tell one from an escaping exception.
+    """
+    _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_BEYOND_ANY_READER, shape=shape)
+    async with _server_client_for(_verify_app(store)) as client:
+        response = await client.get(_verify_path(committed_receipt.receipt_id))
+    assert response.status_code == 200
+    assert response.json() == {
+        "receipt_id": committed_receipt.receipt_id,
+        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+    }
+
+
+@pytest.mark.parametrize("shape", _DEEP_ROW_SHAPES)
+def test_a_deeply_nested_but_READABLE_row_keeps_independent_check_attribution(committed_receipt, store, shape):
+    """Depth alone is not a verdict. A row that READS still gets four independently derived checks.
+
+    The discrimination control for the repair: "unreadable" has to keep meaning "this reader could
+    not get at it", not "this looked alarming". A guard that answered four ``fail``s for any nested
+    value would pass every test above this one and would be strictly less honest than the code it
+    replaced — it would report ``body_hash``, ``deadline_respected`` and ``live_mode`` as failed
+    when all three were re-derived successfully. Only ``manifest`` may move here, and only because
+    ``payer`` was rewritten.
+    """
+    _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_WITHIN_BUDGET, shape=shape)
+    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail")
+
+
+@pytest.mark.parametrize("depth", _BOUNDARY_DEPTHS)
+def test_no_nesting_depth_across_the_reader_boundary_makes_the_verifier_raise(committed_receipt, store, depth):
+    """Sweep the transition. Every depth answers with a verdict; none escapes as an exception.
+
+    Which of the two honest verdicts applies depends on whether this depth happens to fit in the
+    budget left by the caller's stack, and that is a property of the machine rather than of the
+    receipt — so the expectation is the pair, and the claim under test is that the set contains no
+    third member. This is the shape of the original defect: it lived in a handful of depths nobody
+    had a reason to pick, on the far side of a boundary that moves.
+    """
+    _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=depth, shape="array")
+    assert _verdict(committed_receipt, store) in (
+        dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+        _all_pass(manifest="fail"),
+    )
+
+
+@pytest.mark.parametrize(("field", "defeated"), _ONE_REHASH_DEFEATED)
+def test_a_value_that_defeats_ONE_canonical_rehash_fails_only_THAT_check(
+    committed_receipt, store, monkeypatch, field, defeated
+):
+    """A row that PARSES, carrying a value one re-hash cannot serialize: only that check fails.
+
+    The second boundary. Collapsing this to four ``fail``s would discard true information — three
+    of these checks completed and returned a real answer, and reporting them as failed would tell a
+    holder their receipt's probability had been altered when it had not.
+
+    Delivered through the read seam rather than through bytes on disk, and the reason is measured
+    rather than assumed: see the block comment above — on this build the decode exhausts the budget
+    two frames before the re-hash does, so no on-disk depth reaches this code. The DATA is real
+    (genuinely nested, defeating the real production hash function on its own); only the delivery is
+    injected. The existing infrastructure-fault test uses the same seam for the same reason.
+
+    The single equality carries both controls. Acceptance: ``defeated`` must flip to ``fail``, so a
+    guard that never fires is caught. Discrimination: the other three must stay ``pass``, so a guard
+    that fires too widely is caught — and the two parametrisations swap which check is which, so
+    neither can be satisfied by a verdict that is simply hard-coded.
+    """
+    intact = store.finalized_payload(committed_receipt.receipt_id)
+    assert intact is not None
+    deep = {**intact, field: _nested_value(_NEST_BEYOND_ANY_READER)}
+    monkeypatch.setattr(store, "finalized_payload", lambda _receipt_id: deep)
+    assert _verdict(committed_receipt, store) == _all_pass(**{defeated: "fail"})
+
+
+@pytest.mark.parametrize(("field", "defeated"), _ONE_REHASH_DEFEATED)
+async def test_the_verify_endpoint_reports_only_THAT_check_failed_for_an_unhashable_value(
+    committed_receipt, store, monkeypatch, field, defeated
+):
+    """The same attribution, published. A 500 here would erase three checks that succeeded."""
+    intact = store.finalized_payload(committed_receipt.receipt_id)
+    assert intact is not None
+    deep = {**intact, field: _nested_value(_NEST_BEYOND_ANY_READER)}
+    monkeypatch.setattr(store, "finalized_payload", lambda _receipt_id: deep)
+    async with _server_client_for(_verify_app(store)) as client:
+        response = await client.get(_verify_path(committed_receipt.receipt_id))
+    assert response.status_code == 200
+    assert response.json() == {
+        "receipt_id": committed_receipt.receipt_id,
+        "checks": _all_pass(**{defeated: "fail"}),
+    }
+
+
+def test_an_OSError_from_the_READ_is_not_normalized_into_a_verdict(committed_receipt, store, monkeypatch):
+    """The read boundary absorbs a recursion, never a disk fault.
+
+    ``_read_json`` now converts ``RecursionError`` into the ``ValueError`` the verifier absorbs. The
+    conversion is scoped to the parse; the ``read_text`` beside it is not covered, and this test is
+    what says so. Widening it to the whole read would make an unmounted volume report every receipt
+    as invalid — a false verdict standing in for an outage, in the one function whose entire purpose
+    is to keep those two apart.
+    """
+
+    def _unreadable_disk(*_args: Any, **_kwargs: Any) -> str:
+        raise OSError("simulated unreadable disk")
+
+    monkeypatch.setattr(Path, "read_text", _unreadable_disk)
+    with pytest.raises(OSError, match="simulated unreadable disk"):
+        store.finalized_payload(committed_receipt.receipt_id)
+    with pytest.raises(OSError, match="simulated unreadable disk"):
+        verify_receipt(committed_receipt.receipt_id, store)
+
+
+def test_an_OSError_from_a_REHASH_is_not_swallowed_by_the_recursion_guard(committed_receipt, store, monkeypatch):
+    """The re-derivation guard absorbs ``RecursionError`` and nothing else.
+
+    Without this the guard and a bare ``except Exception`` are observationally identical, and the
+    broad version would report ``manifest: fail`` for any fault inside the hash — a receipt declared
+    unverifiable because the service broke while checking it. That is the same laundering the route
+    refuses to do, moved one level down where it is harder to see.
+    """
+
+    def _boom(_manifest: dict[str, Any]) -> str:
+        raise OSError("simulated fault inside the hash")
+
+    monkeypatch.setattr("veridex.signal_trials.receipts.run_manifest_hash", _boom)
+    with pytest.raises(OSError, match="simulated fault inside the hash"):
+        verify_receipt(committed_receipt.receipt_id, store)
+
+
+def test_the_deep_row_tolerance_is_SCOPED_to_the_verifier(committed_receipt, store):
+    """The money path still refuses a row it cannot parse, rather than reading it as absent.
+
+    The companion to ``test_the_unreadable_row_tolerance_is_SCOPED_to_the_verifier`` for the depth
+    case. ``ValueError`` and not ``RecursionError``: normalizing at the read is what lets every
+    existing caller keep its single ``except ValueError`` for corruption, and a ``None`` here would
+    tell the payment path that a paid slot points at nothing.
+    """
+    _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_BEYOND_ANY_READER, shape="array")
+    with pytest.raises(ValueError):
+        store.finalized_payload(committed_receipt.receipt_id)
+    with pytest.raises(ValueError):
+        store.record(committed_receipt.receipt_id)
+
+
 async def test_the_verify_endpoint_answers_404_when_no_store_is_configured():
     """No commit store means no receipt can exist, which is the same honest 404 this route
     already served at H1.2 — an unmounted deployment's answer does not change."""

@@ -52,6 +52,7 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -247,6 +248,39 @@ def commit_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     return {field: payload.get(field) for field in COMMIT_MANIFEST_FIELDS}
 
 
+def _rehash_reproduces(rehash: Callable[[], str], sealed: object) -> bool:
+    """Return whether a canonical re-hash reproduces ``sealed``, treating an unhashable value as no.
+
+    Guards ONE check's re-derivation, and that scope is the point. A stored value nested past the
+    recursion budget defeats the canonical serializer, and the honest reading of that is narrow: the
+    check whose input could not be serialized did not re-derive, so it fails. The three checks that
+    do not read that value are unaffected and must still report their own real result — a receipt
+    whose ``payer`` cannot be re-hashed has not thereby been shown to serve a rewritten probability,
+    and saying so would discard three answers the code successfully computed.
+
+    ``RecursionError`` only. Every other exception is left to propagate, because every other
+    exception here would be the service failing rather than the row being unhashable, and reporting
+    that as ``fail`` would tell a holder their receipt is invalid when what broke was the check. A
+    ``TypeError`` from a non-serializable value cannot arise: the payload came out of ``json.loads``,
+    so every value in it is one ``json.dumps`` accepts.
+
+    Args:
+        rehash: The canonical re-derivation, deferred so the failure is caught rather than raised
+            while the surrounding report is being built.
+        sealed: The digest stored on the row, compared verbatim. Typed ``object`` rather than
+            ``Any``: the row is untrusted, so this may be any JSON value at all, and ``object``
+            says the only thing done with it is the comparison — ``Any`` would silently let a
+            later edit call a string method on whatever a tamper put there.
+
+    Returns:
+        ``True`` when the re-derivation ran and matched.
+    """
+    try:
+        return rehash() == sealed
+    except RecursionError:
+        return False
+
+
 def _epoch_ms(value: Any) -> int | None:
     """Return ``value`` when it is usable as an epoch-millisecond stamp, else ``None``.
 
@@ -340,15 +374,29 @@ class ReceiptStore:
     def _read_json(path: Path) -> dict[str, Any]:
         """Load ``path`` as a JSON object, failing loudly if it is not one.
 
+        Two ways the parse can fail, and CPython reports them under unrelated exception trees. A
+        malformed byte raises ``JSONDecodeError``, which IS a ``ValueError``. A well-formed but
+        deeply nested document instead exhausts the recursion budget and raises ``RecursionError``,
+        which is a ``RuntimeError`` and shares no ancestor with the first — so a caller written to
+        absorb corruption as a ``ValueError`` absorbs the malformed row and is bypassed entirely by
+        the nested one. Both are the same fact about the row: these bytes do not yield a payload.
+        Normalizing here rather than at each caller is what keeps that one fact under one exception,
+        and the ``read_text`` beside the parse is deliberately NOT inside the conversion — an
+        ``OSError`` from the disk is a fact about the SERVICE and must stay distinguishable.
+
         Raises:
-            ValueError: ``path`` is unreadable as JSON or does not hold an object. Corruption
-                is never reported as absence — a slot that reads as "missing" would be a slot
-                that permits a fresh settle.
+            ValueError: ``path`` is unreadable as JSON — malformed, or nested past what this
+                interpreter can decode — or does not hold an object. Corruption is never reported
+                as absence: a slot that reads as "missing" would be a slot that permits a fresh
+                settle.
         """
+        text = path.read_text(encoding="utf-8")
         try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(text)
         except json.JSONDecodeError as error:
             raise ValueError(f"commit-store artifact {path.name} is not readable JSON") from error
+        except RecursionError as error:
+            raise ValueError(f"commit-store artifact {path.name} is nested too deeply to parse") from error
         if not isinstance(loaded, dict):
             raise ValueError(f"commit-store artifact {path.name} must hold a JSON object")
         return loaded
@@ -881,8 +929,9 @@ def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
     receipt that does not exist, because "no such receipt" is a different statement from "this
     receipt does not verify" and the route answers them with different status codes.
 
-    An UNREADABLE row — bytes that are not JSON, or JSON that is not an object — reports all four
-    checks as ``fail``. It is neither an exception nor a 404, and both of those were considered:
+    An UNREADABLE row — bytes that are not JSON, JSON that is not an object, or JSON nested past
+    what this interpreter can decode — reports all four checks as ``fail``. It is neither an
+    exception nor a 404, and both of those were considered:
 
     * Not an exception, because a row that exists and re-derives nothing is precisely what ``fail``
       means. Letting it escape makes the route answer 500, and a 500 says "this service is
@@ -899,6 +948,15 @@ def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
     scoped to this function: :meth:`ReceiptStore.finalized_payload` and :meth:`ReceiptStore.record`
     still raise, because the payment path reads a ``None`` from ``record`` as "the slot points at a
     receipt with no record behind it", which would be the wrong diagnosis on the money path.
+
+    A row can also defeat the canonical serializer AFTER parsing cleanly, and that case is answered
+    per-check rather than here. :func:`_rehash_reproduces` fails the one check whose input could not
+    be re-derived and leaves the other three to report what they actually found — collapsing it to
+    four ``fail``s would be a LESS honest report than this function can produce, since three of the
+    checks completed. Guarding at the two re-hashes rather than around the whole report is what
+    makes that attribution possible, and it is also why no catch belongs on the route: a route-level
+    catch cannot see which check was affected, so it could only ever answer all-or-nothing, and it
+    would swallow the ``OSError`` this paragraph exists to preserve.
 
     Args:
         receipt_id: The receipt to verify. Arrives from a URL path segment on the free verify
@@ -931,8 +989,10 @@ def verify_receipt(receipt_id: str, store: ReceiptStore) -> VerifyReport:
     committed_at_ms = _epoch_ms(payload.get("committed_at_ms"))
     commit_deadline_ms = _epoch_ms(payload.get("commit_deadline_ms"))
     verdicts: dict[str, bool] = {
-        "body_hash": canonical_body_hash(committed_body(payload)) == payload.get("body_hash"),
-        "manifest": run_manifest_hash(commit_manifest(payload)) == payload.get("manifest_hash"),
+        "body_hash": _rehash_reproduces(lambda: canonical_body_hash(committed_body(payload)), payload.get("body_hash")),
+        "manifest": _rehash_reproduces(
+            lambda: run_manifest_hash(commit_manifest(payload)), payload.get("manifest_hash")
+        ),
         "deadline_respected": (
             committed_at_ms is not None and commit_deadline_ms is not None and committed_at_ms < commit_deadline_ms
         ),
