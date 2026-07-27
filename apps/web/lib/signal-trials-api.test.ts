@@ -870,26 +870,34 @@ const DOCKERFILE = readFileSync(resolve(__dirname, '../Dockerfile'), 'utf8');
 // untouched and is then swapped for the placeholder spelling the document uses.
 const PATH_PARAM = 'PARAM';
 
-// THE SIX ENDPOINTS `SKILL.md` MUST NAME.
+// THE SEVEN ENDPOINTS `SKILL.md` MUST NAME — and the count is the third one this task was given.
 //
 // The frozen plan (L1061) says the test asserts the file "names the FIVE endpoints". Integration
-// enumerated the same plan's Step-1 prose and it specifies SIX distinct paths; PKT-TASK-H5-5 rules
-// that all six are named, because omitting a real endpoint to match a miscount is the worse error.
+// enumerated the same plan's Step-1 prose and found SIX distinct paths, ruling that all six are
+// named because omitting a real endpoint to match a miscount is the worse error.
 //
-// FIVE of the six are derived from `SIGNAL_TRIALS_PATHS`. `POST /signal-trials/commit` is a
+// Deriving the six from `SIGNAL_TRIALS_PATHS` rather than retyping them then surfaced a SEVENTH:
+// `trialReceipts`, added by the route-contract addendum AFTER the plan froze. So "the packet's six"
+// and "the client's path map" were never the same set. That discrepancy was escalated rather than
+// silently included or omitted, and it changed the answer — the lane controller ruled the seventh
+// IN, on a deployment-unit argument worth recording because it turns on a fact the count alone
+// cannot settle: `TrialMatchCard.tsx:228` CALLS `getTrialReceipts`, so H5.3 — a NEVER CUT screen —
+// has a hard runtime dependency on this route. Canonical must therefore advance to include it
+// before H6.0 deploys, so the route WILL be in the deployed image and documenting it is correct.
+// Documenting a route that was NOT going to ship would have been C64's own failure turned on
+// SKILL.md: a judge following the document into a 404.
+//
+// SIX of the seven are derived from `SIGNAL_TRIALS_PATHS`. `POST /signal-trials/commit` is a
 // LITERAL and cannot be derived: the path map belongs to a READ client that never calls the paid
 // route (see `getOpenTrial`'s note on the two 503s it therefore never sees), so no entry exists to
 // derive from. That is a disclosed gap in the binding, not an oversight — the commit path is the
 // one route here whose spelling this test cannot keep in step with the client automatically.
-//
-// `SIGNAL_TRIALS_PATHS` also carries a SEVENTH route, `trialReceipts`, added by the route-contract
-// addendum after the plan froze. It is deliberately absent: the packet enumerated six from Step 1,
-// and adding a route the ruling did not name would be this test widening its own scope.
 const SKILL_MD_ENDPOINTS: readonly { readonly method: string; readonly path: string }[] = [
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.openTrial() },
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.season() },
   { method: 'POST', path: '/signal-trials/commit' },
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.trial(PATH_PARAM).replace(PATH_PARAM, '{id}') },
+  { method: 'GET', path: SIGNAL_TRIALS_PATHS.trialReceipts(PATH_PARAM).replace(PATH_PARAM, '{id}') },
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.agent(PATH_PARAM).replace(PATH_PARAM, '{payer}') },
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.verifyReceipt(PATH_PARAM).replace(PATH_PARAM, '{id}') },
 ];

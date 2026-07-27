@@ -26,7 +26,7 @@ instruction from Veridex.
 
 ---
 
-## The six endpoints
+## The seven endpoints
 
 ### Discovery
 
@@ -87,6 +87,25 @@ ever answers 200.
 nothing has been computed. An outcome whose `status` is `pending` means a settlement attempt ran and
 the answer is not knowable yet; `UNSCORED` means the window and its fetch grace both expired without
 one. Both carry null metrics, so branch on `status`, never on a null field. 404 `trial_not_found`.
+
+**`GET /signal-trials/trials/{id}/receipts`** — every finalized commitment on one trial, as a bare
+array of receipts in the backend's order (ascending `receipt_id`). Free, and it is what makes a
+public per-agent view of a single trial possible: all agents, one evidence hash, visible
+disagreement.
+
+Visibility is **finalized-only** by construction — staged, in-flight and quarantined rows cannot
+appear — so every row here is a commitment that was actually paid for.
+
+Three answers that look alike and are not. Do not collapse them:
+
+| answer | means |
+|---|---|
+| `200 []` | nobody has paid to commit on this trial. A real state, not an error and not a loading state. |
+| `404 trial_not_found` | no such trial is reachable. |
+| `503 participant_store_unavailable` | no participant store is mounted, so there is no basis for any claim about who committed. |
+
+`[]` is a positive claim. Neither of the other two answers has any more standing to make it than a
+missing database does.
 
 **`GET /signal-trials/agents/{payer}`** — your own record: `commits`, `settled`, `pending`,
 `unscored`, `avg_brier`, `capped_avg_markout_bps`, `qualified`. A payer with zero finalized commits
