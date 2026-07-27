@@ -387,13 +387,18 @@ def pack_tied_on_brier_and_markout() -> _OraclePack:
 
     * every trial settles profitable-to-follow, so EVERY active decision pays a capped ``+500`` and
       the mean markout is 500 for ANY number of decisions — that is what unties markout from count;
-    * ``zz_active_32`` FOLLOWs at ``p=0.75`` on 32 trials and abstains on 12:
-      ``32*(0.75-1)**2 + 12*0.25 == 32*0.0625 + 3 == 2 + 3 == 5``;
-    * ``aa_active_24`` FOLLOWs at ``p=1.00`` on 24 trials and abstains on 20:
-      ``24*0 + 20*0.25 == 5``.
+    * ``zz_active_32`` FOLLOWs at ``p=0.75`` on 32 trials and abstains on 12;
+    * ``aa_active_24`` FOLLOWs at ``p=1.00`` on 24 trials and abstains on 20.
 
-    Both Brier sums are EXACTLY 5.0 — not approximately — because 0.0625 and 0.25 are exact binary
-    fractions, so the tie cannot drift with summation order. Both clear the gate (active 32 and 24
+    Both Brier sums are EXACTLY equal — not approximately — because every term is a dyadic rational
+    (``(0.75-1)**2 == 0.0625 == 2**-4`` and the abstain error ``0.25 == 2**-2``), so every partial
+    sum is exactly representable and the tie cannot drift with summation order.
+
+    **The numbers are deliberately NOT written out here.** An arithmetic claim in a docstring is a
+    claim about what its author believed, and this one was stated wrongly once while still describing
+    a correct design — a check that reaches the right answer down a wrong path is a coincidence, not
+    a verification. ``test_active_count_is_the_THIRD_rank_key_and_sorts_DESCENDING`` RECOMPUTES both
+    sums from these vectors instead, so the tie is re-proved on every run. Both clear the gate (active 32 and 24
     are >= 20; coverage 32/44 and 24/44 are >= 0.50). Term 3 is therefore the ONLY key left that
     can order them.
 
@@ -405,6 +410,16 @@ def pack_tied_on_brier_and_markout() -> _OraclePack:
     """
     active_high = (0.75,) * 32 + (0.5,) * 12
     active_low = (1.0,) * 24 + (0.5,) * 20
+    # A SECOND pair, for a different defect: here MARKOUT and ACTIVE COUNT DISAGREE about the order,
+    # which is what makes the POSITION of terms 2 and 3 observable at all. `swap_hi_markout` takes
+    # FEWER decisions but every one pays a capped +500; `swap_lo_markout` takes MORE decisions and
+    # fades two of them, dragging its mean to +433. Their Brier sums are exactly tied, so:
+    #   frozen  (markout desc BEFORE active desc) -> swap_hi first
+    #   swapped (active desc BEFORE markout desc) -> swap_lo first
+    # Without a pair where the two terms PULL IN OPPOSITE DIRECTIONS, swapping them reorders
+    # nothing and the mutant is invisible — which is exactly how it survived when first drilled.
+    swap_hi = (1.0,) * 22 + (0.5,) * 22
+    swap_lo = (1.0,) * 28 + (0.0,) * 2 + (0.5,) * 14
     return _build_pack(
         "season-active-count",
         "qualified",
@@ -413,6 +428,8 @@ def pack_tied_on_brier_and_markout() -> _OraclePack:
         diagnostic_agents=(
             DiagnosticAgent(agent_id="zz_active_32", probabilities=active_high),
             DiagnosticAgent(agent_id="aa_active_24", probabilities=active_low),
+            DiagnosticAgent(agent_id="swap_hi_markout", probabilities=swap_hi),
+            DiagnosticAgent(agent_id="swap_lo_markout", probabilities=swap_lo),
         ),
     )
 
@@ -840,11 +857,19 @@ def test_rank_key_is_total_over_fully_equal_agents(full_pack_qualified_with_brie
 
 
 def test_rank_order_is_exactly_the_designed_order(full_pack_qualified):
-    """PIN: the WHOLE qualified ordering is asserted, not merely that Brier is non-decreasing.
+    """PIN (FIXTURE DESIGN): this fixture's five qualified rows land in their hand-computed order.
 
     Region A checks ``briers == sorted(briers)``, which a scorer emitting a single qualified row
-    would satisfy vacuously and which says nothing about the later keys. The five qualified rows
-    of this fixture have a hand-computed order.
+    would satisfy vacuously and which says nothing about the later keys.
+
+    **THIS TEST DOES NOT CARRY THE FROZEN ORDERING RULE, and the distinction is load-bearing.** A
+    hard-coded list is only as strong as the fixture behind it: swap the *markout* and *active-count*
+    terms and this fixture happens to emit the same order, so the assertion below would keep passing
+    over a violated rule. The rule is carried by
+    ``test_the_frozen_four_term_ordering_holds_within_the_qualified_set``, which RECOMPUTES the
+    frozen key over both fixtures. What this test pins is narrower and still worth having: that the
+    fixture's designed order is the one it actually produces, so the other tests built on that
+    design are reasoning about the season they think they are.
     """
     season = score_season(full_pack_qualified)
     ranked = [row.agent_id for row in season.rows if row.qualified]
@@ -864,6 +889,41 @@ def _frozen_rank_key(row):
     brier_key = (1, 0.0) if row.avg_brier is None else (0, row.avg_brier)
     markout_key = (1, 0.0) if row.capped_avg_markout_bps is None else (0, -row.capped_avg_markout_bps)
     return (brier_key, markout_key, -row.active_decisions, row.agent_id)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["full_pack_qualified", "full_pack_qualified_with_brier_ties", "pack_tied_on_brier_and_markout"],
+)
+def test_the_frozen_four_term_ordering_holds_within_the_qualified_set(fixture_name, request):
+    """PIN (F2(b)): the emitted qualified order EQUALS the frozen four-term order — RECOMPUTED.
+
+    **Recomputed, never restated.** ``test_rank_order_is_exactly_the_designed_order`` asserts one
+    hard-coded five-agent list, and a hard-coded list is only as strong as the fixture that produced
+    it: swap the *markout* and *active-count* terms and that fixture happens to emit the same order,
+    so the assertion would keep passing over a violated rule. Sorting by an independently
+    transcribed key cannot go stale that way — it re-derives the expectation from the RULE on every
+    run rather than from one remembered result.
+
+    **Run over ALL THREE fixtures**, because each reaches terms the others do not:
+    ``full_pack_qualified`` has five qualified rows with distinct Briers (term 1); the ties fixture
+    reaches terms 2 and 4; and ``pack_tied_on_brier_and_markout`` is the only one carrying a pair
+    whose MARKOUT and ACTIVE COUNT DISAGREE about the order, which is what makes the POSITION of
+    terms 2 and 3 observable. Without that pair, swapping those two terms reorders nothing anywhere
+    and the mutant survives — measured, it did.
+
+    Note what this does and does not establish. The leading ``not row.qualified`` term CANNOT
+    displace the frozen order — it is constant ``False`` across every qualified row, and a constant
+    leading key is order-preserving within the group where it is constant. So this holds by
+    construction rather than by luck. Its value is as a REGRESSION barrier on the frozen rule
+    itself, not as a check on the partition term.
+    """
+    pack = request.getfixturevalue(fixture_name)
+    season = score_season(pack)
+
+    qualified = [row for row in season.rows if row.qualified]
+    assert len(qualified) >= 5, "non-vacuous: the frozen key must have something to order"
+    assert qualified == sorted(qualified, key=_frozen_rank_key)
 
 
 def test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_directions(full_pack_qualified):
@@ -890,12 +950,9 @@ def test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_dire
     season = score_season(full_pack_qualified)
     shipped = [row.agent_id for row in season.rows]
 
-    # --- DIRECTION 1: the frozen four-term ordering is UNTOUCHED within the qualified set. ---
-    qualified = [row for row in season.rows if row.qualified]
-    assert len(qualified) >= 3, "a qualified set examined must be non-empty to mean anything"
-    assert [row.agent_id for row in qualified] == [
-        row.agent_id for row in sorted(qualified, key=_frozen_rank_key)
-    ], "the partition term must not reorder anything INSIDE the qualified set"
+    # DIRECTION 1 — the frozen ordering is untouched inside the qualified set — is owned by
+    # `test_the_frozen_four_term_ordering_holds_within_the_qualified_set`, which RECOMPUTES the key
+    # and runs over BOTH fixtures. It is not repeated here.
 
     # --- DIRECTION 2: the partition term is PRESENT and does OBSERVABLE work. ---
     # The witness: an UNQUALIFIED row whose Brier beats two QUALIFIED rows. Under the pure frozen
@@ -953,8 +1010,23 @@ def test_active_count_is_the_THIRD_rank_key_and_sorts_DESCENDING(pack_tied_on_br
     # exact in binary floating point. If either ever drifts, this test is silently about key 1 or 2.
     assert high.avg_brier == low.avg_brier, "key 1 (avg Brier) must be exactly tied"
     assert high.capped_avg_markout_bps == low.capped_avg_markout_bps, "key 2 (markout) must be tied"
-    assert high.avg_brier == pytest.approx(5 / 44)
     assert high.capped_avg_markout_bps == 500
+
+    # RECOMPUTED FROM THE FIXTURE'S OWN VECTORS, never restated. An arithmetic claim written out by
+    # hand is a claim about what the author believed, and this one was in fact stated wrongly once
+    # while still describing a correct design — a check that reaches the right answer down a wrong
+    # path is a coincidence, not a verification. Deriving both sums here means the tie is re-proved
+    # from the fixture on every run, and any edit to the vectors that breaks it fails loudly.
+    pack = pack_tied_on_brier_and_markout
+    by_id = {agent.agent_id: agent.probabilities for agent in pack.diagnostic_agents}
+    expected = {}
+    for agent_id, probabilities in by_id.items():
+        expected[agent_id] = sum((p - o) ** 2 for p, o in zip(probabilities, pack.outcomes, strict=True)) / len(
+            pack.outcomes
+        )
+    assert expected["zz_active_32"] == expected["aa_active_24"], "the tie must be EXACT, not approximate"
+    assert high.avg_brier == expected["zz_active_32"]
+    assert low.avg_brier == expected["aa_active_24"]
 
     # Key 3 differs, and it is the only thing left that can order them.
     assert high.active_decisions == 32
