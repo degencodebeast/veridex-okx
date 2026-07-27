@@ -44,12 +44,26 @@ mutated row — a forger who fixed up the seal. That is the only way to prove
 ``deadline_respected`` and ``live_mode`` are independent checks rather than shadows of the
 manifest hash.
 
-The block below ``FROZEN MANDATED RED BLOCK`` is reproduced BYTE-IDENTICALLY from the
-implementation plan (lines 912-924) under ``PKT-DEC-C8``: those bytes are what the captured RED
+The block below ``FROZEN MANDATED RED BLOCK`` was reproduced BYTE-IDENTICALLY from the
+implementation plan (lines 912-924) under ``PKT-DEC-C8``: those bytes are what H4.2's captured RED
 attests to, so lint and type gates do not outrank the freeze. It is fenced with ``fmt: off`` so
 the formatter leaves it alone while the rest of the file stays formatter-clean; the fence lines
-sit OUTSIDE the frozen bytes and change none of them. sha256 of the 13 frozen lines:
+sit OUTSIDE the frozen bytes and change none of them. sha256 of H4.2's 13 frozen lines:
 ``18f6a050c1b7531ea7a1d1917d7abe505b9d12b230d98616de156c1c1fe74d52``.
+
+**H4.3 AMENDED ONE LINE OF THAT BLOCK, and this is the record of it.**
+``test_verify_clean_receipt_commit_checks_pass`` asserted that ``rep.checks`` equalled EXACTLY the
+four commit checks. H4.3 adds the four outcome checks to the same report — which the plan's own
+H4.2 entry says it will ("Outcome checks are added in H4.3") and which H4.3's mandated RED requires
+by reading ``rep.checks[k]`` for each of them. The two statements cannot both be true of one
+report, so the freeze had to yield to the later task in the same frozen plan; the amendment is the
+narrowest one available, filtering that equality to the commit keys and asserting the outcome keys
+separately rather than deleting or weakening either claim. Nothing else in the block is touched, so
+the sha256 above no longer matches the file and is retained as the provenance of what was frozen.
+
+Everything in this file exercises receipts with NO recorded outcome, so its four outcome checks are
+``pending`` throughout — a property of these fixtures, not of the verifier. Their behaviour lives
+in ``tests/signal_trials/test_settlement_records.py``.
 """
 
 from __future__ import annotations
@@ -73,6 +87,7 @@ from veridex.signal_trials.receipts import (
     COMMIT_BODY_FIELDS,
     LIVE_TRIAL_MODE,
     VERIFY_COMMIT_CHECKS,
+    VERIFY_OUTCOME_CHECKS,
     CommitRecord,
     ReceiptStore,
     commit_manifest,
@@ -244,13 +259,67 @@ def _verdict(receipt: CommitRecord, store: ReceiptStore) -> dict[str, str]:
     return dict(verify_receipt(receipt.receipt_id, store).checks)
 
 
-def _all_pass(**overrides: str) -> dict[str, str]:
-    """The clean verdict, with named checks overridden.
+def _clean_verdict(**overrides: str) -> dict[str, str]:
+    """The clean verdict for an intact receipt with NO recorded outcome, with checks overridden.
 
     Every discriminating assertion is written against this, so the assertion states BOTH what
     changed and that nothing else did.
+
+    The four OUTCOME checks are ``pending`` throughout this file, and that is a property of these
+    FIXTURES rather than of the verifier: nothing here records an outcome, so there is no
+    settlement to re-derive. Their behaviour is exercised in
+    ``tests/signal_trials/test_settlement_records.py``, which is where H4.3 put them. They are
+    carried in this expectation rather than filtered out of it so that a change which started
+    reporting them as ``fail`` — or dropped them from the report — turns this file red too.
+
+    Renamed from ``_all_pass`` at H4.3 for a plain reason: it no longer returns all passes, and a
+    helper whose name misdescribes its value is the kind of small false statement this suite is
+    built to notice.
     """
-    return {**dict.fromkeys(VERIFY_COMMIT_CHECKS, "pass"), **overrides}
+    return {
+        **dict.fromkeys(VERIFY_COMMIT_CHECKS, "pass"),
+        **dict.fromkeys(VERIFY_OUTCOME_CHECKS, "pending"),
+        **overrides,
+    }
+
+
+def _unreadable_verdict() -> dict[str, str]:
+    """The verdict for a row whose bytes cannot be read at all.
+
+    Four commit ``fail``s, because every commit check's input is unreadable. Four outcome
+    ``pending``s, because the destroyed row is what would have named the trial, so no settlement
+    was examined and there is no finding to report about one.
+    """
+    return {
+        **dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+        **dict.fromkeys(VERIFY_OUTCOME_CHECKS, "pending"),
+    }
+
+
+def _served_receipt(record: CommitRecord) -> dict[str, Any]:
+    """The participant receipt the verify endpoint serves for an INTACT row in this file.
+
+    Every fixture here records no outcome, so the settlement half is ``pending`` with null metrics
+    and the action is derived from the fixture probability alone. Spelled out field by field rather
+    than round-tripped through the model, so a field silently added to or dropped from the frozen
+    ``CommitReceiptResponse`` turns this file red as well as the H4.3 suite.
+    """
+    return {
+        "receipt_id": record.receipt_id,
+        "trial_id": record.trial_id,
+        "payer": record.payer,
+        "p_follow_profitable": record.p_follow_profitable,
+        "methodology_version": record.methodology_version,
+        "action": "FOLLOW",
+        "status": "pending",
+        "brier": None,
+        "chosen_markout_bps": None,
+        "committed_at_ms": record.committed_at_ms,
+        "commit_deadline_ms": record.commit_deadline_ms,
+        "trial_mode": record.trial_mode,
+        "body_hash": record.body_hash,
+        "payment_tx_hash": record.payment_tx_hash,
+    }
 
 
 def _client_for(app: FastAPI) -> AsyncClient:
@@ -289,8 +358,12 @@ def _verify_path(receipt_id: str) -> str:
 # fmt: off
 def test_verify_clean_receipt_commit_checks_pass(committed_receipt, store):
     rep = verify_receipt(committed_receipt.receipt_id, store)
-    assert {k: v for k, v in rep.checks.items()} == {"body_hash": "pass", "manifest": "pass",
+    assert {k: v for k, v in rep.checks.items() if k in VERIFY_COMMIT_CHECKS} == {"body_hash": "pass", "manifest": "pass",
                                                      "deadline_respected": "pass", "live_mode": "pass"}
+    # H4.3 AMENDMENT (see the module docstring). The four outcome checks now share this report and
+    # are ``pending`` here because these fixtures record no outcome. Asserted rather than filtered
+    # away, so the whole-verdict discipline this file insists on still holds after the widening.
+    assert {k: v for k, v in rep.checks.items() if k in VERIFY_OUTCOME_CHECKS} == dict.fromkeys(VERIFY_OUTCOME_CHECKS, "pending")
 
 def test_tampered_probability_fails_body_hash(committed_receipt, store):
     store.tamper(committed_receipt.receipt_id, field="p_follow_profitable", value=0.99)   # test-only raw write
@@ -309,13 +382,20 @@ def test_pending_staging_id_is_not_a_receipt(store, live_trial):
 # --- the report's own shape: four commit checks, and NOT H4.3's outcome checks ---
 
 
-def test_the_report_carries_exactly_the_four_commit_checks(committed_receipt, store):
-    """Outcome checks belong to H4.3. A ``pending`` placeholder for them here would advertise a
-    settlement verdict that has not been computed."""
+def test_the_report_carries_the_four_commit_checks_FIRST(committed_receipt, store):
+    """The commit checks keep their names and their leading position after H4.3 widened the report.
+
+    Order matters because it is part of the frozen contract H5.1 mirrors, and because the
+    commit-time four are the ones that are always decidable — a consumer reading the map top-down
+    reaches the answerable checks first.
+    """
     report = verify_receipt(committed_receipt.receipt_id, store)
-    assert tuple(report.checks) == VERIFY_COMMIT_CHECKS == ("body_hash", "manifest", "deadline_respected", "live_mode")
+    assert VERIFY_COMMIT_CHECKS == ("body_hash", "manifest", "deadline_respected", "live_mode")
+    assert tuple(report.checks)[:4] == VERIFY_COMMIT_CHECKS
+    assert tuple(report.checks) == VERIFY_COMMIT_CHECKS + VERIFY_OUTCOME_CHECKS
     assert report.receipt_id == committed_receipt.receipt_id
-    assert set(report.checks.values()) <= {"pass", "fail"}
+    # The commit-time four are never ``pending``: each reads a fact the receipt itself carries.
+    assert {report.checks[check] for check in VERIFY_COMMIT_CHECKS} <= {"pass", "fail"}
 
 
 def test_verification_is_repeatable_and_writes_nothing(committed_receipt, store):
@@ -323,7 +403,7 @@ def test_verification_is_repeatable_and_writes_nothing(committed_receipt, store)
     before = sorted(p.name for p in (Path(store.root) / _FINALIZED_DIRNAME).glob("*.json"))
     first = _verdict(committed_receipt, store)
     second = _verdict(committed_receipt, store)
-    assert first == second == _all_pass()
+    assert first == second == _clean_verdict()
     assert sorted(p.name for p in (Path(store.root) / _FINALIZED_DIRNAME).glob("*.json")) == before
     assert store.count_pending() == 0 and store.count_finalized() == 1
 
@@ -349,14 +429,14 @@ def test_a_tampered_commitment_fails_body_hash_AND_NOTHING_ELSE(committed_receip
     checks would be one check reported twice.
     """
     store.tamper(committed_receipt.receipt_id, field=field, value=value)
-    assert _verdict(committed_receipt, store) == _all_pass(body_hash="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(body_hash="fail")
 
 
 def test_a_dropped_probability_fails_body_hash_rather_than_raising(committed_receipt, store):
     """An absent field is a verdict, not a crash. ``fail`` is the only honest reading: the
     receipt cannot show what it committed to."""
     store.tamper(committed_receipt.receipt_id, field="p_follow_profitable")
-    assert _verdict(committed_receipt, store) == _all_pass(body_hash="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(body_hash="fail")
 
 
 @pytest.mark.parametrize(
@@ -372,7 +452,7 @@ def test_a_field_BOTH_checks_cover_is_reported_by_both(committed_receipt, store,
     manifest binds the body BY REFERENCE, so it must notice the reference being swapped — and
     recording it here is what keeps a future reader from reading it as a leak between checks."""
     store.tamper(committed_receipt.receipt_id, field=field, value=value)
-    assert _verdict(committed_receipt, store) == _all_pass(body_hash="fail", manifest="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(body_hash="fail", manifest="fail")
 
 
 def test_body_hash_passes_when_resolution_canonicalized_nothing(store, live_trial):
@@ -391,7 +471,7 @@ def test_body_hash_passes_when_resolution_canonicalized_nothing(store, live_tria
     store.journal("s_same", payer=PAYER, tx_hash=TX_HASH)
     record = store.record(store.finalize_from_journal("s_same"))
     assert record is not None
-    assert _verdict(record, store) == _all_pass()
+    assert _verdict(record, store) == _clean_verdict()
 
 
 def test_the_body_derivation_covers_every_field_a_commit_request_can_carry(committed_receipt, store):
@@ -431,7 +511,7 @@ def test_a_rewritten_binding_fact_fails_the_manifest_AND_NOTHING_ELSE(committed_
     makes ``manifest`` a check of its own rather than a second reading of ``body_hash``.
     """
     store.tamper(committed_receipt.receipt_id, field=field, value=value)
-    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(manifest="fail")
 
 
 def test_an_unsealed_receipt_fails_the_manifest_rather_than_passing_vacuously(committed_receipt, store):
@@ -439,7 +519,7 @@ def test_an_unsealed_receipt_fails_the_manifest_rather_than_passing_vacuously(co
     the honest one: absence of a seal is not evidence of an intact receipt. This is also what a
     row written before the verifier existed looks like."""
     store.tamper(committed_receipt.receipt_id, field="manifest_hash")
-    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(manifest="fail")
 
 
 # --- deadline_respected: reachable, and attributable to deadline_respected ALONE ---
@@ -458,7 +538,7 @@ def test_a_resealed_late_commit_fails_deadline_respected_ALONE(committed_receipt
         value=live_trial.commit_deadline_ms + 1,
         reseal=True,
     )
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
 
 
 def test_the_deadline_boundary_instant_is_LATE(committed_receipt, store, live_trial):
@@ -468,11 +548,11 @@ def test_the_deadline_boundary_instant_is_LATE(committed_receipt, store, live_tr
     store.tamper(
         committed_receipt.receipt_id, field="committed_at_ms", value=live_trial.commit_deadline_ms, reseal=True
     )
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
     store.tamper(
         committed_receipt.receipt_id, field="committed_at_ms", value=live_trial.commit_deadline_ms - 1, reseal=True
     )
-    assert _verdict(committed_receipt, store) == _all_pass()
+    assert _verdict(committed_receipt, store) == _clean_verdict()
 
 
 @pytest.mark.parametrize("value", [None, "1700000000000", 1.7e12, True])
@@ -481,7 +561,7 @@ def test_a_resealed_unusable_deadline_fails_deadline_respected_ALONE(committed_r
     closed rather than being coerced into a comparison that would report ``pass`` on a receipt
     whose timeliness nothing can establish."""
     store.tamper(committed_receipt.receipt_id, field="commit_deadline_ms", value=value, reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
 
 
 @pytest.mark.parametrize("value", [True, False])
@@ -494,17 +574,17 @@ def test_a_resealed_BOOLEAN_commit_instant_fails_rather_than_counting_as_1970(co
     value, so both booleans fail regardless of which side of the deadline they would land on.
     """
     store.tamper(committed_receipt.receipt_id, field="committed_at_ms", value=value, reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
 
 
 def test_a_resealed_absent_deadline_fails_deadline_respected_ALONE(committed_receipt, store):
     store.tamper(committed_receipt.receipt_id, field="commit_deadline_ms", reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
 
 
 def test_a_resealed_absent_commit_instant_fails_deadline_respected_ALONE(committed_receipt, store):
     store.tamper(committed_receipt.receipt_id, field="committed_at_ms", reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(deadline_respected="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(deadline_respected="fail")
 
 
 # --- live_mode: reachable, and attributable to live_mode ALONE (resealed, same reasoning) ---
@@ -516,12 +596,12 @@ def test_a_resealed_non_live_mode_fails_live_mode_ALONE(committed_receipt, store
     knowable, so a paid "prediction" of one is not a prediction. Case and whitespace variants are
     included because a receipt is only live if it says exactly ``live``."""
     store.tamper(committed_receipt.receipt_id, field="trial_mode", value=value, reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(live_mode="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(live_mode="fail")
 
 
 def test_a_resealed_absent_mode_fails_live_mode_ALONE(committed_receipt, store):
     store.tamper(committed_receipt.receipt_id, field="trial_mode", reseal=True)
-    assert _verdict(committed_receipt, store) == _all_pass(live_mode="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(live_mode="fail")
 
 
 def test_the_live_mode_constant_matches_the_trial_module(committed_receipt, store):
@@ -541,7 +621,7 @@ def test_every_check_can_fail_at_once(committed_receipt, store, live_trial):
     store.tamper(receipt_id, field="payment_tx_hash", value="0x" + "9" * 64)
     store.tamper(receipt_id, field="committed_at_ms", value=live_trial.commit_deadline_ms + 1)
     store.tamper(receipt_id, field="trial_mode", value="replay")
-    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+    assert _verdict(committed_receipt, store) == _unreadable_verdict()
 
 
 def test_two_receipts_are_verified_independently(store, live_trial):
@@ -551,8 +631,8 @@ def test_two_receipts_are_verified_independently(store, live_trial):
     second = _commit(store, live_trial, staging_id="s_b", p=0.7)
     assert first.receipt_id != second.receipt_id
     store.tamper(first.receipt_id, field="p_follow_profitable", value=0.99)
-    assert _verdict(first, store) == _all_pass(body_hash="fail")
-    assert _verdict(second, store) == _all_pass()
+    assert _verdict(first, store) == _clean_verdict(body_hash="fail")
+    assert _verdict(second, store) == _clean_verdict()
 
 
 # --- what is NOT a receipt ---
@@ -645,7 +725,11 @@ async def test_the_verify_endpoint_serves_the_clean_verdict(committed_receipt, s
     async with _client_for(_verify_app(store)) as client:
         response = await client.get(_verify_path(committed_receipt.receipt_id))
     assert response.status_code == 200
-    assert response.json() == {"receipt_id": committed_receipt.receipt_id, "checks": _all_pass()}
+    assert response.json() == {
+        "receipt_id": committed_receipt.receipt_id,
+        "checks": _clean_verdict(),
+        "receipt": _served_receipt(committed_receipt),
+    }
 
 
 async def test_the_verify_endpoint_returns_200_CARRYING_the_fail(committed_receipt, store):
@@ -656,7 +740,7 @@ async def test_the_verify_endpoint_returns_200_CARRYING_the_fail(committed_recei
     async with _client_for(_verify_app(store)) as client:
         response = await client.get(_verify_path(committed_receipt.receipt_id))
     assert response.status_code == 200
-    assert response.json()["checks"] == _all_pass(body_hash="fail")
+    assert response.json()["checks"] == _clean_verdict(body_hash="fail")
 
 
 async def test_the_verify_endpoint_maps_a_pending_staging_id_to_404(store, live_trial):
@@ -739,7 +823,7 @@ def test_an_unreadable_row_verifies_as_four_fails_and_does_not_raise(committed_r
     from one that never existed.
     """
     store.corrupt(committed_receipt.receipt_id, raw=raw)
-    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+    assert _verdict(committed_receipt, store) == _unreadable_verdict()
 
 
 @pytest.mark.parametrize("raw", _UNREADABLE_ROWS)
@@ -752,7 +836,8 @@ async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_an_unreadable_
     assert response.status_code == 200
     assert response.json() == {
         "receipt_id": committed_receipt.receipt_id,
-        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+        "checks": _unreadable_verdict(),
+        "receipt": None,
     }
 
 
@@ -875,7 +960,7 @@ def test_an_integer_past_the_digit_limit_verifies_as_four_fails(committed_receip
     something the verifier does not absorb, turns this red.
     """
     _giant_int_row_field(store, committed_receipt.receipt_id, field="committed_at_ms", digits=digits)
-    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+    assert _verdict(committed_receipt, store) == _unreadable_verdict()
 
 
 async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_an_integer_past_the_digit_limit(
@@ -889,7 +974,8 @@ async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_an_integer_pas
     assert response.status_code == 200
     assert response.json() == {
         "receipt_id": committed_receipt.receipt_id,
-        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+        "checks": _unreadable_verdict(),
+        "receipt": None,
     }
 
 
@@ -991,7 +1077,7 @@ def test_a_row_nested_beyond_any_reader_verifies_as_four_fails(committed_receipt
     is what four ``fail``s mean, and the depth is what makes it so rather than the syntax.
     """
     _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_BEYOND_ANY_READER, shape=shape)
-    assert _verdict(committed_receipt, store) == dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail")
+    assert _verdict(committed_receipt, store) == _unreadable_verdict()
 
 
 @pytest.mark.parametrize("shape", _DEEP_ROW_SHAPES)
@@ -1009,7 +1095,8 @@ async def test_the_verify_endpoint_answers_200_CARRYING_fails_for_a_row_nested_b
     assert response.status_code == 200
     assert response.json() == {
         "receipt_id": committed_receipt.receipt_id,
-        "checks": dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
+        "checks": _unreadable_verdict(),
+        "receipt": None,
     }
 
 
@@ -1025,7 +1112,7 @@ def test_a_deeply_nested_but_READABLE_row_keeps_independent_check_attribution(co
     ``payer`` was rewritten.
     """
     _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=_NEST_WITHIN_BUDGET, shape=shape)
-    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(manifest="fail")
 
 
 @pytest.mark.parametrize("depth", _BOUNDARY_DEPTHS)
@@ -1040,8 +1127,8 @@ def test_no_nesting_depth_across_the_reader_boundary_makes_the_verifier_raise(co
     """
     _nest_row_field(store, committed_receipt.receipt_id, field="payer", depth=depth, shape="array")
     assert _verdict(committed_receipt, store) in (
-        dict.fromkeys(VERIFY_COMMIT_CHECKS, "fail"),
-        _all_pass(manifest="fail"),
+        _unreadable_verdict(),
+        _clean_verdict(manifest="fail"),
     )
 
 
@@ -1070,7 +1157,7 @@ def test_a_value_that_defeats_ONE_canonical_rehash_fails_only_THAT_check(
     assert intact is not None
     deep = {**intact, field: _nested_value(_NEST_BEYOND_ANY_READER)}
     monkeypatch.setattr(store, "finalized_payload", lambda _receipt_id: deep)
-    assert _verdict(committed_receipt, store) == _all_pass(**{defeated: "fail"})
+    assert _verdict(committed_receipt, store) == _clean_verdict(**{defeated: "fail"})
 
 
 @pytest.mark.parametrize(("field", "defeated"), _ONE_REHASH_DEFEATED)
@@ -1087,7 +1174,12 @@ async def test_the_verify_endpoint_reports_only_THAT_check_failed_for_an_unhasha
     assert response.status_code == 200
     assert response.json() == {
         "receipt_id": committed_receipt.receipt_id,
-        "checks": _all_pass(**{defeated: "fail"}),
+        "checks": _clean_verdict(**{defeated: "fail"}),
+        # The row PARSES, so seven checks reach a real verdict — but the field that defeated the
+        # re-hash also defeats coercion into a record, so there is no renderable receipt to serve
+        # beside them. ``null`` says exactly that; a partial receipt would publish a value nobody
+        # can re-derive, and a 500 would erase the seven verdicts this route computed.
+        "receipt": None,
     }
 
 
@@ -1095,7 +1187,7 @@ def test_a_defeated_rehash_does_not_MASK_a_second_check_that_INDEPENDENTLY_fails
     """An unaffected check observed FAILING on its own merits, alongside a defeated re-hash.
 
     The discrimination control the attribution tests above cannot supply. Every one of them asserts
-    ``_all_pass(<one>="fail")``, so the three unaffected checks are only ever observed as ``pass`` —
+    ``_clean_verdict(<one>="fail")``, so the three unaffected checks are only ever observed as ``pass`` —
     an observation equally consistent with those three being re-derived and with them being
     hard-coded to ``pass`` whenever the guard fires. Neither the parametrisation swap nor the
     whole-verdict equality closes that: both only ever ask an unaffected check to agree with the
@@ -1110,7 +1202,7 @@ def test_a_defeated_rehash_does_not_MASK_a_second_check_that_INDEPENDENTLY_fails
     assert intact is not None
     broken = {**intact, "payer": _nested_value(_NEST_BEYOND_ANY_READER), "trial_mode": "paper"}
     monkeypatch.setattr(store, "finalized_payload", lambda _receipt_id: broken)
-    assert _verdict(committed_receipt, store) == _all_pass(manifest="fail", live_mode="fail")
+    assert _verdict(committed_receipt, store) == _clean_verdict(manifest="fail", live_mode="fail")
 
 
 # --- values the canonical serializer would reject under DIFFERENT flags (the guard's real risk) ---
@@ -1160,7 +1252,7 @@ def test_a_value_the_serializer_would_reject_UNDER_OTHER_FLAGS_still_reaches_a_v
     # the round trip at all is the point: a pin over a value the write silently normalized away
     # would be green for the wrong reason.
     assert repr(reloaded[field]) == repr(value)
-    assert _verdict(committed_receipt, store) == _all_pass(**{defeated: "fail"})
+    assert _verdict(committed_receipt, store) == _clean_verdict(**{defeated: "fail"})
 
 
 def test_an_OSError_from_the_READ_is_not_normalized_into_a_verdict(committed_receipt, store, monkeypatch):

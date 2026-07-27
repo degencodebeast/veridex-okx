@@ -1,9 +1,10 @@
 """Wire schemas for the signal-trials API surface.
 
-These four models are frozen by the implementation plan at H1.2. The response models
-for trials, agent records, receipt verification and commit receipts are deliberately
-NOT frozen here — they are settled at H4.3, once the settlement path exists and there
-is something truthful for them to carry.
+The first four models were frozen by the implementation plan at H1.2. The remaining five
+are frozen at H4.3, now that the settlement path exists and there is something truthful
+for them to carry: :class:`TrialOutcomeModel`, :class:`TrialResponse`,
+:class:`CommitReceiptResponse`, :class:`AgentRecordResponse` and
+:class:`VerifyReceiptResponse`.
 
 The constraints below are not decoration; each one is a claim boundary:
 
@@ -18,6 +19,22 @@ The constraints below are not decoration; each one is a claim boundary:
 * ``season_status`` admits only the three PUBLISHED statuses. ``not_built`` is a
   health state describing a directory with no season in it, and can never be the
   status of a season document that exists.
+
+**This module imports nothing from ``signal_trials``, and cannot.**
+``veridex.signal_trials.live`` imports :class:`CommitRequest` from here, so the
+dependency runs one way only. That is why :class:`TrialOutcomeModel` is a hand-written
+mirror of the :class:`~veridex.signal_trials.receipts.TrialOutcome` dataclass rather than
+a generated one, and why the mirror is held to the dataclass by
+``test_the_outcome_model_mirrors_the_dataclass_FIELD_FOR_FIELD`` — nothing else can
+notice a field added on one side and not the other, and H5.1's frontend types mirror
+these shapes EXACTLY.
+
+**Every settlement-bearing field is nullable, and the nulls are not defaults.** A trial
+with no recorded outcome carries ``outcome: null``, which is a different claim from an
+outcome whose ``status`` is ``"pending"``: the first says nothing has been computed, the
+second says a settlement attempt ran and the answer is not knowable yet. The same
+distinction runs through ``brier`` and ``chosen_markout_bps`` — a zero there would read
+as a real result rather than as the absence of one.
 """
 
 from __future__ import annotations
@@ -83,3 +100,136 @@ class OpenTrialResponse(BaseModel):
     commit_deadline_ms: int
     evidence: dict[str, Any]
     evidence_hash: str
+
+
+class TrialOutcomeModel(BaseModel):
+    """The EVENT-level settlement of one trial. No participant data appears here.
+
+    Mirrors :class:`~veridex.signal_trials.receipts.TrialOutcome` field for field. The
+    absence of any payer, probability or Brier is the point: two agents who committed
+    opposite probabilities against this event share exactly this outcome, and their
+    records differ only in the participant join that :class:`CommitReceiptResponse`
+    carries.
+
+    ``status`` is three-valued and the two non-settled values are NOT interchangeable.
+    ``pending`` means the settlement candle may still be forming or may not yet be
+    fetchable; ``UNSCORED`` means the window and its fetch grace both expired without
+    one. Every metric field is ``None`` in BOTH states, so a consumer that branched on
+    ``future === null`` would render an unscored trial as one still awaiting its result.
+    Branch on ``status``.
+    """
+
+    trial_id: str
+    status: Literal["pending", "settled", "UNSCORED"]
+    entry: float
+    future: float | None
+    close_ts_ms: int | None
+    observation_lag_ms: int | None
+    follow_markout_bps: int | None
+    fade_markout_bps: int | None
+    follow_profitable: bool | None
+
+
+class TrialResponse(BaseModel):
+    """One trial: its decision-time evidence, the hash binding it, and its outcome.
+
+    The evidence half is byte-for-byte what :class:`OpenTrialResponse` serves, because a
+    trial's terms do not change when it settles — a reader must be able to compare a
+    receipt against the same evidence the committer saw.
+
+    ``outcome`` is ``None`` when NO outcome has been recorded for this trial, which is a
+    weaker statement than a recorded ``pending``: nothing has been computed at all.
+    Synthesizing a pending outcome here would publish a settlement state no settler
+    produced.
+    """
+
+    trial_id: str
+    trial_mode: Literal["live"]
+    t0_ms: int
+    commit_deadline_ms: int
+    evidence: dict[str, Any]
+    evidence_hash: str
+    outcome: TrialOutcomeModel | None
+
+
+class CommitReceiptResponse(BaseModel):
+    """One finalized paid commitment, joined to its trial's outcome.
+
+    The commit half (``body_hash``, ``payment_tx_hash``, ``committed_at_ms``,
+    ``commit_deadline_ms``, ``trial_mode``) is what a verifier re-derives, so it is served
+    rather than hidden: a receipt whose binding facts are not visible cannot be audited
+    against the check map beside it. All of it is already public — the payer address is
+    the record's identity, and the transaction is on a public chain.
+
+    ``action`` is DERIVED from ``p_follow_profitable`` (§8.1 bands), never submitted, so
+    the displayed stance and the committed confidence cannot contradict each other. It is
+    a display of the caller's own probability and not a Veridex recommendation (§3.8).
+
+    ``brier`` and ``chosen_markout_bps`` are ``None`` unless ``status == "settled"``.
+    """
+
+    receipt_id: str
+    trial_id: str
+    payer: str
+    p_follow_profitable: float
+    methodology_version: str | None
+    action: Literal["FOLLOW", "FADE", "ABSTAIN"]
+    status: Literal["pending", "settled", "UNSCORED"]
+    brier: float | None
+    chosen_markout_bps: int | None
+    committed_at_ms: int
+    commit_deadline_ms: int | None
+    trial_mode: str | None
+    body_hash: str
+    payment_tx_hash: str
+
+
+class AgentRecordResponse(BaseModel):
+    """One payer's live participant record, aggregated over FINALIZED commits only.
+
+    ``qualified`` is ALWAYS ``False`` on a live record and is carried explicitly rather
+    than omitted, so a consumer reads a stated ``false`` instead of inferring one from a
+    missing key. §8.4 gates qualification on a ``qualified`` SEASON with ≥20 active
+    decisions and ≥50% coverage; a live exhibition is none of those things, so there is
+    no live record that could truthfully claim skill.
+
+    ``avg_brier`` and ``capped_avg_markout_bps`` are ``None`` until something settles. A
+    zero Brier is a PERFECT score, so defaulting either to zero would publish a result
+    where there is none.
+    """
+
+    payer: str
+    commits: int
+    settled: int
+    pending: int
+    unscored: int
+    avg_brier: float | None
+    capped_avg_markout_bps: int | None
+    qualified: bool
+
+
+class VerifyReceiptResponse(BaseModel):
+    """The verdict on one receipt: every Fair-Play check, and the receipt it is about.
+
+    ``checks`` is a mapping rather than named fields because a consumer's job is to
+    display or audit them uniformly. It is THREE-valued. ``pending`` is not a hedge: the
+    four commit-time checks read facts the receipt itself carries and are therefore always
+    decidable, while the four outcome checks have nothing to re-derive until a settled
+    outcome exists. Reporting them as ``fail`` before then would tell a receipt holder
+    their receipt is invalid because the market has not moved on yet.
+
+    ``pending`` does NOT distinguish "not settled yet" from "settled UNSCORED and never
+    will be" — the triple has no fourth value and this one is frozen. That distinction is
+    carried by ``receipt.status``, which must be read alongside the checks. The boundary
+    is stated here rather than left implied because it is the one thing this map cannot
+    say for itself.
+
+    ``receipt`` is ``None`` only when the stored row's bytes cannot be read at all. That
+    case still answers 200 carrying eight verdicts, because a destroyed receipt is a
+    finding about the receipt and not an outage; rendering a partial receipt out of it
+    would publish fields nothing can re-derive.
+    """
+
+    receipt_id: str
+    checks: dict[str, Literal["pass", "fail", "pending"]]
+    receipt: CommitReceiptResponse | None

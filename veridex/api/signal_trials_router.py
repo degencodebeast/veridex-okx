@@ -27,16 +27,23 @@ explicitly, so a malformed artifact raises here rather than being served.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from veridex.api.signal_trials_schemas import (
+    AgentRecordResponse,
+    CommitReceiptResponse,
     CommitRequest,
     OpenTrialResponse,
     SignalTrialsSeasonResponse,
+    TrialOutcomeModel,
+    TrialResponse,
+    VerifyReceiptResponse,
 )
+from veridex.signal_trials.live import build_agent_record, settle_commit, unsettled_commit
 from veridex.signal_trials.published import read_season, read_state
 from veridex.signal_trials.receipts import verify_receipt
 
@@ -45,7 +52,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from veridex.signal_trials.live import LiveTrial, LiveTrialRepository
-    from veridex.signal_trials.receipts import ReceiptStore
+    from veridex.signal_trials.receipts import ReceiptStore, TrialOutcome
 
 #: Every route this lane owns lives under this prefix.
 SIGNAL_TRIALS_PREFIX = "/signal-trials"
@@ -75,6 +82,74 @@ def _open_trial_response(trial: LiveTrial) -> OpenTrialResponse:
         commit_deadline_ms=trial.commit_deadline_ms,
         evidence=trial.evidence,
         evidence_hash=trial.evidence_hash,
+    )
+
+
+def _trial_response(trial: LiveTrial, outcome: TrialOutcome | None) -> TrialResponse:
+    """Render a trial with its settlement, or with ``outcome=None`` when none is recorded.
+
+    ``None`` is served rather than a synthesized ``pending`` outcome, and the two are different
+    claims: ``null`` says no settler has run on this trial, a recorded ``pending`` says one ran and
+    the answer is not knowable yet. Manufacturing the second from the first would publish a
+    settlement state nothing computed — the placeholder H1.2 refused to serve.
+    """
+    return TrialResponse(
+        trial_id=trial.trial_id,
+        trial_mode="live",
+        t0_ms=trial.t0_ms,
+        commit_deadline_ms=trial.commit_deadline_ms,
+        evidence=trial.evidence,
+        evidence_hash=trial.evidence_hash,
+        outcome=None if outcome is None else TrialOutcomeModel(**asdict(outcome)),
+    )
+
+
+def _commit_receipt_response(receipt_id: str, store: ReceiptStore) -> CommitReceiptResponse | None:
+    """Render one finalized receipt joined to its trial's outcome, or ``None`` if unreadable.
+
+    ``None`` means there is no renderable receipt, and it covers three states that are all that
+    same fact: the row does not exist, its bytes cannot be read, or it parses into values that
+    cannot be coerced into a record. Letting any of those escape would answer 500 for a receipt
+    whose verify report has eight perfectly good verdicts to publish — the exact
+    tampering-versus-outage conflation this route exists to avoid. Rendering a partial receipt out
+    of the wreckage was the alternative and is worse: it would serve fields nothing can re-derive.
+
+    **The catch is bounded, and this names the boundary.** Building a record out of an untrusted
+    parsed row fails in three ways: ``ValueError`` (a row that is not readable JSON, or a value
+    ``float()`` refuses), ``TypeError`` (a value of a type the coercion cannot take at all — a
+    ``p_follow_profitable`` stored as a list), and ``RecursionError`` (a value nested past what the
+    interpreter can walk, which a tampered row can carry and which is not a ``ValueError``). That
+    is a claim about the ROW being unrenderable in every case. Anything outside the three
+    propagates — in particular ``OSError``, which is an unreadable disk or a permissions fault and
+    genuinely IS the service being broken, so a 500 is the honest answer to it.
+
+    ``store.outcome`` is inside the same guard on purpose: a corrupt OUTCOME row also leaves this
+    receipt unrenderable, and the four outcome checks beside it already report that corruption as
+    ``fail``.
+    """
+    try:
+        record = store.record(receipt_id)
+        if record is None:
+            return None
+        outcome = store.outcome(record.trial_id)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    settlement = unsettled_commit(record) if outcome is None else settle_commit(record, outcome)
+    return CommitReceiptResponse(
+        receipt_id=record.receipt_id,
+        trial_id=record.trial_id,
+        payer=record.payer,
+        p_follow_profitable=record.p_follow_profitable,
+        methodology_version=record.methodology_version,
+        action=settlement.action,
+        status=settlement.status,
+        brier=settlement.brier,
+        chosen_markout_bps=settlement.chosen_markout_bps,
+        committed_at_ms=record.committed_at_ms,
+        commit_deadline_ms=record.commit_deadline_ms,
+        trial_mode=record.trial_mode,
+        body_hash=record.body_hash,
+        payment_tx_hash=record.payment_tx_hash,
     )
 
 
@@ -179,12 +254,18 @@ def register_signal_trials_routes(
         return provided
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/trials/{{trial_id}}", response_model=None)
-    async def signal_trials_trial(trial_id: str) -> JSONResponse | OpenTrialResponse:
-        """Serve a known trial's decision-time evidence, or 404 for an id nothing matches.
+    async def signal_trials_trial(trial_id: str) -> JSONResponse | TrialResponse:
+        """Serve a known trial's decision-time evidence and its outcome, or 404 for an unknown id.
 
-        Carries the same no-future evidence as ``/open-trial`` and nothing more. Outcomes,
-        markouts and participant records are H4.3's, and serving a placeholder for them here
-        would publish a settlement state that has not been computed.
+        The evidence half is byte-for-byte what ``/open-trial`` serves: a trial's terms do not
+        change when it settles, and a reader has to be able to compare a receipt against the same
+        evidence the committer saw. The outcome half is ``null`` until one is recorded.
+
+        A CORRUPT outcome row is left to raise rather than served as ``null``, and that is the
+        deliberate reading: ``null`` claims no settlement has been recorded, which is false about a
+        row that was recorded and then destroyed. The service cannot answer this trial honestly, so
+        it says so — unlike the verify route, whose entire purpose is to publish a verdict about a
+        damaged artifact.
 
         The id is never echoed into the refusal: it arrives from a URL path segment, so echoing
         it would reflect caller-controlled text back into logs and responses.
@@ -193,12 +274,34 @@ def register_signal_trials_routes(
         trial = None if repo is None else repo.get(trial_id)
         if trial is None:
             return _error(404, "trial_not_found")
-        return _open_trial_response(trial)
+        commit_store = _store()
+        return _trial_response(trial, None if commit_store is None else commit_store.outcome(trial.trial_id))
 
-    @app.get(f"{SIGNAL_TRIALS_PREFIX}/agents/{{payer_id}}")
-    async def signal_trials_agent(payer_id: str) -> JSONResponse:
-        """No participant records exist until a paid commit can settle (H4.1/H4.3)."""
-        return _error(404, "agent_not_found")
+    @app.get(f"{SIGNAL_TRIALS_PREFIX}/agents/{{payer_id}}", response_model=None)
+    async def signal_trials_agent(payer_id: str) -> JSONResponse | AgentRecordResponse:
+        """Serve a payer's live participant record, or 404 when they have no FINALIZED commit.
+
+        Zero finalized commits is 404 rather than a 200 carrying zeros, because an all-zero record
+        asserts that this payer participated and scored nothing — a different claim from having no
+        record at all, and one that would let any address be quoted as a Veridex participant.
+
+        A STAGED row does not create a record. It is a commitment that was received and not paid
+        for, and the aggregation reads the store's public gate, so this is a property of one read
+        path rather than of this route remembering to filter.
+
+        A CORRUPT outcome row on any of this payer's trials is left to raise, exactly as on the
+        trial route: the record is an AGGREGATE, so serving it while silently skipping the trial
+        nothing could read would publish a smaller, better-looking record than the artifacts
+        support. This route has no verdict to publish about the damage — that is the verify
+        route's job — so the honest answer is that the record cannot be computed.
+        """
+        commit_store = _store()
+        if commit_store is None:
+            return _error(404, "agent_not_found")
+        record = build_agent_record(payer_id, commit_store)
+        if record.commits == 0:
+            return _error(404, "agent_not_found")
+        return AgentRecordResponse(**record.model_dump())
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/commit")
     async def signal_trials_commit_get() -> JSONResponse:
@@ -235,9 +338,9 @@ def register_signal_trials_routes(
             return _error(503, "trials_not_open")
         return _error(503, "payment_gate_not_configured")
 
-    @app.get(f"{SIGNAL_TRIALS_PREFIX}/receipts/{{receipt_id}}/verify")
-    async def signal_trials_verify_receipt(receipt_id: str) -> JSONResponse:
-        """Re-derive a finalized receipt's commit-time claims. Free, and honest about failure.
+    @app.get(f"{SIGNAL_TRIALS_PREFIX}/receipts/{{receipt_id}}/verify", response_model=None)
+    async def signal_trials_verify_receipt(receipt_id: str) -> JSONResponse | VerifyReceiptResponse:
+        """Re-derive a finalized receipt's commit-time and settlement-time claims. Free, and honest.
 
         **A failed check is a 200 carrying a ``fail``**, never a 500. The verdict is what this
         route exists to publish, so reporting a tampered receipt as a server error would make
@@ -246,9 +349,10 @@ def register_signal_trials_routes(
         directions, and this is the trust surface the whole benchmark rests on.
 
         That holds for a row whose bytes are DESTROYED as well as one that was edited: an
-        unreadable row verifies as four ``fail``s rather than escaping as an exception, which is
-        decided in :func:`~veridex.signal_trials.receipts.verify_receipt` rather than papered over
-        here. This handler deliberately does NOT catch broadly. A ``ValueError`` reaching it would
+        unreadable row verifies as four commit ``fail``s and four ``pending`` outcome checks rather
+        than escaping as an exception, which is decided in
+        :func:`~veridex.signal_trials.receipts.verify_receipt` rather than papered over here. Its
+        ``receipt`` is ``null`` for the same reason — see :func:`_commit_receipt_response`. This handler deliberately does NOT catch broadly. A ``ValueError`` reaching it would
         mean the verifier stopped honouring that contract, and swallowing it here would hide the
         regression while leaving the route looking correct. What can still legitimately produce a
         500 is an ``OSError`` — an unreadable disk or a permissions fault — which genuinely is the
@@ -271,4 +375,8 @@ def register_signal_trials_routes(
             report = verify_receipt(receipt_id, commit_store)
         except KeyError:
             return _error(404, "receipt_not_found")
-        return JSONResponse(status_code=200, content={"receipt_id": report.receipt_id, "checks": dict(report.checks)})
+        return VerifyReceiptResponse(
+            receipt_id=report.receipt_id,
+            checks=dict(report.checks),
+            receipt=_commit_receipt_response(receipt_id, commit_store),
+        )
