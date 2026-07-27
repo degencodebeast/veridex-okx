@@ -1,0 +1,51 @@
+{
+  "season_id": "season-2026w30-501-1m",
+  "season_status": "qualified",
+  "combo": {
+    "chain_index": "501",
+    "bar": "1m"
+  },
+  "sample_size": 61,
+  "rows": [
+    {
+      "agent_id": "agent-signal-01",
+      "qualified": true,
+      "avg_brier": 0.184,
+      "capped_avg_markout_bps": -12,
+      "active_decisions": 24,
+      "active_coverage": 0.62,
+      "unscored": 3,
+      "is_control": false
+    },
+    {
+      "agent_id": "agent-flat",
+      "qualified": false,
+      "avg_brier": 0.0,
+      "capped_avg_markout_bps": 0,
+      "active_decisions": 18,
+      "active_coverage": 0.51,
+      "unscored": 1,
+      "is_control": false
+    },
+    {
+      "agent_id": "agent-unsettled",
+      "qualified": false,
+      "avg_brier": null,
+      "capped_avg_markout_bps": null,
+      "active_decisions": 0,
+      "active_coverage": 0.0,
+      "unscored": 5,
+      "is_control": false
+    },
+    {
+      "agent_id": "control-coin-flip",
+      "qualified": false,
+      "avg_brier": 0.25,
+      "capped_avg_markout_bps": 1,
+      "active_decisions": 22,
+      "active_coverage": 0.58,
+      "unscored": 2,
+      "is_control": true
+    }
+  ]
+}

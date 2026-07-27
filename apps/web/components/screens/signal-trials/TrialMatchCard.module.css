@@ -1,0 +1,171 @@
+/* Layout idioms are lifted from SeasonScreen.module.css (same table/panel language, same design
+   tokens) rather than imported from it — that file belongs to H5.2 and must not be modified. */
+.screen { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.panel {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  padding: var(--space-3) var(--pad-panel);
+  border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel);
+}
+/* A state we have no verdict for must not borrow the visual weight of one we do. */
+.panel[data-state='not_found'] { border-style: dashed; }
+.panel[data-state='unavailable'] { border-color: var(--negative); }
+.panel[data-state='contract_violation'] { border-color: var(--negative); border-style: dashed; }
+.panel[data-state='store_unavailable'], .panel[data-state='failed'] { border-color: var(--warning); }
+/* `empty` is a REAL answer (no agent paid to commit), not a degraded one — it keeps the neutral
+   panel. Giving it the warning border would read as a failure, which is the opposite claim. */
+.panel[data-state='empty'] { border-style: dashed; }
+
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+.headText { display: flex; flex-direction: column; gap: 4px; min-width: 240px; }
+.headChips { display: flex; gap: 6px; flex-wrap: wrap; }
+.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; font-family: var(--font-mono), monospace; }
+.lead { margin: 0; font-size: 11px; color: var(--text-2); max-width: 62ch; }
+
+.back {
+  font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.08em;
+  color: var(--accent-2); text-decoration: none; align-self: flex-start;
+}
+.back:hover, .back:focus-visible { color: var(--accent-hi); }
+
+/* Status chip. Deliberately NOT the shared <Badge> component, for three reasons that are each
+   checkable:
+   1. These states do not map cleanly onto the BadgeVariant vocabulary. `settled` and `none` have
+      no variant at all; `pending` and `unscored` DO exist there (lib/badges.ts:3, :8) but carry a
+      different domain meaning — the roster proof-state vocabulary, not a trial's settlement.
+      Borrowing a spelling whose meaning differs is worse than not borrowing it.
+   2. <Badge> cannot carry the `data-status` hook that the rules below and the tests both read.
+   3. `verified` — the variant that looks closest — already means something else here: it is a
+      ProofMode (lib/contracts.ts:10, one of reproducible | verified | partial) describing ONE
+      artifact's proof state, and it is rendered as such elsewhere (DesignSystemScreen.tsx:106).
+      Reusing it for a trial would stretch a per-artifact label into an aggregate claim over eight
+      independently-reported checks. See the "no aggregate badge" guard in TrialMatchCard.test.tsx.
+   SeasonScreen.module.css:16 rolled its own chip for the same reasons. */
+.chip {
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 3px 8px; border-radius: var(--radius-badge);
+  border: 1px solid var(--border); color: var(--text-2); background: var(--panel);
+  white-space: nowrap;
+}
+.chip[data-status='settled'] { border-color: var(--accent); color: var(--accent-hi); }
+.chip[data-status='pending'], .chip[data-status='UNSCORED'] { border-color: var(--warning); color: var(--warning); }
+/* `none` is the ABSENCE of an outcome record — neutral and dashed, never borrowing a verdict's
+   colour. */
+.chip[data-status='none'] { border-style: dashed; color: var(--text-3); }
+
+/* The fence. Loud by design: it is the one line that must survive a screenshot taken out of
+   context. */
+.fence {
+  margin: 0; padding: 6px var(--pad-panel);
+  font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.08em;
+  border: 1px solid var(--warning); border-radius: var(--radius-control);
+  color: var(--warning); background: var(--panel-2);
+}
+
+.rail, .settlement, .checks {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: var(--space-2) var(--pad-panel);
+  border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--panel-2);
+}
+.settlement[data-status='UNSCORED'] { border-color: var(--warning); }
+.settlement[data-status='none'] { border-style: dashed; }
+
+.panelLabel { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.1em; color: var(--text-3); }
+.panelSub { margin: 0; font-size: 10px; color: var(--text-3); }
+
+.hashChip { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.hashLabel { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em; color: var(--text-3); }
+/* The hash wraps rather than truncating. A truncation is a value the backend never served, and
+   this is the one string every agent's commitment is bound to. */
+.hash { font-family: var(--font-mono), monospace; font-size: 10px; color: var(--accent-hi); word-break: break-all; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-2); margin: 0; }
+.field { display: flex; flex-direction: column; gap: 2px; }
+.fieldLabel { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); }
+.fieldValue { margin: 0; font-family: var(--font-mono), monospace; font-size: 12px; color: var(--text-1); font-variant-numeric: tabular-nums; word-break: break-all; }
+
+.official { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.06em; color: var(--accent-hi); }
+
+.stateTitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
+.stateBody { margin: 0; font-size: 12px; color: var(--text-2); max-width: 78ch; }
+.stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
+.footNote { margin: 0; font-size: 10px; color: var(--text-3); max-width: 88ch; }
+
+.errorDetail {
+  margin: 0; padding: var(--space-2); overflow-x: auto; white-space: pre-wrap;
+  font-family: var(--font-mono), monospace; font-size: 10px; color: var(--negative);
+  border: 1px solid var(--negative); border-radius: var(--radius-control); background: var(--panel-2);
+}
+
+.tableWrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-panel); }
+.table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
+.table th { text-align: left; padding: 9px; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); white-space: nowrap; }
+.table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); white-space: nowrap; }
+.row:hover { background: var(--panel-2); }
+.r { text-align: right; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.secondary { color: var(--text-3); }
+
+/* THE FROZEN LABEL and THE VERBATIM STRINGS both ship in the DOM at their authoritative casing —
+   the exported constant for the markout label, the task packet's spelling for the two verbatim
+   strings — and the design handoff's uppercase rendering is applied HERE, as presentation.
+   Hardcoding an uppercase copy in the markup would put a second, drifting spelling in the tree. */
+.upper { text-transform: uppercase; }
+.verbatimUpper { text-transform: uppercase; }
+.frozenLabel { text-transform: none; }
+
+.tag {
+  margin: 0; align-self: flex-start; padding: 3px 8px;
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em;
+  border: 1px solid var(--border); border-radius: var(--radius-badge);
+  color: var(--text-3); background: var(--panel);
+}
+
+.actionChip {
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
+  padding: 2px 6px; border-radius: var(--radius-badge);
+  border: 1px solid var(--border); color: var(--text-2); background: var(--panel);
+}
+/* FOLLOW and FADE are OPPOSITE decisions on identical evidence, so they must not look alike.
+   Neither colour is a quality judgement — a FADE is not worse than a FOLLOW. */
+.actionChip[data-action='FOLLOW'] { border-color: var(--accent); color: var(--accent-hi); }
+.actionChip[data-action='FADE'] { border-color: var(--accent-2); color: var(--accent-2); }
+.actionChip[data-action='ABSTAIN'] { border-style: dashed; color: var(--text-3); }
+
+.checks[data-checks-state='unavailable'] { border-color: var(--warning); }
+.checks[data-checks-state='not_found'] { border-style: dashed; }
+
+.checkList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.checkRow {
+  display: grid; grid-template-columns: minmax(130px, auto) 88px 1fr auto;
+  gap: var(--space-2); align-items: baseline;
+  padding: 5px 0; border-bottom: 1px solid var(--border-soft);
+}
+.checkKey { font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-1); }
+.checkPhase { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); }
+.checkDesc { font-size: 10px; color: var(--text-3); }
+.checkStatus {
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
+  padding: 2px 6px; border-radius: var(--radius-badge);
+  border: 1px solid var(--border); color: var(--text-2); white-space: nowrap;
+}
+.checkStatus[data-status='pass'] { border-color: var(--accent); color: var(--accent-hi); }
+.checkStatus[data-status='fail'] { border-color: var(--negative); color: var(--negative); }
+.checkStatus[data-status='pending'] { border-color: var(--warning); color: var(--warning); }
+/* `not served` is the ABSENCE of a verdict, not a verdict. It is styled as neither a pass nor a
+   pending so it can never be read as one the verifier actually made. */
+.checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-3); }
+
+.retry {
+  align-self: flex-start; font-family: var(--font-mono), monospace; font-size: 10px;
+  letter-spacing: 0.06em; padding: 5px 10px; border-radius: var(--radius-control);
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text-1); cursor: pointer;
+}
+.retry:hover, .retry:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
+
+.skeletonRow { height: 11px; border-radius: 3px; background: var(--panel-2); }
+
+@media (max-width: 640px) {
+  .checkRow { grid-template-columns: 1fr auto; }
+  .checkPhase, .checkDesc { grid-column: 1 / -1; }
+}

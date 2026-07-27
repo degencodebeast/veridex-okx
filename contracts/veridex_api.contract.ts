@@ -126,3 +126,76 @@ export interface MakerArenaResultResponseWire {   // GET /maker/arena-result
   rank_axis: string; rank_axis_direction: string;
   result: MakerArenaResultWire; proof_card: MakerProofCardWire; diagnostics: MakerDiagnosticsWire;
 }
+
+// ---- SIGNAL TRIALS ----
+// The eight frontend-consumed models, frozen at veridex/api/signal_trials_schemas.py @ 2d303d4
+// (SCHEMA_FREEZE: 8 models, 60 fields, ZERO defaults — extracted by Pydantic runtime introspection,
+// not by reading source). Do not hand-edit field names without updating
+// veridex/api/signal_trials_schemas.py + contracts/fixtures + tests/test_api_contract.py.
+//
+// EVERY NULLABLE FIELD IS REQUIRED WITH NO DEFAULT. A consumer that renders `0` for `null`
+// publishes a fabricated result on a public leaderboard: a zero markout is a real FLAT outcome and
+// a zero Brier is a PERFECT score. `pending` and `UNSCORED` carry IDENTICAL null metrics, so the
+// `status` label is the only thing separating them.
+
+export type TrialStatusWire = "pending" | "settled" | "UNSCORED";
+export type TrialActionWire = "FOLLOW" | "FADE" | "ABSTAIN";
+export type SignalTrialsCheckStatusWire = "pass" | "fail" | "pending";   // THREE-valued, no not_applicable
+export type SignalTrialsSeasonStatusWire = "qualified" | "exploratory" | "no_season";
+export type SeasonStateWire = "not_built" | "qualified" | "exploratory" | "no_season";
+
+// GET /signal-trials/health — UNTYPED on the backend (dict[str, Any], no response_model) with
+// EXACTLY these two fields. read_state's `detail` is projected away at the route: do NOT model it.
+// Both `not_built` and `no_season` answer 404 on /season, so this is the ONLY place they differ.
+export interface SignalTrialsHealthWire { ok: boolean; season_state: SeasonStateWire; }
+
+export interface SignalTrialsRowWire {
+  agent_id: string; qualified: boolean;
+  avg_brier: number | null;               // null until something settles
+  capped_avg_markout_bps: number | null;  // null until something settles
+  active_decisions: number; active_coverage: number; unscored: number; is_control: boolean;
+}
+export interface SignalTrialsSeasonWire {   // GET /signal-trials/season — 404 no_season_published
+  season_id: string; season_status: SignalTrialsSeasonStatusWire;
+  combo: Record<string, unknown>; sample_size: number; rows: SignalTrialsRowWire[];
+}
+export interface OpenTrialWire {            // GET /signal-trials/open-trial — 404 no_open_trial
+  trial_id: string; trial_mode: "live"; t0_ms: number; commit_deadline_ms: number;
+  evidence: Record<string, unknown>; evidence_hash: string;
+}
+export interface TrialOutcomeWire {         // embedded in TrialWire; `entry` is NOT nullable
+  trial_id: string; status: TrialStatusWire; entry: number;
+  future: number | null; close_ts_ms: number | null; observation_lag_ms: number | null;
+  follow_markout_bps: number | null; fade_markout_bps: number | null; follow_profitable: boolean | null;
+}
+// GET /signal-trials/trials/{id} — 404 trial_not_found. SEVEN fields: there is NO participants list
+// on this model and no route enumerates a trial's receipts (`ParticipantSettlement` does not exist).
+export interface TrialWire {
+  trial_id: string; trial_mode: "live"; t0_ms: number; commit_deadline_ms: number;
+  evidence: Record<string, unknown>; evidence_hash: string;
+  outcome: TrialOutcomeWire | null;   // null ⇒ nothing computed at all (WEAKER than a recorded `pending`)
+}
+export interface CommitReceiptWire {
+  receipt_id: string; trial_id: string; payer: string; p_follow_profitable: number;
+  methodology_version: string | null; action: TrialActionWire; status: TrialStatusWire;
+  brier: number | null; chosen_markout_bps: number | null;   // null unless status === "settled"
+  committed_at_ms: number; commit_deadline_ms: number | null;
+  trial_mode: string | null;          // UNCONSTRAINED str here, unlike the trial models' "live"
+  body_hash: string; payment_tx_hash: string;
+}
+// GET /signal-trials/agents/{payer} — 404 agent_not_found on zero finalized commits (an all-zero
+// record would assert the payer participated and scored nothing). `qualified` is false on live records.
+export interface AgentRecordWire {
+  payer: string; commits: number; settled: number; pending: number; unscored: number;
+  avg_brier: number | null; capped_avg_markout_bps: number | null; qualified: boolean;
+}
+// GET /signal-trials/receipts/{id}/verify — 404 receipt_not_found. A failed check is a 200 carrying
+// a `fail`, NEVER a 500. `checks` KEYS are published as unconstrained str over the frozen eight:
+//   commit-time  body_hash  manifest  deadline_respected  live_mode
+//   outcome      bar_version  law_version  evidence_equality  outcome_source
+// `pending` does NOT distinguish "not settled yet" from "settled UNSCORED and never will be" —
+// that lives in receipt.status, which must be read alongside the checks.
+export interface VerifyReceiptWire {
+  receipt_id: string; checks: Record<string, SignalTrialsCheckStatusWire>;
+  receipt: CommitReceiptWire | null;  // null ONLY when the row's bytes are unreadable — still 200 + 8 verdicts
+}

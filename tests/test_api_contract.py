@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from veridex.api.demo_fixtures import build_demo_ticks, contrarian_agent
@@ -18,7 +19,22 @@ from veridex.api.schemas import (
     RuntimeEventsResponse,
     VerifyResponse,
 )
+from veridex.api.signal_trials_schemas import (
+    OpenTrialResponse,
+    SignalTrialsRowModel,
+    SignalTrialsSeasonResponse,
+)
 from veridex.store import InMemoryStore
+
+# The H4.3 half of the frozen Signal Trials family lands on this branch with the payments lane
+# merge. Importing it unconditionally would break the WHOLE contract suite on a tree that simply
+# has not merged yet, so it is probed — and the test that needs it SKIPS WITH A NAMED REASON
+# rather than silently passing. The skip converts itself into a hard assertion the moment the
+# models arrive; see test_signal_trials_trial_fixture_validates_against_trial_response.
+try:
+    from veridex.api.signal_trials_schemas import TrialResponse as _TrialResponse
+except ImportError:  # pragma: no cover - exercised only before the payments lane merge
+    _TrialResponse = None
 
 _FIXTURES = Path("contracts/fixtures")
 
@@ -31,6 +47,7 @@ _REGISTRY = {
     "inspector_record.json": InspectorRecord,
     "feed_health.json": FeedHealthResponse,
     "runtime_events.json": RuntimeEventsResponse,
+    "signal_trials_season.json": SignalTrialsSeasonResponse,
 }
 
 
@@ -143,3 +160,81 @@ async def test_verify_route_manifest_hash_matches_seal_time() -> None:
     verify = client.post(f"/runs/{sealed.run.run_id}/verify")
     assert verify.status_code == 200
     assert verify.json()["manifest_hash"] == sealed.manifest_hash
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL TRIALS (H5.1) — the contract seam between the frozen models and the
+# TypeScript wire family in apps/web/lib/wire.ts.
+# ---------------------------------------------------------------------------
+
+
+def test_signal_trials_models_carry_no_defaults() -> None:
+    """SCHEMA_FREEZE's load-bearing property: ZERO of the frozen fields carry a default.
+
+    This is why the TypeScript mirror types every nullable field ``| null`` and never optional
+    (``?``) — a field that may be absent and a field that is present-and-null are different
+    contracts, and only the second one is what the backend serves. Asserted by runtime
+    ``model_fields`` introspection, the same method that produced the freeze packet, because two
+    prior regex passes over this source each produced a different wrong answer and one silently
+    dropped ``t0_ms``.
+    """
+    for model in (SignalTrialsRowModel, SignalTrialsSeasonResponse, OpenTrialResponse):
+        for name, field in model.model_fields.items():
+            assert field.is_required(), f"{model.__name__}.{name} acquired a default; the freeze says zero do"
+
+
+def test_signal_trials_season_fixture_preserves_null_and_zero_as_DIFFERENT_values() -> None:
+    """The fixture must carry both a null metric AND a real zero metric, and keep them apart.
+
+    A zero markout is a real FLAT outcome and a zero Brier is a PERFECT score, so a fixture
+    carrying only nulls could not catch a consumer that renders ``0`` for ``null`` — the failure
+    this whole freeze exists to prevent. Both controls are asserted here for the same reason the
+    TypeScript adapter tests assert both.
+    """
+    data = json.loads((_FIXTURES / "signal_trials_season.json").read_text())
+    season = SignalTrialsSeasonResponse.model_validate(data)
+    rows = {row.agent_id: row for row in season.rows}
+
+    unsettled = rows["agent-unsettled"]
+    assert unsettled.avg_brier is None
+    assert unsettled.capped_avg_markout_bps is None
+
+    flat = rows["agent-flat"]
+    assert flat.avg_brier == 0.0
+    assert flat.capped_avg_markout_bps == 0
+    assert flat.avg_brier is not None  # a real zero is NOT an absent value
+    assert flat.capped_avg_markout_bps is not None
+
+    # ...and a control row is present, so a consumer's control flag has something to bind to.
+    assert any(row.is_control for row in season.rows)
+    assert any(not row.is_control for row in season.rows)
+
+
+@pytest.mark.skipif(
+    _TrialResponse is None,
+    reason=(
+        "TrialResponse lands with the payments lane (H4.3) merge; it is absent at this branch base. "
+        "contracts/fixtures/signal_trials_trial.json is committed and this assertion activates "
+        "automatically once veridex/api/signal_trials_schemas.py carries the H4.3 models."
+    ),
+)
+def test_signal_trials_trial_fixture_validates_against_trial_response() -> None:
+    """The trial fixture is the TrialWire contract seam: seven fields, outcome nullable."""
+    data = json.loads((_FIXTURES / "signal_trials_trial.json").read_text())
+    trial = _TrialResponse.model_validate(data)
+
+    # SEVEN fields and no participants list — `ParticipantSettlement` does not exist at the frozen
+    # head, and the design handoff's three mentions of it are a design note, not a field.
+    assert set(_TrialResponse.model_fields) == {
+        "trial_id", "trial_mode", "t0_ms", "commit_deadline_ms",
+        "evidence", "evidence_hash", "outcome",
+    }
+    assert trial.outcome is not None
+    assert trial.outcome.status == "settled"
+    # `entry` is the one NON-nullable outcome field; the rest are populated only once settled.
+    assert trial.outcome.entry is not None
+    assert trial.outcome.observation_lag_ms is not None
+
+    # A null outcome is a WEAKER statement than a recorded `pending` and must validate as None.
+    absent = _TrialResponse.model_validate({**data, "outcome": None})
+    assert absent.outcome is None

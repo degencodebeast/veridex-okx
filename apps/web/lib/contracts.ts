@@ -483,3 +483,136 @@ export interface InspectorRecord {
   clv_explanation: ClvExplanation;
   untrusted_llm: UntrustedLlmMetadata | null;
 }
+
+// ---- SIGNAL TRIALS view models (H5.1) ----
+// Mapped from the frozen `lib/wire.ts` Signal Trials family by `lib/signal-trials-api.ts`. These
+// are camelCase per the frozen plan (L1030), which names `seasonStatus`/`avgBrier` directly.
+//
+// NULLABILITY IS CARRIED THROUGH, NOT SMOOTHED AWAY. Every `| null` below mirrors a wire field
+// that is REQUIRED with no default, and the adapter preserves it verbatim: a zero markout is a
+// real FLAT outcome and a zero Brier is a PERFECT score, so a `0` standing in for `null` would
+// publish a fabricated result on a public leaderboard.
+
+// The FULL four-value runtime union. `season_status` on the typed season model admits only three;
+// `not_built` reaches the frontend solely via /signal-trials/health. Both `not_built` and
+// `no_season` answer 404 on /season, so health is the only place they differ — and C54 makes
+// `not_built` reachable in production for every failed/refused/aborted probe. Keeping all four
+// here is what keeps `tsc --noEmit` honest about the states a screen must actually handle.
+export type SeasonViewState = 'not_built' | 'no_season' | 'qualified' | 'exploratory';
+
+export type TrialStatus = 'pending' | 'settled' | 'UNSCORED';
+export type TrialAction = 'FOLLOW' | 'FADE' | 'ABSTAIN';
+export type SignalTrialsCheckStatus = 'pass' | 'fail' | 'pending';
+
+export interface SignalTrialsRow {
+  agentId: string;
+  qualified: boolean;
+  avgBrier: number | null;
+  cappedAvgMarkoutBps: number | null;
+  activeDecisions: number;
+  activeCoverage: number;
+  unscored: number;
+  isControl: boolean;
+}
+
+// The composed season view. On a season-404 the document fields are null rather than zero-filled:
+// `sampleSize: 0` would assert "we sampled zero signals", which is a different — and false —
+// claim from "no season document exists".
+export interface SignalTrialsSeason {
+  seasonStatus: SeasonViewState;
+  seasonId: string | null;
+  combo: Record<string, unknown> | null;
+  sampleSize: number | null;
+  rows: SignalTrialsRow[];
+}
+
+export interface SignalTrialsHealth {
+  ok: boolean;
+  seasonState: SeasonViewState;
+}
+
+export interface OpenTrial {
+  trialId: string;
+  trialMode: 'live';
+  t0Ms: number;
+  commitDeadlineMs: number;
+  evidence: Record<string, unknown>;
+  evidenceHash: string;
+}
+
+export interface TrialOutcome {
+  trialId: string;
+  status: TrialStatus;
+  entry: number;
+  future: number | null;
+  closeTsMs: number | null;
+  observationLagMs: number | null;
+  followMarkoutBps: number | null;
+  fadeMarkoutBps: number | null;
+  followProfitable: boolean | null;
+}
+
+// One trial's decision-time evidence plus its outcome. There is deliberately NO participants
+// array: `TrialResponse` has seven fields, no participants list, and no route enumerates a
+// trial's receipts at the frozen head.
+export interface TrialCard {
+  trialId: string;
+  trialMode: 'live';
+  t0Ms: number;
+  commitDeadlineMs: number;
+  evidence: Record<string, unknown>;
+  evidenceHash: string;
+  // `null` means nothing was computed at all — weaker than a recorded `pending`.
+  outcome: TrialOutcome | null;
+}
+
+export interface CommitReceipt {
+  receiptId: string;
+  trialId: string;
+  payer: string;
+  pFollowProfitable: number;
+  methodologyVersion: string | null;
+  action: TrialAction;
+  status: TrialStatus;
+  brier: number | null;
+  chosenMarkoutBps: number | null;
+  committedAtMs: number;
+  commitDeadlineMs: number | null;
+  trialMode: string | null;
+  bodyHash: string;
+  paymentTxHash: string;
+}
+
+export interface AgentRecord {
+  payer: string;
+  commits: number;
+  settled: number;
+  pending: number;
+  unscored: number;
+  avgBrier: number | null;
+  cappedAvgMarkoutBps: number | null;
+  qualified: boolean;
+}
+
+export interface VerifyCheck {
+  key: string;
+  phase: 'commit' | 'outcome';
+  // `null` means the backend did NOT serve this key. It is not a verdict. Rendering the real
+  // verdict `pending` in its place would fabricate a statement the verifier never made — the
+  // same class of error as rendering 0 for a null markout.
+  status: SignalTrialsCheckStatus | null;
+}
+
+// The verify view. These are REPRODUCIBILITY CHECKS OVER RECORDED EVIDENCE: they re-derive a
+// receipt's commit-time and settlement-time claims from the stored artifacts. They are not, and
+// must not be presented as, proof against a malicious storage operator.
+export interface VerifyChecks {
+  receiptId: string;
+  checks: VerifyCheck[];      // the frozen eight, always length 8, always in the frozen order
+  unexpectedKeys: string[];   // served keys outside the frozen eight — surfaced, never swallowed
+  receipt: CommitReceipt | null;
+  // Read ALONGSIDE the checks: a `pending` check does NOT distinguish "not settled yet" from
+  // "settled UNSCORED and never will be". That distinction lives here. `null` when the receipt's
+  // bytes were unreadable, which still answers 200 with eight verdicts.
+  receiptStatus: TrialStatus | null;
+}
