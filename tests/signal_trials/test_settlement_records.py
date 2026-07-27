@@ -3407,6 +3407,75 @@ async def test_a_finalized_commitment_on_ANOTHER_trial_is_never_served(store: _T
     assert [row["receipt_id"] for row in other_response.json()] == [theirs.receipt_id]
 
 
+class _CanonicalizingRepo:
+    """A repository that RESOLVES an id rather than requiring the caller's exact spelling.
+
+    Not an exotic double. It is what :class:`~veridex.signal_trials.live.LiveTrialRepository` already
+    does on a case-insensitive filesystem, which is macOS APFS by default and every Windows volume:
+    ``get("TRIAL_H43")`` opens ``trials/trial_h43.json`` and returns a trial whose ``trial_id`` is the
+    document's ``trial_h43``. MEASURED against the real repository on this host — the request pair
+    ``/trials/TRIAL_H43`` and ``/trials/TRIAL_H43/receipts`` answered ``200`` with the resolved trial
+    and ``200 []`` respectively, while the same pair under ``trial_h43`` served the participant.
+
+    The double is used instead of that filesystem so the property is pinned identically on every
+    platform: a test that depended on the host's case-folding would pass on Linux CI and fail on a
+    developer's macOS, or the reverse, which is worse than no test.
+    """
+
+    def __init__(self, trial: LiveTrial) -> None:
+        self._trial = trial
+
+    def current(self) -> LiveTrial | None:
+        return self._trial
+
+    def get(self, trial_id: str) -> LiveTrial | None:
+        return self._trial if trial_id.lower() == self._trial.trial_id.lower() else None
+
+
+async def test_a_RESOLVED_trial_id_serves_its_participants_and_never_an_empty_set(
+    store: _TamperableStore,
+) -> None:
+    """The join must filter by the id the repository RESOLVED, never by the caller's raw spelling.
+
+    Reading the raw path segment answers ``200 []`` here — the one answer AC2 and AC7 exist to
+    forbid, because an empty array is the positive claim that nobody committed to this trial, and a
+    trial with a paid participant makes that claim false. It arrives with no corruption and no
+    tampering: one request for a case-variant of a real id, on a filesystem that resolves it.
+
+    The two spellings in one test are the DISCRIMINATION CONTROL. Filtering by ``trial.trial_id``
+    passes both; filtering by the raw segment passes the exact spelling and returns ``[]`` for the
+    variant, so the pair separates a resolved read from an unresolved one where either alone cannot.
+
+    The sibling ``/trials/{id}`` assertion is what makes this a CONSISTENCY claim rather than a
+    preference. That route already reads ``trial.trial_id`` for its outcome, so before the fix the two
+    routes disagreed about the same URL: one served the trial and its settled outcome, the other said
+    nobody had committed to it. A frontend joining them would have rendered a settled trial with an
+    empty participant list and had nothing on the wire to tell it that was a defect.
+    """
+    trial = _trial()
+    committed = _commit(store, trial, staging_id="s_resolved", p=0.8)
+    store.record_outcome(TRIAL_ID, _settled_outcome_from(_series()))
+    variant = TRIAL_ID.upper()
+    assert variant != TRIAL_ID, "the fixture no longer varies the spelling"
+
+    async with _client(_app(store=store, live_trials=_CanonicalizingRepo(trial))) as client:
+        exact = await client.get(_receipts_path(TRIAL_ID))
+        resolved = await client.get(_receipts_path(variant))
+        sibling = await client.get(f"/signal-trials/trials/{variant}")
+
+    assert exact.status_code == 200
+    assert [row["receipt_id"] for row in exact.json()] == [committed.receipt_id]
+    assert resolved.status_code == 200
+    assert resolved.json() != [], "a case-variant of a known trial id claimed that nobody committed"
+    assert [row["receipt_id"] for row in resolved.json()] == [committed.receipt_id]
+    # Both routes resolved the SAME variant spelling to the same trial, so a consumer cannot receive a
+    # settled outcome from one and an empty participant set from the other.
+    assert sibling.status_code == 200
+    assert sibling.json()["trial_id"] == TRIAL_ID
+    assert sibling.json()["outcome"]["status"] == "settled"
+    assert [row["trial_id"] for row in resolved.json()] == [TRIAL_ID]
+
+
 @pytest.mark.parametrize(
     ("recorded", "status", "brier", "markout"),
     [

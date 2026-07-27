@@ -358,6 +358,15 @@ def register_signal_trials_routes(
         participant. This route has no verdict to publish about the damage; that is the verify
         route's job. The honest answer is that the set cannot be served.
 
+        **The join filters on the RESOLVED ``trial.trial_id``, never on the raw path segment**, which
+        is the same read the trial route above uses for its outcome. Resolution is permitted to
+        canonicalize: ``LiveTrialRepository.get`` returns a trial whose id comes from the stored
+        DOCUMENT, and on a case-insensitive filesystem — macOS APFS by default, every Windows volume —
+        a case-variant URL resolves to it. Filtering on the caller's spelling there matched no record
+        and answered ``200 []``, which is the one answer this route must never invent: an empty array
+        claims nobody committed, and it was making that claim about a trial with a paid participant
+        while the trial route beside it served that same trial's settled outcome.
+
         The id is never echoed into the refusal: it arrives from a URL path segment, so echoing it
         would reflect caller-controlled text back into logs and responses.
         """
@@ -370,7 +379,7 @@ def register_signal_trials_routes(
             return _error(503, "participant_store_unavailable")
         return [
             _render_commit_receipt(record, commit_store)
-            for record in finalized_commits_for_trial(commit_store, trial_id)
+            for record in finalized_commits_for_trial(commit_store, trial.trial_id)
         ]
 
     @app.get(f"{SIGNAL_TRIALS_PREFIX}/agents/{{payer_id}}", response_model=None)
