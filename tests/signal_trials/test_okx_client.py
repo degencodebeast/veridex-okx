@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import math
+import subprocess
 import sys
 import time
 from importlib import util as importlib_util
@@ -1534,7 +1535,11 @@ async def test_the_rendered_summary_publishes_NO_evidence_VALUE_without_exceptio
     # The KEY SET is pinned exactly, so a future field cannot appear in the rendering without
     # failing here first — including one that would re-introduce an evidence value.
     assert set(rendered) == {
-        "source", "evidence_hash", "evidence_fields", "handoff_status", "dry_run", "published"
+        "source", "evidence_hash", "evidence_fields", "handoff_status", "dry_run", "published",
+        # Added deliberately, and this pin is what forced the decision into the open: a nonzero
+        # child status does NOT mean nothing was written, so the rendering carries a third state.
+        # It is a bool and cannot collide with an evidence value, so it needs no `_scan` exclusion.
+        "publication_indeterminate",
     }
     assert rendered["evidence_hash"] == summary.evidence_hash
     assert "trigger_price" in rendered["evidence_fields"], "the field NAMES are the useful part"
@@ -1858,6 +1863,216 @@ def _capture_main_stderr(module, argv, ctx_factory) -> "_MainResult":
     with contextlib.redirect_stderr(buffer):
         status = module.main(argv, connect_factory=lambda _url: ctx_factory())
     return _MainResult(status, buffer.getvalue())
+
+
+def test_a_handoff_that_STARTS_and_then_RAISES_warns_that_a_trial_may_exist():
+    """CODEX MAJOR-1, half one: the boundary must contain the CALL, not follow it.
+
+    The post-handoff boundary used to begin on the line AFTER `run_handoff(...)`, so an exception
+    raised BY the handoff — a broken pipe while writing the child's stdin, which happens after the
+    child is already spawned — escaped as an ordinary pre-handoff refusal. The comment naming the
+    hazard sat one line below the statement that creates it.
+
+    The handoff here RECORDS THAT IT STARTED before raising, which is what makes this a genuine
+    reproduction rather than a plain failure: the child had begun, so a trial may exist.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    started = []
+
+    def _starts_then_raises(_argv, _stdin):
+        started.append(_argv)
+        raise BrokenPipeError("stdin write failed after child start")
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = _starts_then_raises
+    try:
+        result = _capture_main_stderr(module, argv, _Ctx)
+    finally:
+        module._subprocess_handoff = original
+
+    assert started, "the reproduction is only valid if the handoff actually began"
+    assert result.status == 1
+    assert result.err.startswith("refused AFTER handoff:"), f"got {result.err!r}"
+    assert "MAY ALREADY EXIST" in result.err
+    assert "check the data dir" in result.err
+
+
+def test_a_DRY_RUN_handoff_that_raises_is_NOT_reported_as_maybe_published():
+    """DISCRIMINATION for the test above: the dry-run exemption is real, not a hole.
+
+    `--dry-run` invokes the child with `--dry-run`, which writes nothing, so a failure there
+    genuinely leaves nothing behind and the ordinary refusal is the correct advice. Without this,
+    widening the boundary could have been done by warning on EVERY failure — which would make the
+    warning meaningless rather than informative.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x", "--dry-run"]
+
+    def _raises(_argv, _stdin):
+        raise BrokenPipeError("stdin write failed after child start")
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = _raises
+    try:
+        result = _capture_main_stderr(module, argv, _Ctx)
+    finally:
+        module._subprocess_handoff = original
+
+    assert result.status == 1
+    assert result.err.startswith("refused: "), f"got {result.err!r}"
+    assert "MAY ALREADY EXIST" not in result.err, "a dry run published nothing; do not warn"
+
+
+def test_a_NONZERO_child_status_is_reported_as_INDETERMINATE_not_as_not_published():
+    """CODEX MAJOR-1, half two — the half no exception handler could ever have covered.
+
+    A nonzero return never raises, so no `try` protects it. And the inference behind treating it as
+    "not published" is invalid for the actual child: `open_live_trial.py` publishes DURABLY and only
+    THEN prints its summary, so a terminal-output failure leaves a real trial on disk while the
+    child exits nonzero.
+
+    Reported as `published: false`, that tells an operator to open a REST-sourced fallback for a
+    signal that already has a WS-sourced trial — one signal, two live trials, contradictory source
+    labels. `published` guarded the false POSITIVE; this is the false NEGATIVE, and the false
+    negative is the one that produces the second trial.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = lambda _argv, _stdin: 120  # published, then failed to print
+    try:
+        result = _capture_main_stderr(module, argv, _Ctx)
+    finally:
+        module._subprocess_handoff = original
+
+    assert result.status == 1
+    assert "MAY ALREADY EXIST" in result.err, "a nonzero child may still have published"
+    assert "check the data dir" in result.err
+    assert "AFTER starting" in result.err
+
+    # THREE STATES, not two, and each asserted so none can collapse into another.
+    Summary = module.ExhibitionSummary
+
+    def _s(status, dry):
+        return Summary(evidence_hash="h", evidence_fields=("a",), handoff_status=status, dry_run=dry)
+
+    assert (_s(0, False).published, _s(0, False).publication_indeterminate) == (True, False)
+    assert (_s(120, False).published, _s(120, False).publication_indeterminate) == (False, True)
+    assert (_s(0, True).published, _s(0, True).publication_indeterminate) == (False, False)
+    assert (_s(120, True).published, _s(120, True).publication_indeterminate) == (False, False)
+    assert _s(120, False).render()["publication_indeterminate"] is True
+
+
+def test_the_REAL_child_publishes_BEFORE_it_prints_which_is_why_nonzero_is_indeterminate(tmp_path):
+    """The premise of the finding, verified against the REAL `open_live_trial.py`. OFFLINE.
+
+    This is the fact the whole third state rests on, so it is measured rather than assumed: the
+    child writes the trial to disk and only afterwards prints. A local subprocess is spawned — no
+    socket, no network, no credential — and its stdout is closed so the print fails after the write
+    has already landed.
+
+    If a future edit made the child print BEFORE publishing, `publication_indeterminate` would
+    become needless pessimism and this test is where that would be noticed.
+    """
+    module = _ws_exhibition_module()
+    data_dir = tmp_path / "data"
+    argv = module.build_handoff_argv(data_dir=str(data_dir), dry_run=False)
+
+    payload = json.dumps(H22_WS, separators=(",", ":"), sort_keys=True)
+    proc = subprocess.run(
+        [sys.executable, *argv],
+        input=payload,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    # The control: this child really did publish, whatever it returned.
+    written = sorted(p.name for p in (data_dir / "live").rglob("*") if p.is_file())
+    assert written, f"the child published nothing; rc={proc.returncode} err={proc.stderr!r}"
+    assert proc.returncode == 0, "baseline: with a working stdout the child succeeds"
+
+    # ...and the ordering is the point: the publish call precedes the print in the child's source,
+    # which is what makes a nonzero status compatible with a trial existing.
+    child = (Path(module.OPEN_LIVE_TRIAL_SCRIPT)).read_text()
+    publish_at = child.index(".publish(trial)")
+    print_at = child.index("print(json.dumps(summary")
+    assert publish_at < print_at, "the child now prints before publishing; revisit the third state"
+
+
+def test_a_TIMEOUT_refusal_tells_the_operator_what_to_do(monkeypatch):
+    """CODEX MINOR-1. `str(TimeoutError())` is the EMPTY STRING.
+
+    So the generic formatter rendered `refused: TimeoutError: ` with nothing after the colon — a
+    refusal naming only that something did not happen. The detail is added where the bound is
+    known, and the message names the fallback the truth rule requires.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+
+    # THE CONNECTION RAISES TimeoutError IMMEDIATELY rather than going quiet, and that is a
+    # deliberate change from a never-answering fake. `main` is synchronous, so it carries no
+    # outer safety net — and under a mutant that removes the transport's bound, a never-answering
+    # fake makes this test HANG rather than fail. That cost three orphaned drill runs before I
+    # diagnosed it, which is the same lesson the two elapsed-time tests already encode.
+    #
+    # Nothing is lost: this test is about the MESSAGE, not the bound. The bound is bound by
+    # `test_the_real_transport_BOUNDS_recv_and_does_not_wait_forever`, which asserts on elapsed
+    # time. Here the transport's `except TimeoutError` is entered the same way either route
+    # reaches it, so the detail it adds is measured without waiting for anything.
+    class _TimesOutAtOnce:
+        async def send(self, message):
+            pass
+
+        async def recv(self):
+            raise TimeoutError
+
+        async def close(self):
+            pass
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _TimesOutAtOnce()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(module, "RECV_TIMEOUT_S", 0.05)
+    result = _capture_main_stderr(module, argv, _Ctx)
+
+    assert result.status == 1
+    assert result.err.startswith("refused: TimeoutError:")
+    assert result.err.rstrip() != "refused: TimeoutError:", "the detail is empty — the whole finding"
+    assert "0.05s" in result.err, "the message must name the bound that expired"
+    assert WS_CHANNEL_ON_THE_WIRE in result.err
+    assert "rest" in result.err.lower(), "it must name the fallback the truth rule requires"
+    # A timeout is PRE-handoff — nothing was spawned — so it must NOT carry the maybe-published
+    # warning. Otherwise the warning appears on refusals where it is simply false.
+    assert "MAY ALREADY EXIST" not in result.err
 
 
 def test_main_PRINTS_A_DIFFERENT_SENTENCE_after_the_handoff_than_before_it():

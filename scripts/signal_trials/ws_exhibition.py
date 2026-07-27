@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, Protocol
 
 from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, normalize_signal
-from veridex.signal_trials.okx_client import WSTransport, subscribe_one_signal
+from veridex.signal_trials.okx_client import WS_SIGNAL_CHANNEL, WSTransport, subscribe_one_signal
 
 #: The transport tag for everything this script produces. A constant, never an argument: see the
 #: module docstring. A mutation of this value is killed by
@@ -61,6 +61,14 @@ WS_SOURCE: Final[Literal["ws"]] = "ws"
 #: The payments-lane script this one composes with. Resolved as a path and never imported, so this
 #: script holds no code-level coupling to a module another lane owns.
 OPEN_LIVE_TRIAL_SCRIPT = Path(__file__).resolve().parent / "open_live_trial.py"
+
+#: The one sentence an operator must see whenever a trial MIGHT exist. Shared by both routes that
+#: can reach that state — an exception raised after the handoff began, and a nonzero child status —
+#: because they are the same situation and a reader who learns the phrase from one must recognise
+#: it from the other. Two spellings of one warning is how the two paths drift apart.
+INDETERMINATE_WARNING = (
+    "a live trial MAY ALREADY EXIST for this signal; check the data dir before opening a REST-sourced one"
+)
 
 #: Receive bound, in seconds. `WSTransport` states that a real implementation MUST set one, because
 #: `_ws_converse` loops with no frame budget. Generous rather than tight: a signal push is a market
@@ -127,13 +135,32 @@ class ExhibitionSummary:
 
     @property
     def published(self) -> bool:
-        """Whether a live trial actually exists now.
+        """Whether a live trial DEFINITELY exists now.
 
-        False on a non-zero handoff status, and false for a dry run. A summary that claimed a
-        publication the open-trial script refused would be the demo asserting a live trial exists
-        when none does.
+        True only for a non-dry-run handoff that returned 0. A summary claiming a publication the
+        open-trial script refused would be the demo asserting a live trial exists when none does.
         """
         return self.handoff_status == 0 and not self.dry_run
+
+    @property
+    def publication_indeterminate(self) -> bool:
+        """Whether a trial MIGHT exist despite the handoff failing — the false-NEGATIVE case.
+
+        ``published`` guards one direction: never claim a publication that did not happen. That
+        left the inverse unguarded, and the inverse is the one that produces a second trial.
+
+        **A nonzero child status does not mean nothing was written.** ``open_live_trial.py``
+        publishes durably FIRST and prints its summary AFTERWARDS, so a terminal-output failure —
+        a closed pipe, a full disk — leaves a real trial on disk while the child exits nonzero.
+        Reported as ``published: false``, that tells an operator to open a REST-sourced fallback
+        for a signal that already has a WS-sourced trial: one signal, two live trials, contradictory
+        source labels. Exactly what the truth rule exists to prevent.
+
+        So the honest report has THREE states, not two: definitely published, definitely not
+        (nothing was ever spawned, or it was a dry run), and INDETERMINATE — the child began and
+        did not cleanly succeed, and only the data directory can settle it.
+        """
+        return self.handoff_status != 0 and not self.dry_run
 
     def render(self) -> dict[str, Any]:
         """The JSON-safe view printed to stdout.
@@ -165,6 +192,7 @@ class ExhibitionSummary:
             "handoff_status": self.handoff_status,
             "dry_run": self.dry_run,
             "published": self.published,
+            "publication_indeterminate": self.publication_indeterminate,
         }
 
 
@@ -218,12 +246,20 @@ async def exhibit_one_signal(
     raw = await subscribe_one_signal(ws_transport, chain_index)
     signal: CanonicalSignal = normalize_signal(raw, WS_SOURCE)
 
+    # Both prepared BEFORE the boundary, so that a failure to BUILD the call is still an ordinary
+    # pre-handoff refusal — nothing has been spawned yet at that point.
     argv = build_handoff_argv(data_dir=data_dir, dry_run=dry_run)
-    status = run_handoff(argv, json.dumps(raw, separators=(",", ":"), sort_keys=True))
+    payload = json.dumps(raw, separators=(",", ":"), sort_keys=True)
 
-    # EVERYTHING PAST THIS LINE RUNS AFTER THE TRIAL MAY ALREADY EXIST, so a failure here means
-    # something very different to an operator than a failure before it — see `PostHandoffError`.
+    # THE BOUNDARY CONTAINS THE CALL, and that is the correction. It previously began on the line
+    # AFTER `run_handoff(...)`, so an exception raised BY the handoff itself — a broken pipe while
+    # writing the child's stdin, say — escaped as an ordinary pre-handoff refusal. The comment
+    # naming the hazard sat one line below the statement that creates it.
+    #
+    # `dry_run` is the only exemption, and it is a real one: the child is invoked with
+    # `--dry-run`, writes nothing, so a failure there genuinely leaves nothing behind.
     try:
+        status = run_handoff(argv, payload)
         return ExhibitionSummary(
             evidence_hash=evidence_hash(signal),
             evidence_fields=tuple(sorted(signal.model_dump())),
@@ -231,6 +267,8 @@ async def exhibit_one_signal(
             dry_run=dry_run,
         )
     except Exception as error:
+        if dry_run:
+            raise
         raise PostHandoffError(error) from error
 
 
@@ -302,7 +340,18 @@ class _WebsocketsTransport:
         await self._connection.send(message)
 
     async def recv(self) -> str:
-        frame = await asyncio.wait_for(self._connection.recv(), timeout=self._recv_timeout)
+        try:
+            frame = await asyncio.wait_for(self._connection.recv(), timeout=self._recv_timeout)
+        except TimeoutError as error:
+            # `str(TimeoutError())` is the EMPTY STRING, so `main`'s formatter rendered the bare
+            # `refused: TimeoutError: ` with nothing after the colon — a refusal that tells an
+            # operator only that something did not happen. The detail is added HERE, at the one
+            # place that knows the bound and what waiting on it meant.
+            raise TimeoutError(
+                f"no WS frame arrived within {self._recv_timeout:g}s on the "
+                f"{WS_SIGNAL_CHANNEL!r} channel; the socket is open but the peer is pushing "
+                "nothing. Fall back to a REST-sourced trial and label it rest."
+            ) from error
         return frame.decode("utf-8") if isinstance(frame, bytes) else str(frame)
 
     async def close(self) -> None:
@@ -364,6 +413,16 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
         print(json.dumps(summary.render(), indent=2, sort_keys=True))
     except Exception as error:
         raise PostHandoffError(error) from error
+
+    # THE NONZERO-RETURN PATH, which had no protection at all. It never raises, so no exception
+    # handler could ever have covered it — the child simply reports failure, and the child publishes
+    # BEFORE it prints. The operator gets the same sentence here as on the raising path, because it
+    # is the same situation.
+    if summary.publication_indeterminate:
+        print(
+            f"handoff returned {summary.handoff_status} AFTER starting -- {INDETERMINATE_WARNING}",
+            file=sys.stderr,
+        )
     return exit_status(summary)
 
 
@@ -402,8 +461,7 @@ def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | Non
         # invites the documented REST fallback; after the handoff has fired that fallback would
         # open a SECOND trial for one signal. This line tells them to check before acting.
         print(
-            f"refused AFTER handoff: {error} -- a live trial MAY ALREADY EXIST for this signal; "
-            "check the data dir before opening a REST-sourced one",
+            f"refused AFTER handoff: {error} -- {INDETERMINATE_WARNING}",
             file=sys.stderr,
         )
         return 1
