@@ -18,7 +18,9 @@ Two trust-relevant properties this module is responsible for:
    off-contract candle row raises (``OKXAPIError`` / ``OKXResponseError``) instead of degrading
    into an empty page or series. §7 permits an empty settlement result only for genuine absence,
    so a swallowed API failure would masquerade as a lawful ``UNSCORED`` — a false provenance
-   claim rather than a diagnostic.
+   claim rather than a diagnostic. A candle number that parses to ``+inf``, ``-inf`` or ``NaN``
+   is off-contract in exactly this sense and is refused here rather than downstream — see
+   ``_finite_candle_number``.
 
 Normalization of the raw signal dicts is task H2.2 and deliberately does NOT happen here —
 ``SignalPage.signals`` carries the wire dicts untouched.
@@ -30,6 +32,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -164,6 +167,58 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _finite_candle_number(raw: Any, wire_column: str, field: str) -> float:
+    """Parse one numeric candle column, refusing a value that is not a finite number.
+
+    ``float("1e400")`` is **not** a parse error — it is ``inf``, an ordinary-looking decimal that
+    overflows silently — and ``float("nan")`` is ``NaN``. Either would enter ``Candle`` as a price
+    and be indistinguishable downstream from a measurement. Measured, not supposed: a series whose
+    ``p0`` close parsed as ``+inf`` made ``contestants.compute_ext`` return ``1`` — a confident
+    "already extended" verdict manufactured from a value that should never have been parsed.
+
+    So this fails **loudly**, exactly as the envelope and row-shape guards above do. Rejecting at
+    the parse boundary fixes the root cause once for every consumer instead of asking each one to
+    guard a value it should never have received (PKT-DEC-C28 ruling 1). ``+inf``, ``-inf`` and
+    ``NaN`` are all off-contract for a candle number; ``NaN`` in particular fails every comparison
+    it takes part in, so only an explicit ``math.isfinite`` covers all three.
+
+    Deliberately **not** a positivity check. §5.3's ``p0, p1 > 0`` is Law's rule, and inventing a
+    stricter one at this boundary would change a settlement answer without authority — the hazard
+    C28 names. A negative finite value passes this guard unchanged.
+
+    Args:
+        raw: The wire value for one numeric column, as OKX serialized it.
+        wire_column: The documented upstream column name, for the diagnostic.
+        field: The ``Candle`` field this column lands in, for the diagnostic.
+
+    Returns:
+        The parsed value, guaranteed finite.
+
+    Raises:
+        OKXResponseError: ``raw`` parsed successfully but to ``+inf``, ``-inf`` or ``NaN``. This is
+            the only exception this function itself raises.
+        ValueError: ``float()`` could not parse ``raw`` at all — ``"abc"``, ``""``. Propagates from
+            ``float()`` unconverted, exactly as it did before this guard existed. Listed because a
+            ``Raises`` section that names only the new failure reads as though it were the only one.
+            Note ``OKXResponseError`` is itself a ``ValueError`` subclass, so a caller catching
+            ``ValueError`` catches both — and a test that wants to tell them apart must assert the
+            EXACT type rather than use ``isinstance``.
+        TypeError: ``raw`` was not a type ``float()`` accepts — ``None``. Same provenance.
+
+    The ``ValueError``/``TypeError`` paths PREDATE this guard and are deliberately left alone.
+    Converting them to ``OKXResponseError`` would be tidier and is out of scope: PKT-DEC-C28
+    authorizes rejecting NON-FINITE values here, which is a different change from rejecting
+    UNPARSEABLE ones. Documented rather than silently widened.
+    """
+    parsed = float(raw)
+    if not math.isfinite(parsed):
+        raise OKXResponseError(
+            f"candle column {wire_column!r} (Candle.{field}) must be a finite number, "
+            f"got {raw!r} which parsed as {parsed}"
+        )
+    return parsed
+
+
 def _rows(payload: dict[str, Any]) -> list[Any]:
     """Return the envelope's ``data`` list, failing closed on anything that is not a success.
 
@@ -253,7 +308,8 @@ class OKXMarketClient:
         Raises ``ValueError`` for a bar this client has no width for; guessing one would silently
         skew every ``close_ts`` derived from the series. Raises ``OKXAPIError`` /
         ``OKXResponseError`` rather than returning a partial or empty series for an error
-        envelope or a row that is not the frozen wire record.
+        envelope, a row that is not the frozen wire record, or a numeric column that parses to a
+        non-finite value (``_finite_candle_number``).
         """
         if bar not in BAR_MS:
             raise ValueError(f"unsupported bar {bar!r}; supported bars: {sorted(BAR_MS)}")
@@ -286,15 +342,19 @@ class OKXMarketClient:
                     f"[ts,o,h,l,c,vol,volUsd,confirm], got {len(row)}"
                 )
             ts, open_, high, low, close, vol, vol_usd, confirm = row
+            # Every `float()` column goes through the finiteness guard. `ts` does not: `int()`
+            # cannot produce a non-finite value (`int("1e400")` raises), and `confirm` is compared
+            # as a string. `Candle`'s public shape is untouched — this changes what may be PUT in
+            # the fields, never the fields themselves (C17-R2).
             candles.append(
                 Candle(
                     ts_open_ms=int(ts),  # OKX `ts` is the candle OPEN time (§7).
-                    open=float(open_),
-                    high=float(high),
-                    low=float(low),
-                    close=float(close),
-                    vol=float(vol),
-                    vol_usd=float(vol_usd),
+                    open=_finite_candle_number(open_, "o", "open"),
+                    high=_finite_candle_number(high, "h", "high"),
+                    low=_finite_candle_number(low, "l", "low"),
+                    close=_finite_candle_number(close, "c", "close"),
+                    vol=_finite_candle_number(vol, "vol", "vol"),
+                    vol_usd=_finite_candle_number(vol_usd, "volUsd", "vol_usd"),
                     confirmed=str(confirm) == "1",
                 )
             )
