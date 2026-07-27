@@ -21,8 +21,12 @@ and both are recorded here rather than left to be discovered:
 * the file carries ``# ruff: noqa: E701, SIM300``. Both codes are triggered ONLY by the plan's own
   text — ``E701`` by the single-line ``with pytest.raises(...): ...`` in ``test_clv_field_guard``
   and ``SIM300`` by ``assert FROZEN_ROSTER <= ids`` — and a per-line ``# noqa`` would have edited
-  the mandated lines themselves. The suppression is file-wide because ruff has no region scope;
-  neither code occurs anywhere in Region B.
+  the mandated lines themselves. The suppression is file-wide because ruff has no region scope.
+  **As measured when this note was written, neither code occurs in Region B — but that is a
+  MEASUREMENT AT A HEAD, NOT A STANDING PROPERTY**, and the directive applies file-wide either way.
+  This is the same claim shape that was once falsified by the very commit that wrote it, in the
+  mypy note below; it is qualified here too because THE DOCSTRING IS WHAT A READER MEETS FIRST and
+  an unqualified claim here would undo the caveat that appears eighty lines lower down.
 
 **Region B** is this implementer's additional pins, labelled as pins rather than as RED — they were
 green the moment they were written (C46) and they exist to close the gaps Region A leaves open. The
@@ -867,9 +871,13 @@ def test_rank_order_is_exactly_the_designed_order(full_pack_qualified):
     terms and this fixture happens to emit the same order, so the assertion below would keep passing
     over a violated rule. The rule is carried by
     ``test_the_frozen_four_term_ordering_holds_within_the_qualified_set``, which RECOMPUTES the
-    frozen key over both fixtures. What this test pins is narrower and still worth having: that the
-    fixture's designed order is the one it actually produces, so the other tests built on that
-    design are reasoning about the season they think they are.
+    frozen key over every fixture in this module that emits ranked rows — DESCRIBED RATHER THAN
+    COUNTED, because an embedded count is one more number that drifts the moment a fixture is
+    added, exactly as the line numbers in the suppression note did.
+
+    What this test pins is narrower and still worth having: that the fixture's designed order is
+    the one it actually produces, so the other tests built on that design are reasoning about the
+    season they think they are.
     """
     season = score_season(full_pack_qualified)
     ranked = [row.agent_id for row in season.rows if row.qualified]
