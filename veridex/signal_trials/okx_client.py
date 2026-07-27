@@ -136,6 +136,16 @@ class WSTransport(Protocol):
 
     ``recv`` yields ``str`` — a transport over a library that can deliver ``bytes`` decodes at its
     own edge, so the frame parsing below has exactly one input type to reason about.
+
+    **The recv TIMEOUT is the transport's responsibility, and it is not optional.**
+    ``_ws_converse`` loops on ``recv`` with no frame budget: it refuses an unrecognized event
+    precisely so it never sits on a socket that is telling it something, but it has no bound on
+    sitting on a socket that tells it NOTHING. A peer that sends only heartbeats is waited on
+    forever — measured: a fake transport returning ``"pong"`` indefinitely reached 50,000 frames
+    without the subscriber giving up. That asymmetry is deliberate rather than overlooked. This
+    protocol layer cannot know what a reasonable wait is, whereas the connection can, so a real
+    implementation of this Protocol MUST set a receive timeout; the in-memory fakes in the test
+    suite bound themselves by exhausting their script.
     """
 
     async def send(self, message: str) -> None: ...

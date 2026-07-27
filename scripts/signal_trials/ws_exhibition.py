@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, Protocol
 
 from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, normalize_signal
-from veridex.signal_trials.okx_client import OKXClientError, WSTransport, subscribe_one_signal
+from veridex.signal_trials.okx_client import WSTransport, subscribe_one_signal
 
 #: The transport tag for everything this script produces. A constant, never an argument: see the
 #: module docstring. A mutation of this value is killed by
@@ -78,7 +78,6 @@ class ExhibitionSummary:
     """
 
     evidence_hash: str
-    t0_ms: int
     evidence_fields: tuple[str, ...]
     handoff_status: int
     dry_run: bool
@@ -101,22 +100,43 @@ class ExhibitionSummary:
     def render(self) -> dict[str, Any]:
         """The JSON-safe view printed to stdout.
 
-        Market-data evidence VALUES are deliberately absent — only the field NAMES and the hash —
-        matching ``open_live_trial.py``'s own rendering. The payload is public through the free
-        read; a terminal transcript is not where it should be published, and the hash is what an
-        operator compares against a receipt.
+        **Evidence VALUES are absent, with NO exception** — only the field NAMES and the hash. The
+        payload is public through the free read; a terminal transcript is not where it should be
+        published, and the hash is what an operator compares against a receipt.
 
-        ``t0_ms`` is the one exception and is TRIAL METADATA rather than market data: it is when
-        the trial opens, ``open_live_trial.py`` prints it for the same reason, and an operator
-        cannot check a deadline without it. ``token_address`` used to be rendered here and is not
-        any more — it is market data, so printing it made the sentence above untrue. The line
-        between the two is what ``test_the_rendered_summary_carries_evidence_FIELD_NAMES_but_not_
-        evidence_VALUES`` pins.
+        The rule is exceptionless on purpose, and it did not start that way. Two fields were
+        printed here and both were wrong to print. ``token_address`` went first. ``t0_ms`` was then
+        RETAINED under a written exception claiming it was "trial metadata rather than market
+        data" — a claim that was false three ways, none of which had been measured:
+
+        * It is a HASHED EVIDENCE FIELD. ``visible_at_decision`` returns the whole
+          ``CanonicalSignal`` model dump, so ``t0_ms`` is inside ``evidence_hash``. This dict was
+          therefore listing ``"t0_ms"`` in ``evidence_fields`` — naming it as evidence — while
+          printing its value under a docstring saying evidence values are absent.
+        * It is NOT the trial-open instant. ``live.py`` is explicit that ``LiveTrial.t0_ms`` is
+          ``now_ms`` and *"not from ``sig.t0_ms``… the two are usually equal and are allowed to"*
+          differ; ``live.py`` has a guard that exists solely because they can. Two different
+          quantities under one name.
+        * It could not serve the deadline check it was justified by. Measured on one signal in one
+          invocation, the two renderings were ~31.7 billion ms apart, and this script prints no
+          deadline of its own.
+
+        So the honest fix is to print neither, rather than to relabel one. **An operator who needs
+        the deadline already has it:** the handoff does not capture the child's stdout, so
+        ``open_live_trial.py`` prints its own summary — carrying the authoritative ``t0_ms`` AND
+        ``commit_deadline_ms`` — into the same terminal, in the same run. Printing a second
+        ``t0_ms`` under the same key with a different value would not add information; it would
+        put a contradiction in front of the operator. The script that owns the deadline prints the
+        deadline, and this one does not guess at it.
+
+        Pinned by ``test_the_rendered_summary_publishes_NO_evidence_VALUE_without_exception``,
+        which walks EVERY field of the signal rather than a hand-kept list — the exceptionless rule
+        is what makes that general guard possible, and a hand-kept exception list is what produced
+        both defects above.
         """
         return {
             "source": self.source,
             "evidence_hash": self.evidence_hash,
-            "t0_ms": self.t0_ms,
             "evidence_fields": list(self.evidence_fields),
             "handoff_status": self.handoff_status,
             "dry_run": self.dry_run,
@@ -173,7 +193,6 @@ async def exhibit_one_signal(
     )
     return ExhibitionSummary(
         evidence_hash=evidence_hash(signal),
-        t0_ms=signal.t0_ms,
         evidence_fields=tuple(sorted(signal.model_dump())),
         handoff_status=status,
         dry_run=dry_run,
@@ -247,12 +266,31 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one exhibition. Refusals go to stderr and exit non-zero."""
+    """Run one exhibition. Refusals go to stderr and exit non-zero.
+
+    **The catch is deliberately broad, and the narrow version was measurably wrong.** This
+    previously caught ``(OSError, ValueError, OKXClientError)``, a tuple written by reasoning about
+    which exceptions a connection failure raises. Measured against the installed ``websockets``
+    15.0.1, ``InvalidURI``, ``InvalidHandshake`` and ``ConnectionClosed`` are subclasses of
+    ``WebSocketException`` and of NEITHER ``OSError`` nor ``ValueError`` — so not one of the
+    failures this script exists to survive was caught, and the documented refusal degraded to a
+    traceback. ``import websockets`` failing adds ``ModuleNotFoundError`` to the same list.
+
+    Re-enumerating a third-party hierarchy is the move that just failed, so this does not do it
+    again. ``Exception`` leaves ``KeyboardInterrupt`` and ``SystemExit`` alone (they are
+    ``BaseException``), so Ctrl-C still behaves, and the exception TYPE is printed alongside the
+    message so a genuine defect stays diagnosable rather than being flattened into a bare string.
+
+    This matters beyond tidiness: the scenario it fails on — live WS unreliable at demo time — is
+    the exact scenario the plan's truth rule is written for. An operator who gets a clean
+    ``refused:`` line falls back to a REST-sourced trial and says so; one who gets a traceback is
+    being invited to improvise.
+    """
     args = build_parser().parse_args(argv)
     try:
         return asyncio.run(_run(args))
-    except (OSError, ValueError, OKXClientError) as error:
-        print(f"refused: {error}", file=sys.stderr)
+    except Exception as error:
+        print(f"refused: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 
 

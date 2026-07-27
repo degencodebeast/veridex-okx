@@ -1101,12 +1101,37 @@ def test_the_reused_H22_twin_fixtures_really_are_a_TWIN_PAIR_and_not_the_same_di
     equality test downstream is known to be a real question before it is answered.
     """
     assert H22_REST != H22_WS, "the twins must differ, or the hash-equality test is tautological"
-    assert set(H22_REST) != set(H22_WS), "the twins must differ in KEY SPELLING, which is the thing normalized"
+
+    # THE LOAD-BEARING DIFFERENCE IS THE NESTED ONE, and it is asserted first because it is the
+    # only one that makes the hash-equality question non-trivial.
+    # `token.top10HolderPercent` / `top10HolderPercentage` is the alias `normalize_signal` must
+    # actually reconcile to produce equal hashes — `_pick` reads exactly this pair.
+    assert set(H22_REST["token"]) != set(H22_WS["token"]), (
+        "the twins must differ in the NESTED alias spelling; that is the one normalize_signal reads"
+    )
+
+    # The top-level key difference is `soldRatioPercent` / `soldRatioPercentage` — which
+    # `normalize_signal` documents as NEVER READ. It is asserted, but it is NOT what makes the
+    # hash-equality test a real question, and the previous message on this line claimed it was
+    # ("the thing normalized"). It is the opposite: the one field normalization ignores. Deleting
+    # the nested difference and leaving only this one left the twin guard AND the hash-equality
+    # test both passing with the load-bearing alias gone, so this assertion alone would have
+    # certified a fixture that binds nothing.
+    assert set(H22_REST) != set(H22_WS), "the twins also differ at top level, via the DROPPED sold-ratio alias"
+
     # ...and the difference must be confined to the alias spellings, not the observed values.
     shared = set(H22_REST) & set(H22_WS) - {"token"}
     assert shared, "the twins share no top-level fields; they cannot be describing one event"
     for key in shared:
         assert H22_REST[key] == H22_WS[key], f"twin fixtures disagree on the VALUE of {key!r}"
+
+    # The nested values must agree too, for the same reason the top-level ones must: the twins
+    # describe ONE event. `token` was excluded from the loop above (its key sets differ by design),
+    # so without this the nested payload was neither asserted equal nor asserted different.
+    shared_token = set(H22_REST["token"]) & set(H22_WS["token"])
+    assert shared_token, "the twins' token objects share no fields; they cannot be one event"
+    for key in shared_token:
+        assert H22_REST["token"][key] == H22_WS["token"][key], f"twins disagree on token.{key}"
 
 
 # --- subscribe_one_signal: the one-shot subscription protocol ------------------------------
@@ -1243,11 +1268,24 @@ async def test_subscribe_one_signal_refuses_an_UNRECOGNIZED_control_event():
     assert "subscribe" in okx_client._WS_SKIPPABLE_EVENTS
 
 
-async def test_subscribe_one_signal_skips_heartbeats_and_acks_but_not_indefinitely():
+async def test_subscribe_one_signal_skips_heartbeats_and_acks_until_the_FIRST_push():
     """`pong` and the subscribe ack are control traffic and are skipped; the FIRST push wins.
 
     The acceptance control for the refusal suite above: a method that refused every frame would
     pass all of those tests. This one proves the skip path can actually reach a signal.
+
+    RENAMED, AND THE OLD NAME WAS THE DEFECT. This was
+    `..._skips_heartbeats_and_acks_but_NOT_INDEFINITELY`, which asserted a bound nothing here
+    measures. `_ws_converse` is a `while True` with no frame budget; the run below terminates
+    because `RecordingWS.recv` raises when its four-frame SCRIPT runs out — a property of the
+    FAKE, not of the subject. Measured against a transport that returns `"pong"` forever, the
+    subscriber reached 50,001 `recv` calls without giving up.
+
+    No budget is added, and that is a deliberate boundary rather than an omission: the receive
+    timeout belongs to the connection, which is the only layer that knows what a reasonable wait
+    is. `WSTransport`'s docstring now states that a real implementation MUST set one. What is
+    fixed here is the NAME — a test asserting a bound nobody measured is the same class of defect
+    as the tautology labelled at :892, and this file cannot teach that standard while breaking it.
     """
     ws = RecordingWS(["pong", _ws_ack(), "pong", _ws_push(H22_WS)])
 
@@ -1428,34 +1466,144 @@ async def test_the_summary_RECORDS_the_source_and_the_record_cannot_be_reassigne
         summary.source = "rest"
 
 
-async def test_the_rendered_summary_carries_evidence_FIELD_NAMES_but_not_evidence_VALUES():
-    """The printed summary names the evidence fields and hashes them; it does not publish them.
+async def test_the_rendered_summary_publishes_NO_evidence_VALUE_without_exception():
+    """The printed summary names the evidence fields and hashes them; it publishes NONE of them.
 
-    `open_live_trial.py` renders on exactly this principle and this script's docstring claims the
-    same one, but the mechanical decision-point sweep for this commit found `render()` unbound: no
-    mutant and no assertion reached it, so the claim was documentation only. The demo transcript is
-    not where the payload gets published — the free read is — and the hash is what an operator
-    actually compares against a receipt.
+    REPLACES a hand-listed check, and the hand-list was the defect. The previous version asserted
+    four specific values absent and one — `t0_ms` — PRESENT, as a declared exception justified by
+    three claims none of which had been measured: that it was "trial metadata rather than market
+    data", that it was the trial-open instant, and that `open_live_trial.py` printed it for the
+    same reason. All three are false. `visible_at_decision` returns the whole model dump, so
+    `t0_ms` IS hashed evidence; `live.py` sets the trial's `t0_ms` to `now_ms` and says explicitly
+    it is "not from `sig.t0_ms`"; and the two renderings measured ~31.7 billion ms apart in one
+    invocation. The rendered dict was listing `"t0_ms"` in `evidence_fields` — naming it evidence —
+    while printing its value under a docstring saying evidence values are absent.
+
+    So this walks EVERY field of the signal instead of a curated list. A hand-kept exception list
+    is what produced both the original leak and its mislabelled remediation; a general rule cannot
+    grow a quiet exception, and a new evidence field is covered the day it is added rather than the
+    day someone remembers to extend a literal.
     """
-    summary, _, _ = await _exhibit([_ws_push(H22_WS)])
-    rendered = json.dumps(summary.render(), sort_keys=True)
+    summary, handoff, _ = await _exhibit([_ws_push(H22_WS)])
+    rendered = summary.render()
+    evidence = normalize_signal(H22_WS, "ws").model_dump()
 
-    assert summary.evidence_hash in rendered
-    assert "trigger_price" in rendered, "the FIELD NAMES are the useful part and must be present"
+    # The KEY SET is pinned exactly, so a future field cannot appear in the rendering without
+    # failing here first — including one that would re-introduce an evidence value.
+    assert set(rendered) == {
+        "source", "evidence_hash", "evidence_fields", "handoff_status", "dry_run", "published"
+    }
+    assert rendered["evidence_hash"] == summary.evidence_hash
+    assert "trigger_price" in rendered["evidence_fields"], "the field NAMES are the useful part"
+    assert set(rendered["evidence_fields"]) == set(evidence), "the names must be the whole signal"
 
-    # ACCEPTANCE CONTROL. Every value below really is in the fixture, so a rendering that leaked
-    # values WOULD contain it — without this the absence assertions could be passing because the
-    # values were never in the signal in the first place.
-    assert (H22_WS["price"], H22_WS["amountUsd"], H22_WS["triggerWalletAddress"]) == ("0.042", "1500", "0xa")
-    assert H22_WS["token"]["tokenAddress"] == "So1"
-    for value in ("0.042", "1500", "So1", "0xa"):
-        assert value not in rendered, f"the rendered summary published the evidence value {value!r}"
+    # TWO KEYS ARE EXCLUDED FROM THE SUBSTRING SCAN, and each is excluded because it carries its
+    # OWN assertion above — not because excluding it makes the test pass:
+    #   `evidence_hash`   — a 64-char hex digest. A short decimal evidence value can appear inside
+    #                       it BY CHANCE, so scanning it makes the test flake on a coincidence
+    #                       rather than on a leak. It is asserted equal to `summary.evidence_hash`
+    #                       above, and a digest is not a publication of its input — that is exactly
+    #                       why it is the thing printed.
+    #   `evidence_fields` — the field NAMES, which are legitimately printed and are asserted to be
+    #                       EXACTLY the signal's key set above, so they cannot smuggle a value.
+    # This exclusion is load-bearing rather than cosmetic: a first draft scanned the whole
+    # rendering and failed on `wallet_type="1"`, because the single character "1" occurs inside the
+    # NAME `top10_holder_percent`. That was the scan matching a name, not a leak.
+    def _scan(payload):
+        return json.dumps(
+            {k: v for k, v in payload.items() if k not in ("evidence_hash", "evidence_fields")},
+            sort_keys=True,
+        )
 
-    # `t0_ms` is the DECLARED exception and is asserted PRESENT rather than quietly omitted from
-    # the list above. It is trial metadata (when the trial opens, which an operator needs to check
-    # a deadline) and `open_live_trial.py` prints it for the same reason. Stating it here means the
-    # rule is "market data never, metadata deliberately" rather than an unexplained hole.
-    assert str(H22_WS["timestamp"]) in rendered
+    scanned = _scan(rendered)
+
+    # POPULATION NAMED BESIDE THE PREDICATE: every field of CanonicalSignal, not a chosen subset.
+    assert len(evidence) == 13, f"expected the full canonical signal, got {sorted(evidence)}"
+    for field, value in evidence.items():
+        assert str(value) not in scanned, f"the rendering published evidence value {field}={value!r}"
+
+    # ACCEPTANCE CONTROL: the scan CAN fire, through the SAME `_scan` the assertions above use.
+    # Without it, "no value found" is equally consistent with a scan pointed at the wrong string.
+    # Every field is poisoned in turn, so the control covers the whole population rather than one
+    # convenient member — including `wallet_type`, the one a careless scan gets wrong.
+    for field, value in evidence.items():
+        assert str(value) in _scan({**rendered, "leaked": value}), f"the scan cannot detect a leaked {field}"
+
+    # The handoff still received the raw signal — the values are not being withheld from the
+    # PIPELINE, only from the terminal. Absent this, dropping the payload entirely would pass.
+    assert json.loads(handoff.calls[0][1]) == H22_WS
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("InvalidURI", id="bad-ws-url"),
+        pytest.param("InvalidHandshake", id="handshake-rejected"),
+        pytest.param("ConnectionClosed", id="peer-closed"),
+        pytest.param("ModuleNotFoundError", id="websockets-not-installed"),
+    ],
+)
+def test_main_REFUSES_cleanly_when_the_connection_fails(monkeypatch, capsys, failure):
+    """`main` promises "refusals go to stderr and exit non-zero". It must keep that for real failures.
+
+    NO SOCKET IS OPENED. A fake `websockets` module is injected into `sys.modules` whose `connect`
+    raises before any I/O, so this exercises the connect-failure path without a network.
+
+    This closes a gap I had disclosed as UNREACHABLE. The evidence packet listed `main`'s two
+    returns among five decision points "on the real-socket path" and therefore unbindable; the SPEC
+    review showed one of them was bindable with a `sys.modules` injection, and it was right. Three
+    of the five are genuinely unreachable without real I/O; these are not.
+
+    The old `except (OSError, ValueError, OKXClientError)` caught NONE of these — measured against
+    websockets 15.0.1, all three WS errors subclass `WebSocketException` and neither `OSError` nor
+    `ValueError` — so the documented refusal degraded to a traceback for every failure the demo
+    will actually hit. That scenario, live WS unreliable at demo time, is the exact one the plan's
+    truth rule is written for.
+    """
+    module = _ws_exhibition_module()
+
+    class _FakeWSError(Exception):
+        pass
+
+    class _FakeWebsockets:
+        def connect(self, *_args, **_kwargs):
+            if failure == "ModuleNotFoundError":
+                raise ModuleNotFoundError("No module named 'websockets'")
+            raise _FakeWSError(f"simulated {failure}")
+
+    monkeypatch.setitem(sys.modules, "websockets", _FakeWebsockets())
+
+    status = module.main(["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"])
+
+    assert status == 1, "a failed connection must not report success"
+    captured = capsys.readouterr()
+    assert captured.err.startswith("refused: "), f"expected a clean refusal, got {captured.err!r}"
+    assert captured.out == "", "nothing may be printed to stdout when no exhibition happened"
+    # The TYPE survives into the message, so a genuine defect is still diagnosable rather than
+    # being flattened into a bare string by the broadened catch.
+    assert ("_FakeWSError" in captured.err) or ("ModuleNotFoundError" in captured.err)
+
+
+def test_main_refusal_control_the_fake_really_does_prevent_a_connection(monkeypatch):
+    """ACCEPTANCE CONTROL for the test above: prove the injection is what stops the socket.
+
+    Without this, the refusals above could be produced by argparse, a bad data dir, or anything
+    else that fails before `connect` — and the tests would pass while never reaching the code path
+    they claim to bind. Asserting `connect` was actually CALLED is what ties them to it.
+    """
+    module = _ws_exhibition_module()
+    calls = []
+
+    class _Recording:
+        def connect(self, *args, **kwargs):
+            calls.append(args)
+            raise RuntimeError("no socket, by construction")
+
+    monkeypatch.setitem(sys.modules, "websockets", _Recording())
+    status = module.main(["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"])
+
+    assert status == 1
+    assert calls == [("wss://example.invalid",)], "main must reach connect with the operator's URL"
 
 
 async def test_a_REST_envelope_on_the_ws_wire_produces_NO_record_at_all():
