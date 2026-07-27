@@ -1805,7 +1805,7 @@ async def test_run_and_main_BOTH_take_an_injected_connect_factory():
         return _Ctx()
 
     handoff_calls = []
-    module_handoff = getattr(module, "_subprocess_handoff")
+    module_handoff = module._subprocess_handoff
 
     def fake_handoff(argv, stdin_text):
         handoff_calls.append((argv, stdin_text))
@@ -1843,26 +1843,62 @@ class _ScriptedConn:
         pass
 
 
-class _MainResult:
-    """What one `main` invocation returned and wrote, so assertions can name both."""
+class _MainOutcome:
+    """Everything one `main` invocation produced, INCLUDING what escaped it.
 
-    def __init__(self, status: int, err: str) -> None:
+    `status` and `err` presume `main` RETURNED. Sometimes it must not — Ctrl-C has to stay Ctrl-C —
+    so what escaped is evidence too, and a runner that cannot see it cannot tell "swallowed the
+    interrupt" from "warned and re-raised". `escaped` is `None` whenever `main` returned normally.
+
+    ONE result type, not two. This was `_MainResult(status, err)` plus a `_MainOutcome` that added
+    exactly one field, so a future editor adding a fourth observable had to pick which of the two to
+    extend and the other silently became less capable.
+    """
+
+    def __init__(self, status, err, escaped=None) -> None:
         self.status = status
         self.err = err
+        self.escaped = escaped
 
 
-def _capture_main_stderr(module, argv, ctx_factory) -> "_MainResult":
+def _exhibition_argv(dry_run=False):
+    """The operator argv every `main` runner in this file uses. One spelling, four callers."""
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
+
+
+@contextlib.contextmanager
+def _patched_handoff(module, handoff):
+    """Swap the module's handoff for the duration, and restore it however the block exits.
+
+    Load-bearing rather than belt-and-braces: `_ws_exhibition_module` is `lru_cache`d, so every
+    test in this file shares ONE module object and a leaked patch would follow the suite.
+    """
+    original = module._subprocess_handoff
+    module._subprocess_handoff = handoff
+    try:
+        yield
+    finally:
+        module._subprocess_handoff = original
+
+
+def _capture_main_stderr(module, argv, ctx_factory) -> "_MainOutcome":
     """Run `main` with an INJECTED connect factory and capture its stderr.
 
     Uses the `connect_factory=` seam rather than `sys.modules`, which is the point of FINDING 2:
     while `main` had no seam, its returns were reachable only by faking the module table, and the
     test that certified the seam's existence was contradicted by two tests in its own file.
     No socket: `ctx_factory` builds an async context manager that never connects.
+
+    Anything that ESCAPES `main` propagates out of here rather than being recorded — use
+    `_main_outcome` when the escape is the measurement.
     """
     buffer = io.StringIO()
     with contextlib.redirect_stderr(buffer):
         status = module.main(argv, connect_factory=lambda _url: ctx_factory())
-    return _MainResult(status, buffer.getvalue())
+    return _MainOutcome(status, buffer.getvalue())
 
 
 def test_a_handoff_that_STARTS_and_then_RAISES_warns_that_a_trial_may_exist():
@@ -2389,16 +2425,9 @@ _REFUSED_FRAME = '{"code":"0","data":[]}'
 
 
 def _main_over(module, *, ctx, dry_run, handoff):
-    """Run `main` over one injected connection and handoff, restoring the module attribute after."""
-    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
-    if dry_run:
-        argv.append("--dry-run")
-    original = module._subprocess_handoff
-    module._subprocess_handoff = handoff
-    try:
-        return _capture_main_stderr(module, argv, lambda: ctx)
-    finally:
-        module._subprocess_handoff = original
+    """Run `main` over one injected connection and handoff. For rows where `main` RETURNS."""
+    with _patched_handoff(module, handoff):
+        return _capture_main_stderr(module, _exhibition_argv(dry_run), lambda: ctx)
 
 
 def _chain_types(error):
@@ -2522,8 +2551,15 @@ def test_a_SUPPRESSING_teardown_is_classified_by_PHASE_and_not_by_what_was_assig
     the replacement — control left the block without any statement of ours running — so it is
     classified the same way: by the recorded phase, not by what happens to be bound.
 
-    Both halves, because the phase is only informative if it can say NO: a swallowed PRE-handoff
-    failure published nothing and must keep the ordinary refusal.
+    THREE ROWS, and the third is QUALITY R5 MAJOR-1. The `dry-run` x `suppresses` cell existed in
+    no family in this file: every `"suppresses"` row was `dry_run=False`, and every dry-run row used
+    `"raises"` or `"passes"`. The cell is the intersection of two dimensions each of which was
+    covered alone — not a case anyone forgot to think about, but one nobody took the cross-product
+    of. It went unguarded through four rounds, and a mutant that made this branch warn "a live trial
+    MAY ALREADY EXIST" on a run where publication was IMPOSSIBLE survived all 154 tests.
+
+    The phase is only informative if it can say NO, and it must say NO for two different reasons: a
+    swallowed PRE-handoff failure published nothing, and a swallowed dry-run failure could not have.
     """
     module = _ws_exhibition_module()
 
@@ -2533,21 +2569,57 @@ def test_a_SUPPRESSING_teardown_is_classified_by_PHASE_and_not_by_what_was_assig
     def _never_reached(_argv, _stdin):
         raise AssertionError("a pre-handoff refusal must never reach the handoff")
 
-    after = _main_over(
-        module, ctx=_Teardown([_ws_push(H22_WS)], "suppresses"), dry_run=False, handoff=_starts_then_raises
-    )
-    before = _main_over(
-        module, ctx=_Teardown([_REFUSED_FRAME], "suppresses"), dry_run=False, handoff=_never_reached
+    after_ctx = _Teardown([_ws_push(H22_WS)], "suppresses")
+    before_ctx = _Teardown([_REFUSED_FRAME], "suppresses")
+    dry_ctx = _Teardown([_ws_push(H22_WS)], "suppresses")
+    after = _main_over(module, ctx=after_ctx, dry_run=False, handoff=_starts_then_raises)
+    before = _main_over(module, ctx=before_ctx, dry_run=False, handoff=_never_reached)
+    dry = _main_over(module, ctx=dry_ctx, dry_run=True, handoff=_starts_then_raises)
+
+    # THE REPRODUCTION VALIDATES ITS OWN PREMISE: each teardown ran, and each SAW the exception it
+    # was supposed to swallow. Without the second half a context that never received the failure
+    # would still satisfy every assertion below.
+    assert (after_ctx.calls, before_ctx.calls, dry_ctx.calls) == (1, 1, 1)
+    assert after_ctx.saw is module.PostHandoffError, f"the post-handoff row swallowed {after_ctx.saw}"
+    assert before_ctx.saw is OKXResponseError, f"the pre-handoff row swallowed {before_ctx.saw}"
+    assert dry_ctx.saw is BrokenPipeError, (
+        f"the dry-run row must swallow the RAW failure, unconverted: got {dry_ctx.saw}"
     )
 
     assert after.status == 1
     assert after.err.startswith("refused AFTER handoff:"), f"got {after.err!r}"
     assert module.INDETERMINATE_WARNING in after.err
+    # ...and it names WHAT was suppressed. The branch built its message with no cause at all, so an
+    # operator learned only that something had been swallowed.
+    assert "BrokenPipeError" in after.err, f"the erased cause never reached the operator: {after.err!r}"
 
     assert before.status == 1
     assert before.err.startswith("refused: "), f"got {before.err!r}"
     assert module.INDETERMINATE_WARNING not in before.err
     assert "AFTER handoff" not in before.err
+
+    # ...and the cause survives in the CHAIN as well as in the sentence, so a developer reading a
+    # traceback gets it too. `__aexit__` returning True clears the handled exception, so this is
+    # recovered from a local captured one block earlier rather than from `__context__`.
+    async def _suppressed_run():
+        with _patched_handoff(module, _starts_then_raises), pytest.raises(module.PostHandoffError) as excinfo:
+            await module._run(
+                module.build_parser().parse_args(_exhibition_argv()),
+                connect_factory=lambda _url: _Teardown([_ws_push(H22_WS)], "suppresses"),
+            )
+        return excinfo.value
+
+    assert BrokenPipeError in _chain_types(asyncio.run(_suppressed_run())), (
+        "the suppressed cause is named in the sentence but lost from the chain"
+    )
+
+    # THE MISSING CELL. Publication was impossible, so the ordinary refusal is the true sentence.
+    assert dry.status == 1
+    assert dry.err.startswith("refused: "), f"got {dry.err!r}"
+    assert module.INDETERMINATE_WARNING not in dry.err, (
+        f"a dry run cannot have published; warning here erodes the warning that matters: {dry.err!r}"
+    )
+    assert "AFTER handoff" not in dry.err
 
 
 def test_a_failure_in_the_EVENT_LOOP_teardown_still_reaches_the_operator_as_post_handoff(monkeypatch):
@@ -2636,37 +2708,16 @@ def test_the_post_handoff_chain_walk_is_COMPLETE_over_both_links():
     assert walk(a) is None
 
 
-class _MainOutcome:
-    """Everything one `main` invocation produced, INCLUDING what escaped it.
-
-    `_MainResult` records a status and stderr, which presumes `main` returned. The whole point of
-    the `BaseException` family is that sometimes it must NOT return -- Ctrl-C has to stay Ctrl-C --
-    so the thing that escaped is evidence too, and a runner that cannot see it cannot tell
-    "swallowed the interrupt" from "warned and re-raised".
-    """
-
-    def __init__(self, status, err, escaped):
-        self.status = status
-        self.err = err
-        self.escaped = escaped
-
-
 def _main_outcome(module, *, ctx, dry_run, handoff):
     """Run `main` over an injected connection and handoff, recording a return OR an escape."""
-    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
-    if dry_run:
-        argv.append("--dry-run")
-    original = module._subprocess_handoff
-    module._subprocess_handoff = handoff
     buffer = io.StringIO()
     status, escaped = None, None
-    try:
-        with contextlib.redirect_stderr(buffer):
-            status = module.main(argv, connect_factory=lambda _url: ctx)
-    except BaseException as error:  # noqa: BLE001 - what ESCAPES main is the measurement
-        escaped = error
-    finally:
-        module._subprocess_handoff = original
+    with _patched_handoff(module, handoff):
+        try:
+            with contextlib.redirect_stderr(buffer):
+                status = module.main(_exhibition_argv(dry_run), connect_factory=lambda _url: ctx)
+        except BaseException as error:  # noqa: BLE001 - what ESCAPES main is the measurement
+            escaped = error
     return _MainOutcome(status, buffer.getvalue(), escaped)
 
 
@@ -2763,9 +2814,12 @@ def test_a_BASE_EXCEPTION_after_the_handoff_still_reaches_the_operator_as_post_h
     # The hole the compound case exposes from the other side: the child SUCCEEDED, so a trial
     # definitely exists, and the interrupt arrives during teardown instead of during the handoff.
     cases["success then KeyboardInterrupt teardown"] = (push, None, "interrupts", False, _succeeds)
-    # Publication was impossible, so the ordinary refusal is the TRUE sentence.
-    cases["dry-run KeyboardInterrupt + raises"] = (push, None, "raises", True, _interrupted(KeyboardInterrupt))
-    cases["dry-run KeyboardInterrupt + passes"] = (push, None, "passes", True, _interrupted(KeyboardInterrupt))
+    # Publication was impossible, so the ordinary refusal is the TRUE sentence -- ACROSS ALL THREE
+    # teardown modes. These were two named rows covering `raises` and `passes`; the missing third
+    # was the `dry-run` x `suppresses` cell, which existed in no family in this file and which a
+    # surviving mutant found before this row did.
+    for mode in ("passes", "raises", "suppresses"):
+        cases[f"dry-run KeyboardInterrupt + {mode}"] = (push, None, mode, True, _interrupted(KeyboardInterrupt))
 
     for label, (frames, connection, mode, dry_run, handoff) in cases.items():
         ctx = _Teardown(frames, mode, connection=connection)
@@ -2789,8 +2843,12 @@ def test_a_BASE_EXCEPTION_after_the_handoff_still_reaches_the_operator_as_post_h
         expected[f"PRE-handoff {exc_name} + raises"] = ("ordinary", None)
         expected[f"PRE-handoff {exc_name} + suppresses"] = ("ordinary", None)
     expected["success then KeyboardInterrupt teardown"] = ("AFTER+warn", "KeyboardInterrupt")
-    expected["dry-run KeyboardInterrupt + raises"] = ("ordinary", None)
+    # A clean teardown lets the interrupt out unmarked; a failing or suppressing one has already
+    # replaced it with an ordinary `RuntimeError` before `main` sees anything. None of the three may
+    # warn: under `--dry-run` the child wrote nothing.
     expected["dry-run KeyboardInterrupt + passes"] = ("silent", "KeyboardInterrupt")
+    expected["dry-run KeyboardInterrupt + raises"] = ("ordinary", None)
+    expected["dry-run KeyboardInterrupt + suppresses"] = ("ordinary", None)
 
     assert rows == expected, rows
     assert len(started) == len(cases) - 6, "every non-pre-handoff row must actually have begun the handoff"
@@ -2828,6 +2886,23 @@ def test_CTRL_C_after_the_handoff_warns_and_STILL_terminates_as_an_interrupt():
     # `TimeoutError`. The detail is the type alone when there is no message.
     detail = outcome.err.split(" -- ", 1)[0]
     assert detail == "refused AFTER handoff: KeyboardInterrupt", f"got {detail!r}"
+
+    # THE SECOND SURFACE, AND IT IS THE ONE AN OPERATOR ACTUALLY MEETS. The assertion above binds
+    # `main`'s own rendering. `PostHandoffError.__init__` formats a SECOND copy of the same
+    # sentence, and on this path that copy is spliced into the interrupt's `__context__` and
+    # re-raised — so the DEFAULT EXCEPTHOOK prints it in the operator's terminal. Both were built
+    # by hand from `type(cause).__name__` and `cause`; one was fixed and the other was not, which
+    # is this round's defect class rendered in miniature.
+    assert str(module.PostHandoffError(KeyboardInterrupt())) == "KeyboardInterrupt"
+    assert str(module.PostHandoffError(TimeoutError())) == "TimeoutError"
+    marker = module._post_handoff_in_chain(outcome.escaped)
+    assert marker is not None and str(marker) == "KeyboardInterrupt", (
+        f"the excepthook will print {str(marker)!r} to the operator's terminal"
+    )
+
+    # ...AND `main`'s PostHandoffError branch renders through that same string, so the fix reaches
+    # it transitively. A message-less cause is what makes the two surfaces distinguishable at all.
+    assert str(module.PostHandoffError(RuntimeError("teardown failed"))) == "RuntimeError: teardown failed"
 
 
 def test_an_INTERRUPT_in_the_TAIL_after_the_child_returned_is_still_post_handoff():
@@ -2911,6 +2986,27 @@ def test_the_post_handoff_marker_SPLICES_into_the_chain_without_replacing_the_ex
 
     # DISCRIMINATION: an unspliced interrupt is not post-handoff, or every interrupt would warn.
     assert module._post_handoff_in_chain(KeyboardInterrupt()) is None
+
+    # IDEMPOTENT, AND THE GUARD IS PRODUCTION-REACHABLE RATHER THAN DEFENSIVE. On the Ctrl-C path
+    # the same exception object passes two boundaries that both mark it: `exhibit_one_signal`
+    # splices, and `_run`'s arbitration calls `_reraise_as_post_handoff` on the same object. I
+    # declared this guard a "predicted survivor" in my own drill on the grounds that a second marker
+    # is only traceback noise; that reasoning was right about the HARM and wrong about the STATUS.
+    # A documented guard that production exercises and no test binds is one a future simplifier
+    # deletes, and it also creates a reference cycle that only `seen` keeps from hanging the walk.
+    module._splice_post_handoff(interrupt)
+    assert interrupt.__context__ is marker, "a second splice displaced the first marker"
+    chain, seen, pending = [], set(), [interrupt]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+    assert sum(isinstance(e, module.PostHandoffError) for e in chain) == 1, (
+        f"the chain carries {sum(isinstance(e, module.PostHandoffError) for e in chain)} markers, not 1"
+    )
 
 
 async def test_a_failure_AFTER_the_handoff_says_so_because_the_operator_acts_differently():

@@ -110,7 +110,15 @@ class PostHandoffError(RuntimeError):
     """
 
     def __init__(self, cause: BaseException) -> None:
-        super().__init__(f"{type(cause).__name__}: {cause}")
+        # `_describe`, not `f"{type(cause).__name__}: {cause}"`, and this line reaches an operator
+        # by a route the module's other renderings do not. On the Ctrl-C path the marker built here
+        # is spliced into the interrupt's `__context__` and `main` RE-RAISES, so this text is
+        # printed by the DEFAULT EXCEPTHOOK, in the operator's terminal, on the most likely
+        # interruption of a live demo. `str(KeyboardInterrupt())` is the empty string, so the naive
+        # form rendered `KeyboardInterrupt: ` — a line whose detail is a bare colon. Fixing it here
+        # rather than at the call site fixes `main`'s `str(error)` rendering transitively, because
+        # that is this same string.
+        super().__init__(_describe(cause))
         self.cause = cause
 
 
@@ -332,12 +340,17 @@ def _splice_post_handoff(error: BaseException) -> None:
 def _reraise_as_post_handoff(error: BaseException, *, dry_run: bool) -> NoReturn:
     """Re-raise ``error`` carrying the post-handoff phase, whatever kind of exception it is.
 
-    THE ONE PLACE THE RULE IS SPELLED. Three boundaries in this module need it — the handoff region
-    in ``exhibit_one_signal``, the connect/teardown arbitration in ``_run``, and ``_run``'s tail —
-    and each previously spelled its own version. That is how the ninth instance of this lane's
-    class arrived: the handoff region said ``except Exception``, ``_run`` said
-    ``except PostHandoffError``, and a ``KeyboardInterrupt`` delivered while the child was running
-    matched neither, so the phase was never recorded at all.
+    THE ONE PLACE THE RULE IS SPELLED. FOUR boundaries in this module need it — the handoff region
+    in ``exhibit_one_signal``, the connect/teardown arbitration in ``_run``, ``_run``'s
+    suppressed-teardown guard, and ``_run``'s tail — and each previously spelled its own version.
+    That is how the ninth instance of this lane's class arrived: the handoff region said
+    ``except Exception``, ``_run`` said ``except PostHandoffError``, and a ``KeyboardInterrupt``
+    delivered while the child was running matched neither, so the phase was never recorded at all.
+
+    The count in this sentence was itself wrong for a round: it said THREE while the
+    suppressed-teardown guard spelled the rule inline fourteen lines from a comment claiming it did
+    not. A docstring that enumerates its call sites is a claim, and this one is now the enumeration
+    a reader can check — four, listed above.
 
     ``dry_run`` is the single exemption and it is applied HERE for the same reason: the child was
     invoked with ``--dry-run`` and wrote nothing, so the ordinary refusal is the TRUE sentence, and
@@ -512,6 +525,12 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
     # than passed along. A flag written where the phase is KNOWN survives any later replacement
     # because it is not carried by the exception at all.
     handoff_may_have_started = False
+    # What the suppression ERASED, kept so the operator is not told only that something was
+    # swallowed. An `__aexit__` returning True clears the handled exception, so by the time control
+    # reaches the guard below, `__context__` is `None` and the real failure is unrecoverable — but
+    # it was in scope one block earlier, because `__aexit__` can only suppress an exception raised
+    # by the block body and the handler below catches every one of them first.
+    suppressed_cause: BaseException | None = None
     try:
         async with connect(args.ws_url) as connection:
             try:
@@ -529,14 +548,15 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
                 # of a `PostHandoffError` trivially and of a marked interrupt equally.
                 if _post_handoff_in_chain(error) is not None:
                     handoff_may_have_started = True
+                suppressed_cause = error
                 raise
     except BaseException as error:
         if isinstance(error, PostHandoffError):
             raise
         # A live `summary` still means the same thing — the exhibition returned, so the child ran
         # and only the teardown failed. The `--dry-run` exemption is not spelled here: it lives in
-        # `_reraise_as_post_handoff` with the other two boundaries, because stating one rule at
-        # three sites is how the three drift apart.
+        # `_reraise_as_post_handoff` with the other three boundaries, because stating one rule at
+        # four sites is how the four drift apart.
         if handoff_may_have_started or summary is not None:
             _reraise_as_post_handoff(error, dry_run=args.dry_run)
         raise
@@ -547,9 +567,23 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
         # simply arrives here with nothing assigned. Reaching the tail would raise `AttributeError`
         # on `None` and get wrapped as post-handoff regardless of phase — a warning that fires on
         # every refusal is not a warning. The run has still failed; what it must not do is guess.
-        suppressed = RuntimeError("the connection's __aexit__ suppressed the exhibition failure; no summary exists")
+        #
+        # THE FOURTH BOUNDARY, AND IT NO LONGER SPELLS THE RULE ITSELF. It read
+        # `raise PostHandoffError(suppressed)` — fourteen lines below the comment above, which
+        # asserts that the `--dry-run` exemption lives in `_reraise_as_post_handoff` rather than at
+        # the boundaries; that was true of the line above it and false of this one. It was correct
+        # only by an
+        # emergent cross-function invariant that nothing stated and nothing tested: under
+        # `--dry-run` nothing splices a marker, so `handoff_may_have_started` never becomes True, so
+        # this branch was unreachable. A mutant that made it warn "a live trial MAY ALREADY EXIST"
+        # on a run where publication was IMPOSSIBLE survived the entire suite. Routing through the
+        # helper makes the exemption a fact of the code rather than of the call graph.
+        erased = "cause unrecorded" if suppressed_cause is None else _describe(suppressed_cause)
+        suppressed = RuntimeError(f"the connection's __aexit__ suppressed the exhibition failure ({erased})")
+        # The cause the suppression erased, restored for diagnosis as well as for the sentence.
+        suppressed.__cause__ = suppressed_cause
         if handoff_may_have_started:
-            raise PostHandoffError(suppressed)
+            _reraise_as_post_handoff(suppressed, dry_run=args.dry_run)
         raise suppressed
 
     # ONE BOUNDARY OVER THE WHOLE TAIL, rather than one per statement, and the shape is the fix.
