@@ -1405,6 +1405,57 @@ async def test_the_trial_route_reports_a_MISSING_outcome_as_null_not_as_a_pendin
     assert response.status_code == 200 and response.json()["outcome"] is None
 
 
+@pytest.mark.parametrize(
+    ("now_ms", "status"),
+    [
+        pytest.param(T0 + 60_000, "pending", id="pending"),
+        pytest.param(T + 60_000 + FETCH_GRACE_MS, "UNSCORED", id="UNSCORED"),
+    ],
+)
+async def test_the_trial_route_serves_a_RECORDED_non_settled_outcome_with_every_metric_null(
+    store: _TamperableStore, now_ms: int, status: str
+) -> None:
+    """A recorded ``pending`` and a recorded ``UNSCORED`` both render over the wire, metrics null.
+
+    This is the state BETWEEN the two the other route tests cover — a settled outcome, and no
+    outcome at all — and it is the common one in production: ``settle_live_trials`` records
+    ``pending`` on every trial it visits before one settles, so ``GET /trials/{id}`` on a visited
+    but unsettled trial is an ordinary read, not an edge case.
+
+    It is also the only place :class:`TrialOutcomeModel`'s NULLABILITY is exercised. The mirror test
+    compares field NAMES, so it is blind to a metric that stopped being ``| None``; nothing else
+    serves an outcome carrying ``None`` through the model. A metric narrowed to a non-optional type
+    with a default would pass every other test in this file and then answer 500 on this read, and a
+    metric narrowed WITHOUT a default would publish a zero where the backend meant "no result" —
+    which is the H5.1 contract break the freeze exists to prevent, since a zero markout is a real
+    flat outcome and a zero Brier is a perfect score.
+
+    Asserts the STATUS as well as the nulls, per ``PKT-DEC-C26``: both non-settled states carry
+    identical ``None`` metrics, so an assertion on the nulls alone cannot tell them apart and would
+    pass just as happily against a route that had collapsed the two labels into one.
+    """
+    trial = _trial()
+    store.record_outcome(TRIAL_ID, settle_trial(trial, _empty_series(), now_ms=now_ms))
+    async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
+        response = await client.get(f"/signal-trials/trials/{TRIAL_ID}")
+    assert response.status_code == 200
+    outcome = response.json()["outcome"]
+    # Not ``null``: a RECORDED non-settled outcome is a stronger claim than an absent one, and the
+    # test above already covers the absent case — without this, both could be served as ``null``.
+    assert outcome is not None
+    assert outcome["status"] == status
+    # Every key present, so a metric is served as an explicit ``null`` rather than omitted: a
+    # consumer reading a missing key cannot tell "no result" from "field I do not know about".
+    assert set(outcome) == set(TrialOutcomeModel.model_fields)
+    metrics = ("future", "close_ts_ms", "observation_lag_ms", "follow_markout_bps", "fade_markout_bps")
+    assert {key: outcome[key] for key in metrics} == dict.fromkeys(metrics)
+    assert outcome["follow_profitable"] is None
+    # The entry is NOT null in any status — it is sealed at ``t0``, long before the settlement
+    # candle. Asserted so the nulls above are a statement about the metrics and not about an
+    # outcome object that came back empty.
+    assert outcome["entry"] == ENTRY
+
+
 async def test_the_agent_route_serves_a_record_and_404s_without_one(store: _TamperableStore) -> None:
     """A payer with no FINALIZED commit has no participant record; one with a commit has one."""
     async with _client(_app(store=store)) as client:

@@ -438,8 +438,8 @@ def unscored_boundary_ms(t0_ms: int, horizon_ms: int, bar_ms: int) -> int:
     in which a closed candle is not yet retrievable from the endpoint.
 
     So: ``T + bar_ms + FETCH_GRACE_MS``. The ``bar_ms`` term is the load-bearing one — a boundary
-    that omitted it would be wrong by 59 minutes under the 1H fallback and only ten minutes early
-    under 1m, which is precisely why it is easy to omit and hard to notice.
+    that omitted it would be early by EXACTLY ``bar_ms``: 60 minutes under the 1H fallback, and
+    only one minute under 1m, which is precisely why it is easy to omit and hard to notice.
 
     Args:
         t0_ms: The trial's open instant.

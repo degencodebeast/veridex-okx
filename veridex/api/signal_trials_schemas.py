@@ -224,10 +224,13 @@ class VerifyReceiptResponse(BaseModel):
     is stated here rather than left implied because it is the one thing this map cannot
     say for itself.
 
-    ``receipt`` is ``None`` only when the stored row's bytes cannot be read at all. That
-    case still answers 200 carrying eight verdicts, because a destroyed receipt is a
-    finding about the receipt and not an outage; rendering a partial receipt out of it
-    would publish fields nothing can re-derive.
+    ``receipt`` is ``None`` only when the stored row cannot be RENDERED — its bytes are
+    unreadable, or they parse into values that cannot be coerced. An ABSENT receipt is
+    never a ``null`` here: this route answers 404 on an id it holds no row for, before the
+    receipt is rendered at all. A row that is present and unrenderable still answers 200
+    carrying eight verdicts, because a destroyed receipt is a finding about the receipt and
+    not an outage; rendering a partial receipt out of it would publish fields nothing can
+    re-derive.
     """
 
     receipt_id: str
