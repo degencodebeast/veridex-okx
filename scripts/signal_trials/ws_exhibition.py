@@ -41,6 +41,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
@@ -61,11 +62,48 @@ WS_SOURCE: Final[Literal["ws"]] = "ws"
 #: script holds no code-level coupling to a module another lane owns.
 OPEN_LIVE_TRIAL_SCRIPT = Path(__file__).resolve().parent / "open_live_trial.py"
 
+#: Receive bound, in seconds. `WSTransport` states that a real implementation MUST set one, because
+#: `_ws_converse` loops with no frame budget. Generous rather than tight: a signal push is a market
+#: event and may legitimately be minutes away, so this is the "the socket has gone quiet and the
+#: demo needs an answer" bound, not a latency SLA. An expiry becomes a clean `refused:` line.
+RECV_TIMEOUT_S = 90.0
+
+#: Handshake and close bounds, passed explicitly rather than left to library defaults — the same
+#: choice `scripts/smoke_public_ws.py::_default_connect` makes.
+OPEN_TIMEOUT_S = 10.0
+CLOSE_TIMEOUT_S = 5.0
+
+#: How the connection is opened. Injected so tests never reach a socket — see `_run`.
+ConnectFactory = Callable[[str], Any]
+
 
 class Handoff(Protocol):
     """How the open-trial script gets run. Injected so tests never spawn a process."""
 
     def __call__(self, argv: list[str], stdin_text: str) -> int: ...
+
+
+class PostHandoffError(RuntimeError):
+    """A failure that happened AFTER the open-trial handoff fired — so a trial MAY EXIST.
+
+    This type exists because of what ``main``'s ``refused:`` line instructs an operator to do. The
+    module docstring's fallback is "say REST-sourced and open a REST trial instead", and that is
+    correct advice for a failure BEFORE the handoff, when nothing was published. Applied to a
+    failure AFTER it, the same advice produces a SECOND live trial for one signal — one labelled
+    ``ws``, one labelled ``rest``. A single word in a stderr line is the difference.
+
+    The window is small but it is not empty: the summary construction, the connection ``__aexit__``
+    and the final ``print`` all run after the child has been spawned. Low probability is a reason
+    to make the message precise, not a reason to let it be wrong — the guarantee the docstring
+    makes about what ``refused:`` MEANS is the thing being kept honest here.
+
+    ``RuntimeError`` rather than a bare ``Exception`` so it is still caught by ``main``'s broad
+    handler with no special-casing needed for the exit status; only the WORDING differs.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -104,35 +142,21 @@ class ExhibitionSummary:
         payload is public through the free read; a terminal transcript is not where it should be
         published, and the hash is what an operator compares against a receipt.
 
-        The rule is exceptionless on purpose, and it did not start that way. Two fields were
-        printed here and both were wrong to print. ``token_address`` went first. ``t0_ms`` was then
-        RETAINED under a written exception claiming it was "trial metadata rather than market
-        data" — a claim that was false three ways, none of which had been measured:
+        **The "no exception" is the load-bearing half.** Two fields were printed here and both were
+        wrong to print; the second, ``t0_ms``, was RETAINED for a round under a written exception
+        that read plausibly and was false in three ways, none of which had been measured. Anyone
+        reaching for a fresh exception should assume theirs reads just as plausibly. The rule is
+        also what makes the guard general: ``test_the_rendered_summary_publishes_NO_evidence_VALUE_
+        without_exception`` walks EVERY field of the signal, which a hand-kept exception list would
+        make impossible.
 
-        * It is a HASHED EVIDENCE FIELD. ``visible_at_decision`` returns the whole
-          ``CanonicalSignal`` model dump, so ``t0_ms`` is inside ``evidence_hash``. This dict was
-          therefore listing ``"t0_ms"`` in ``evidence_fields`` — naming it as evidence — while
-          printing its value under a docstring saying evidence values are absent.
-        * It is NOT the trial-open instant. ``live.py`` is explicit that ``LiveTrial.t0_ms`` is
-          ``now_ms`` and *"not from ``sig.t0_ms``… the two are usually equal and are allowed to"*
-          differ; ``live.py`` has a guard that exists solely because they can. Two different
-          quantities under one name.
-        * It could not serve the deadline check it was justified by. Measured on one signal in one
-          invocation, the two renderings were ~31.7 billion ms apart, and this script prints no
-          deadline of its own.
+        An operator who needs the deadline already has it — the handoff does not capture the
+        child's stdout, so ``open_live_trial.py`` prints the authoritative ``t0_ms`` and
+        ``commit_deadline_ms`` into the same terminal, in the same run.
 
-        So the honest fix is to print neither, rather than to relabel one. **An operator who needs
-        the deadline already has it:** the handoff does not capture the child's stdout, so
-        ``open_live_trial.py`` prints its own summary — carrying the authoritative ``t0_ms`` AND
-        ``commit_deadline_ms`` — into the same terminal, in the same run. Printing a second
-        ``t0_ms`` under the same key with a different value would not add information; it would
-        put a contradiction in front of the operator. The script that owns the deadline prints the
-        deadline, and this one does not guess at it.
-
-        Pinned by ``test_the_rendered_summary_publishes_NO_evidence_VALUE_without_exception``,
-        which walks EVERY field of the signal rather than a hand-kept list — the exceptionless rule
-        is what makes that general guard possible, and a hand-kept exception list is what produced
-        both defects above.
+        Full history — the three false claims, the measurements that refuted them, and why
+        dropping beat relabelling — is in PKT-EVID-H2-5-MUTATION-3f9a4c7.txt SECTION 3, the commit
+        message, and the test's own docstring.
         """
         return {
             "source": self.source,
@@ -171,7 +195,7 @@ async def exhibit_one_signal(
     *,
     data_dir: str,
     dry_run: bool = False,
-    handoff: Handoff = _subprocess_handoff,
+    handoff: Handoff | None = None,
 ) -> ExhibitionSummary:
     """Subscribe once, normalize the arrival as ``ws``, and hand it to the open-trial script.
 
@@ -184,19 +208,30 @@ async def exhibit_one_signal(
         OKXClientError: the WS conversation failed or the frame was not a signal push.
         ValueError: the arrived signal failed canonicalization (including leakage refusals).
     """
+    # Resolved at CALL time for the same reason `_WebsocketsTransport._recv_timeout` is:
+    # `handoff: Handoff = _subprocess_handoff` in the signature FREEZES the function object at
+    # import, so rebinding `module._subprocess_handoff` is silently ignored and the real
+    # subprocess runs anyway. Measured — a test that patched the module attribute spawned
+    # `open_live_trial.py` for real while reporting that its fake had been used.
+    run_handoff: Handoff = _subprocess_handoff if handoff is None else handoff
+
     raw = await subscribe_one_signal(ws_transport, chain_index)
     signal: CanonicalSignal = normalize_signal(raw, WS_SOURCE)
 
-    status = handoff(
-        build_handoff_argv(data_dir=data_dir, dry_run=dry_run),
-        json.dumps(raw, separators=(",", ":"), sort_keys=True),
-    )
-    return ExhibitionSummary(
-        evidence_hash=evidence_hash(signal),
-        evidence_fields=tuple(sorted(signal.model_dump())),
-        handoff_status=status,
-        dry_run=dry_run,
-    )
+    argv = build_handoff_argv(data_dir=data_dir, dry_run=dry_run)
+    status = run_handoff(argv, json.dumps(raw, separators=(",", ":"), sort_keys=True))
+
+    # EVERYTHING PAST THIS LINE RUNS AFTER THE TRIAL MAY ALREADY EXIST, so a failure here means
+    # something very different to an operator than a failure before it — see `PostHandoffError`.
+    try:
+        return ExhibitionSummary(
+            evidence_hash=evidence_hash(signal),
+            evidence_fields=tuple(sorted(signal.model_dump())),
+            handoff_status=status,
+            dry_run=dry_run,
+        )
+    except Exception as error:
+        raise PostHandoffError(error) from error
 
 
 def exit_status(summary: ExhibitionSummary) -> int:
@@ -231,37 +266,93 @@ def build_parser() -> argparse.ArgumentParser:
 class _WebsocketsTransport:
     """Adapter over a `websockets` client connection, satisfying :class:`WSTransport`.
 
-    Exists to keep the byte/str ambiguity at the edge: `recv` can yield either, and the frame
-    parsing upstream is written against exactly one input type. Only ``main`` constructs this —
-    no test touches it, and nothing in this module opens a connection on any other path.
+    Exists for two reasons. First, to keep the byte/str ambiguity at the edge: `recv` can yield
+    either, and the frame parsing upstream is written against exactly one input type.
+
+    Second, and this is the load-bearing one, **to honour the receive-timeout MUST that
+    ``WSTransport``'s docstring states.** ``_ws_converse`` is a ``while True`` with no frame budget
+    BY DESIGN — the protocol layer cannot know what a reasonable wait is, so the whole safety of
+    that loop rests on the transport imposing a bound. This class is the repo's ONLY real
+    implementation of that Protocol, and it previously did not impose one: `recv` was a bare
+    ``await``, which made the module's own stated MUST false at the only place it applied.
+
+    Why a bare await is not enough, measured rather than assumed: websockets 15.0.1's
+    ``ClientConnection.recv`` has signature ``(self, decode)`` — **there is no timeout parameter**,
+    so the bound can only come from the caller. ``connect()``'s ``open_timeout`` bounds the
+    handshake and ``ping_interval``/``ping_timeout`` detect a DEAD peer, but a peer that is alive
+    and answering Pings while pushing no signal blocks ``recv`` with nothing to interrupt it. That
+    is exactly the heartbeats-forever case, and on the H6.1 demo path it is a hung terminal in
+    front of an audience — the one state worse than the traceback ``main`` was fixed to avoid.
+
+    ``asyncio.wait_for`` is the same mechanism ``scripts/smoke_public_ws.py`` already uses for its
+    own WS reads; this is an in-repo pattern, not a novel demand. The expiry surfaces as
+    ``TimeoutError``, which ``main``'s existing ``except Exception`` renders as a clean ``refused:``
+    line — the documented operator behaviour.
     """
 
-    def __init__(self, connection: Any) -> None:
+    def __init__(self, connection: Any, *, recv_timeout: float | None = None) -> None:
         self._connection = connection
+        # Resolved at CALL time, not as a default argument. `recv_timeout=RECV_TIMEOUT_S` in the
+        # signature would freeze the constant at import, so an operator override or a test that
+        # rebinds the module attribute would be silently ignored — the default would already have
+        # been captured. Measured: a test that set it to 0.05 waited the full 90s default.
+        self._recv_timeout = RECV_TIMEOUT_S if recv_timeout is None else recv_timeout
 
     async def send(self, message: str) -> None:
         await self._connection.send(message)
 
     async def recv(self) -> str:
-        frame = await self._connection.recv()
+        frame = await asyncio.wait_for(self._connection.recv(), timeout=self._recv_timeout)
         return frame.decode("utf-8") if isinstance(frame, bytes) else str(frame)
 
     async def close(self) -> None:
         await self._connection.close()
 
 
-async def _run(args: argparse.Namespace) -> int:
-    """Connect, exhibit once, print the summary. The only place a real socket is opened."""
+def _default_connect(ws_url: str) -> Any:
+    """Open the real connection. The ONLY place in this module that opens a socket.
+
+    Bounds the handshake explicitly rather than relying on defaults, matching
+    ``scripts/smoke_public_ws.py``'s ``_default_connect``.
+    """
     import websockets
 
-    async with websockets.connect(args.ws_url) as connection:
-        summary = await exhibit_one_signal(
-            _WebsocketsTransport(connection),
-            args.chain_index,
-            data_dir=args.data_dir,
-            dry_run=args.dry_run,
-        )
-    print(json.dumps(summary.render(), indent=2, sort_keys=True))
+    return websockets.connect(ws_url, open_timeout=OPEN_TIMEOUT_S, close_timeout=CLOSE_TIMEOUT_S)
+
+
+async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory = _default_connect) -> int:
+    """Connect, exhibit once, print the summary.
+
+    ``connect_factory`` is INJECTED for the same reason ``handoff`` is, and the omission was a real
+    gap rather than a style point. While the connection was resolved by a function-local
+    ``import websockets``, the only way to intercept it was global ``sys.modules`` state — so
+    "no real socket is opened" rested on every future test remembering to patch it, with no
+    structural backstop, and three decision points here were disclosed as unbindable when they were
+    merely un-injected. ``scripts/smoke_public_ws.py`` already ships this seam
+    (``connect_factory: ConnectFactory = _default_connect``); H2.5 simply had not picked it up.
+    """
+    summary: ExhibitionSummary | None = None
+    try:
+        async with connect_factory(args.ws_url) as connection:
+            summary = await exhibit_one_signal(
+                _WebsocketsTransport(connection),
+                args.chain_index,
+                data_dir=args.data_dir,
+                dry_run=args.dry_run,
+            )
+    except Exception as error:
+        # `summary` is bound only once `exhibit_one_signal` has RETURNED, which it cannot do before
+        # the handoff has fired. So a live `summary` here means the failure is the connection
+        # teardown — inside the may-have-published window — rather than the connect or the
+        # exhibition itself. `PostHandoffError` passes through unchanged; it already says so.
+        if summary is not None and not isinstance(error, PostHandoffError):
+            raise PostHandoffError(error) from error
+        raise
+
+    try:
+        print(json.dumps(summary.render(), indent=2, sort_keys=True))
+    except Exception as error:
+        raise PostHandoffError(error) from error
     return exit_status(summary)
 
 
@@ -289,6 +380,16 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return asyncio.run(_run(args))
+    except PostHandoffError as error:
+        # A DIFFERENT SENTENCE, because the operator's correct next action is different. "refused"
+        # invites the documented REST fallback; after the handoff has fired that fallback would
+        # open a SECOND trial for one signal. This line tells them to check before acting.
+        print(
+            f"refused AFTER handoff: {error} -- a live trial MAY ALREADY EXIST for this signal; "
+            "check the data dir before opening a REST-sourced one",
+            file=sys.stderr,
+        )
+        return 1
     except Exception as error:
         print(f"refused: {type(error).__name__}: {error}", file=sys.stderr)
         return 1

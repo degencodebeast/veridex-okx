@@ -1,8 +1,11 @@
+import ast
+import asyncio
 import functools
 import inspect
 import json
 import math
 import sys
+import time
 from importlib import util as importlib_util
 from pathlib import Path
 
@@ -1030,6 +1033,11 @@ WS_CHANNEL_ON_THE_WIRE = "dex-market-new-signal-openapi"
 #: instead of the argument would be visible (the C21 pin's lesson, applied to the WS op).
 WS_CHAIN_INDEX = "501"
 
+#: Outer bound the timeout tests impose on THEMSELVES, so an unbounded subject fails fast instead
+#: of hanging the run. Comfortably longer than the transport bounds under test, so it only fires
+#: when the subject imposed nothing.
+OUTER_SAFETY_NET_S = 3.0
+
 
 class RecordingWS:
     """A scripted, in-memory WS conversation. Records what was sent and how often it was closed.
@@ -1213,6 +1221,39 @@ async def test_subscribe_one_signal_refuses_anything_that_is_not_a_signal_PUSH_f
         await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
 
     assert ws.closed == 1
+
+
+async def test_a_NON_LIST_data_is_refused_AS_A_DATA_PROBLEM_not_as_a_bad_row():
+    """`data` must be a LIST, and that clause is pinned independently of the non-empty one.
+
+    FOUND BY THE CORRECTED LEDGER, not by reading. `_ws_signal`'s guard is a conjunction —
+    `not isinstance(data, list) or not data` — and the old per-line ledger called the whole line
+    BOUND because one mutant on it was killed. Only the `or not data` half was measured. A mutant
+    dropping the `isinstance` half SURVIVED the entire suite.
+
+    It survived because the frame is still refused, just for the wrong reason and one step later:
+    a string `data` is truthy, so it passes the mutated guard, `data[0]` takes its first CHARACTER,
+    and the row-shape check rejects that. Every existing test asserted only `pytest.raises(
+    OKXResponseError)`, which cannot tell "this push had no data list" from "this row was not an
+    object". Asserting WHICH refusal fired is what separates them — a diagnostic that names the
+    wrong cause sends an operator to the wrong wire contract.
+    """
+    ws = RecordingWS([json.dumps({"arg": _ws_arg(), "data": "not-a-list"})])
+
+    with pytest.raises(OKXResponseError) as excinfo:
+        await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    message = str(excinfo.value)
+    assert "'data'" in message and "list" in message, f"refused for the wrong reason: {message}"
+    assert "JSON object" not in message, "this is a data-list failure, not a row-shape failure"
+    assert ws.closed == 1
+
+    # DISCRIMINATION: the row-shape refusal still says its own thing, so the two diagnostics are
+    # genuinely distinguishable rather than both matching whatever this test asserts.
+    row_ws = RecordingWS([json.dumps({"arg": _ws_arg(), "data": ["not-an-object"]})])
+    with pytest.raises(OKXResponseError) as row_error:
+        await okx_client.subscribe_one_signal(row_ws, WS_CHAIN_INDEX)
+    assert "JSON object" in str(row_error.value)
 
 
 async def test_subscribe_one_signal_refuses_a_push_frame_from_a_DIFFERENT_channel():
@@ -1584,6 +1625,287 @@ def test_main_REFUSES_cleanly_when_the_connection_fails(monkeypatch, capsys, fai
     assert ("_FakeWSError" in captured.err) or ("ModuleNotFoundError" in captured.err)
 
 
+async def test_the_real_transport_BOUNDS_recv_and_does_not_wait_forever():
+    """MAJOR-Q2. `_WebsocketsTransport` is the repo's ONLY real `WSTransport`, and it must honour
+    the receive-timeout MUST that `WSTransport`'s own docstring states.
+
+    It previously did not: `recv` was a bare `await`. That made the module's stated MUST false at
+    the one place it applied, and `_ws_converse` has no frame budget BY DESIGN precisely because
+    the transport was supposed to carry the bound. Measured against websockets 15.0.1,
+    `ClientConnection.recv` has signature `(self, decode)` — NO timeout parameter — so the bound
+    can only be imposed by the caller. `connect()`'s keepalive detects a DEAD peer; a peer that is
+    ALIVE and answering Pings while pushing no signal blocks `recv` with nothing to interrupt it.
+    On the H6.1 demo path that is a hung terminal in front of an audience.
+
+    NO SOCKET: the connection is a fake whose `recv` never completes.
+    """
+    module = _ws_exhibition_module()
+
+    class NeverAnswers:
+        def __init__(self):
+            self.recv_calls = 0
+
+        async def recv(self):
+            self.recv_calls += 1
+            await asyncio.Event().wait()  # never set: blocks until cancelled by the timeout
+
+        async def send(self, message):
+            pass
+
+        async def close(self):
+            pass
+
+    connection = NeverAnswers()
+    transport = module._WebsocketsTransport(connection, recv_timeout=0.05)
+
+    # THE ASSERTION IS ON ELAPSED TIME, NOT MERELY ON THE EXCEPTION TYPE, and that is forced by
+    # what the defect actually is. If the transport imposes no bound, `recv` waits FOREVER — so a
+    # bare `pytest.raises(TimeoutError): await transport.recv()` does not fail against the
+    # unbounded version, it HANGS, and a hung drill reports nothing at all. Measured: that is
+    # exactly what happened, and it is the defect demonstrating itself.
+    #
+    # So the test carries its own outer safety net and then checks WHICH bound fired. Under the
+    # real code the transport's own 0.05s expires; under an unbounded `recv` the 3s net fires and
+    # the elapsed-time assertion kills it in three seconds instead of never.
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(transport.recv(), timeout=OUTER_SAFETY_NET_S)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < OUTER_SAFETY_NET_S / 2, (
+        f"recv took {elapsed:.2f}s: the transport imposed no bound of its own and the test's outer "
+        "safety net is what stopped it — which is the unbounded-wait defect, not a passing test"
+    )
+    assert connection.recv_calls == 1, "the bound must apply to the recv that actually blocked"
+
+    # ACCEPTANCE CONTROL: the bound does not simply reject everything. A connection that ANSWERS
+    # returns its frame through the same wrapper, so the timeout discriminates between a quiet
+    # socket and a working one rather than failing closed on both.
+    class Answers(NeverAnswers):
+        async def recv(self):
+            return "pong"
+
+    assert await module._WebsocketsTransport(Answers(), recv_timeout=5.0).recv() == "pong"
+
+    # ...and bytes still decode at this edge, which is the adapter's other job.
+    class AnswersBytes(NeverAnswers):
+        async def recv(self):
+            return b"pong"
+
+    assert await module._WebsocketsTransport(AnswersBytes(), recv_timeout=5.0).recv() == "pong"
+
+
+async def test_a_TimeoutError_from_the_transport_reaches_the_operator_as_a_clean_refusal():
+    """The bound is only useful if its expiry becomes the documented `refused:` line.
+
+    A timeout that surfaced as a traceback would trade one bad demo state for another. `main`'s
+    broad `except Exception` renders `TimeoutError` correctly, and this pins that end to end
+    through the injected connect factory — no socket, no `sys.modules` patching.
+    """
+    module = _ws_exhibition_module()
+
+    class NeverAnswersConn:
+        async def recv(self):
+            await asyncio.Event().wait()
+
+        async def send(self, message):
+            pass
+
+        async def close(self):
+            pass
+
+    class _Ctx:
+        async def __aenter__(self):
+            return NeverAnswersConn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch_timeout = 0.05
+    original = module.RECV_TIMEOUT_S
+    module.RECV_TIMEOUT_S = monkeypatch_timeout
+    try:
+        # Self-bounded for the same reason as the transport test above: with no bound in the
+        # subject this awaits forever and HANGS the run rather than failing it. The elapsed-time
+        # assertion is what distinguishes "the transport's own bound fired" from "the test's
+        # safety net did".
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                module._run(
+                    module.build_parser().parse_args(
+                        ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+                    ),
+                    connect_factory=lambda _url: _Ctx(),
+                ),
+                timeout=OUTER_SAFETY_NET_S,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        module.RECV_TIMEOUT_S = original
+
+    assert elapsed < OUTER_SAFETY_NET_S / 2, (
+        f"_run took {elapsed:.2f}s: the transport imposed no bound and the test's net stopped it"
+    )
+
+
+async def test_run_takes_an_INJECTED_connect_factory_so_no_test_needs_sys_modules():
+    """MINOR-Q3. The connection is injected, like the handoff already was.
+
+    While `_run` resolved `websockets` by a function-local import, the ONLY interception point was
+    global `sys.modules` state — so "no real socket" rested on every future test remembering to
+    patch it, with no structural backstop, and three decision points here were disclosed as
+    "unbindable without real I/O" when they were merely un-injected. `scripts/smoke_public_ws.py`
+    already ships this seam; H2.5 had not picked it up.
+
+    `Handoff` was the counter-example proving the point: everything above the injected handoff was
+    unit-tested, and `connect` simply had not been given the same treatment.
+    """
+    module = _ws_exhibition_module()
+
+    assert "connect_factory" in inspect.signature(module._run).parameters
+    assert module._run.__kwdefaults__["connect_factory"] is module._default_connect
+
+    calls = []
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def factory(url):
+        calls.append(url)
+        return _Ctx()
+
+    handoff_calls = []
+    module_handoff = getattr(module, "_subprocess_handoff")
+
+    def fake_handoff(argv, stdin_text):
+        handoff_calls.append((argv, stdin_text))
+        return 0
+
+    args = module.build_parser().parse_args(
+        ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x", "--dry-run"]
+    )
+    module._subprocess_handoff = fake_handoff
+    try:
+        status = await module._run(args, connect_factory=factory)
+    finally:
+        module._subprocess_handoff = module_handoff
+
+    assert calls == ["wss://example.invalid"], "the factory must receive the operator's URL"
+    assert status == 0
+    assert handoff_calls and "--dry-run" in handoff_calls[0][0]
+
+
+class _ScriptedConn:
+    """A fake websockets connection: replays text frames, records nothing else. Never a socket."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    async def send(self, message):
+        pass
+
+    async def recv(self):
+        if not self.frames:
+            raise AssertionError("the subscriber asked for more frames than the script holds")
+        return self.frames.pop(0)
+
+    async def close(self):
+        pass
+
+
+async def test_a_failure_AFTER_the_handoff_says_so_because_the_operator_acts_differently():
+    """MINOR-Q5. `refused:` and `refused AFTER handoff:` are different instructions.
+
+    The module tells an operator that a `refused:` line means "fall back to a REST-sourced trial
+    and say so". That is right for a failure BEFORE the handoff, when nothing was published.
+    Applied to a failure AFTER it, the same advice opens a SECOND live trial for one signal — one
+    labelled `ws`, one labelled `rest`. The window is small (the summary construction, the
+    connection teardown, the final print) but the docstring makes a guarantee about what `refused:`
+    MEANS, and nothing enforced it.
+    """
+    module = _ws_exhibition_module()
+
+    class _Boom:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            raise RuntimeError("connection teardown failed after the child was spawned")
+
+    def fake_handoff(argv, stdin_text):
+        return 0
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = fake_handoff
+    try:
+        with pytest.raises(module.PostHandoffError) as excinfo:
+            await module._run(
+                module.build_parser().parse_args(
+                    ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+                ),
+                connect_factory=lambda _url: _Boom(),
+            )
+    finally:
+        module._subprocess_handoff = original
+
+    assert "teardown failed" in str(excinfo.value)
+
+    # THE SECOND WINDOW, and my own drill is why it is here. A mutant that stripped the
+    # `PostHandoffError` wrapper from `exhibit_one_signal`'s TAIL survived the whole suite: the
+    # test above only ever exercised the `_run` teardown window, so the summary-construction
+    # window — which is the FIRST thing to run after the child is spawned — was unmeasured. Two
+    # windows, one property; measuring one and claiming the property is the ledger defect again.
+    handoff_fired = []
+
+    def _recording_handoff(argv, stdin_text):
+        handoff_fired.append(argv)
+        return 0
+
+    def _boom(_signal):
+        raise RuntimeError("evidence hashing failed after the child was spawned")
+
+    original_hash = module.evidence_hash
+    module.evidence_hash = _boom
+    try:
+        with pytest.raises(module.PostHandoffError) as tail:
+            await module.exhibit_one_signal(
+                RecordingWS([_ws_push(H22_WS)]),
+                WS_CHAIN_INDEX,
+                data_dir="/tmp/x",
+                handoff=_recording_handoff,
+            )
+    finally:
+        module.evidence_hash = original_hash
+
+    assert handoff_fired, "the guard is only meaningful once the handoff has actually fired"
+    assert "evidence hashing failed" in str(tail.value)
+
+    # DISCRIMINATION: a failure BEFORE the handoff must NOT be labelled post-handoff, or the new
+    # message is just the old one in different words and tells the operator nothing.
+    class _FailsBeforeHandoff:
+        async def __aenter__(self):
+            return _ScriptedConn(['{"code":"0","data":[]}'])  # refused by the channel check
+
+        async def __aexit__(self, *exc):
+            return False
+
+    with pytest.raises(Exception) as before:
+        await module._run(
+            module.build_parser().parse_args(
+                ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+            ),
+            connect_factory=lambda _url: _FailsBeforeHandoff(),
+        )
+    assert not isinstance(before.value, module.PostHandoffError), (
+        "a pre-handoff refusal must keep the ordinary message; nothing was published"
+    )
+
+
 def test_main_refusal_control_the_fake_really_does_prevent_a_connection(monkeypatch):
     """ACCEPTANCE CONTROL for the test above: prove the injection is what stops the socket.
 
@@ -1626,6 +1948,74 @@ async def test_a_REST_envelope_on_the_ws_wire_produces_NO_record_at_all():
     assert handoff.calls == [], "a refused frame must not reach the open-trial handoff"
 
 
+async def test_DRY_RUN_travels_the_whole_edge_and_publishes_nothing():
+    """`--dry-run` end to end THROUGH `exhibit_one_signal`, not at the argv boundary.
+
+    ADDED BECAUSE FOUR SINGLE-TOKEN MUTANTS SURVIVED THE WHOLE SUITE. `--dry-run` was exercised
+    only by DIRECT calls to `build_handoff_argv`, so the FORWARDING EDGE from `exhibit_one_signal`
+    into it was never travelled. The operationally serious survivor hard-coded `dry_run=False` at
+    that call site: an operator types `--dry-run`, `open_live_trial.py` publishes a REAL live
+    trial, the printed summary still says `"dry_run": true`, and 797 tests passed.
+
+    That is the honesty failure this whole task exists to prevent, arriving through the one flag
+    whose entire purpose is "publish nothing".
+
+    Each assertion below is a separate mutant's grave, and they are not redundant:
+      argv carries --dry-run   -> kills the severed forwarding edge (the child would really publish)
+      summary.dry_run is True  -> kills a constant on the record (the summary would lie about itself)
+      published is False       -> kills dropping `and not self.dry_run` from the honesty guard
+      exit_status == 0         -> pins the branch `exit_status`'s docstring claims: a dry run is a
+                                  SUCCESS, so a shell driving this must not read it as a failure
+    """
+    summary, handoff, _ = await _exhibit([_ws_push(H22_WS)], dry_run=True)
+    module = _ws_exhibition_module()
+
+    argv, _stdin = handoff.calls[0]
+    assert "--dry-run" in argv, "the flag never reached the child; it would publish for real"
+    assert summary.dry_run is True
+    assert summary.published is False, "a dry run published nothing and must never claim otherwise"
+    assert summary.render()["dry_run"] is True
+    assert summary.render()["published"] is False
+    assert module.exit_status(summary) == 0, "a dry run is a SUCCESS; nothing was meant to publish"
+
+
+async def test_published_is_TRUE_on_the_ordinary_path_so_the_guard_is_pinned_BOTH_ways():
+    """The other direction of `published`, without which the property is half-measured.
+
+    `published` was asserted False exactly once, on the failed-handoff path, and True nowhere at
+    all. A one-directional assertion cannot tell a working guard from a CONSTANT: a mutant making
+    `published` return a constant `False` survived the entire suite, because nothing ever required
+    it to be True. Pinning both directions is what makes the assertion evidence rather than a
+    coincidence — the same acceptance/discrimination split this file applies elsewhere.
+    """
+    summary, _, _ = await _exhibit([_ws_push(H22_WS)])
+
+    assert summary.dry_run is False
+    assert summary.handoff_status == 0
+    assert summary.published is True, "a real run with a successful handoff DID publish"
+    assert summary.render()["published"] is True
+
+
+async def test_published_is_false_if_EITHER_reason_holds_and_the_two_are_independent():
+    """`published` is a conjunction, and a per-line ledger cannot see that.
+
+    The rule "L100 is bound by a killed mutant" was recorded as satisfied while only the
+    `handoff_status` clause was measured. A two-clause conjunction hosts TWO independent
+    behaviours at one line number, so a per-line accounting reports 100% and means 50%. All four
+    combinations are walked here so neither clause can be dropped unnoticed.
+    """
+    module = _ws_exhibition_module()
+    Summary = module.ExhibitionSummary
+
+    def _summary(status, dry):
+        return Summary(evidence_hash="h", evidence_fields=("a",), handoff_status=status, dry_run=dry)
+
+    assert _summary(0, False).published is True, "the only combination that publishes"
+    assert _summary(1, False).published is False, "the handoff refused"
+    assert _summary(0, True).published is False, "a dry run publishes nothing"
+    assert _summary(1, True).published is False, "both reasons at once"
+
+
 async def test_a_nonzero_handoff_status_is_reported_and_not_swallowed():
     """If `open_live_trial.py` refuses the capture, the exhibition must say so.
 
@@ -1638,6 +2028,31 @@ async def test_a_nonzero_handoff_status_is_reported_and_not_swallowed():
     assert summary.handoff_status == 1
     assert summary.published is False
     assert module.exit_status(summary) != 0
+
+
+def _reads_environment(source: str) -> set[str]:
+    """Return the environment-reading constructs `source` actually CONTAINS, by parsing it.
+
+    Structural, so a docstring or comment mentioning `os.getenv` contributes nothing: comments are
+    not in the tree at all, and a string literal is an `ast.Constant`, never a `Name` or a call.
+
+    Covers the routes a credential read can actually arrive by — `import os` at any scope
+    (including inside a function, the idiom `ws_exhibition.py` itself uses for `websockets`),
+    `from os import ...`, attribute access such as `os.environ` / `os.getenv`, and a bare `getenv`
+    bound by a from-import.
+    """
+    tree = ast.parse(source)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found |= {f"import {a.name}" for a in node.names if a.name.split(".")[0] == "os"}
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "os":
+            found |= {f"from os import {a.name}" for a in node.names}
+        elif isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+            found.add(f".{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in ("environ", "getenv"):
+            found.add(node.id)
+    return found
 
 
 def test_the_exhibition_script_reads_NO_credential_from_the_environment(monkeypatch):
@@ -1657,14 +2072,38 @@ def test_the_exhibition_script_reads_NO_credential_from_the_environment(monkeypa
     for name, value in sentinels.items():
         monkeypatch.setenv(name, value)
 
-    # The predicate is the MECHANISM, not the spelling. An earlier draft asserted that the variable
-    # NAMES never appear in the source, which flagged the module docstring's own explanation that it
-    # does not read them — a predicate that fires on documentation is measuring the wrong thing.
-    # What "reads no credential" actually means is that no environment read exists at all.
-    source = inspect.getsource(module)
-    assert not hasattr(module, "os"), "the exhibition script imported `os`; it has no environment to read"
-    for reader in ("environ", "getenv"):
-        assert reader not in source, f"the exhibition script calls {reader}; it has no use for credentials"
+    # THE PREDICATE IS THE AST, NOT THE TEXT — and the previous version of this comment claimed
+    # exactly that while still scanning text. `inspect.getsource` returns every docstring and
+    # comment in the file, so `assert "getenv" not in source` accused the script of calling
+    # `getenv` on the strength of a COMMENT SAYING IT NEVER DOES. Measured: adding one comment line
+    # (`# NOTE: this script never calls os.getenv for a credential.`) produced a file whose
+    # `ast.dump` was IDENTICAL — provably no behaviour change — and turned this test red.
+    #
+    # Twice now the fix changed the words being scanned rather than the class of the scan. Parsing
+    # is what actually distinguishes a call from a sentence about a call.
+    assert _reads_environment(inspect.getsource(module)) == set(), (
+        "the exhibition script reads the environment; it has no use for credentials"
+    )
+
+    # `hasattr(module, "os")` is retained but is NOT the guard — a function-local `import os` never
+    # binds a module attribute, and this file demonstrates that idiom itself. The AST walk above
+    # sees a function-local import; this line only catches the top-level case.
+    assert not hasattr(module, "os")
+
+    # ACCEPTANCE CONTROL, which this test previously had none of. A predicate that returns the empty
+    # set for everything would pass above and measure nothing. Each of these synthetic modules reads
+    # the environment by a DIFFERENT route, including the function-local import the real module's
+    # own style makes plausible.
+    for label, snippet in (
+        ("top-level import + environ", "import os\nKEY = os.environ['OKX_API_KEY']\n"),
+        ("top-level import + getenv", "import os\ndef f():\n    return os.getenv('OKX_API_KEY')\n"),
+        ("function-local import", "def f():\n    import os\n    return os.environ.get('OKX_API_KEY')\n"),
+        ("from-import", "from os import getenv\ndef f():\n    return getenv('OKX_API_KEY')\n"),
+    ):
+        assert _reads_environment(snippet), f"the predicate cannot detect: {label}"
+
+    # ...and it does NOT fire on prose about the environment, which is the whole point.
+    assert _reads_environment("# this module never calls os.getenv\n'''os.environ is not read'''\n") == set()
 
     rendered = json.dumps(module.build_handoff_argv(data_dir="/tmp/x", dry_run=False))
     for value in sentinels.values():
