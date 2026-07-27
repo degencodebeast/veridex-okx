@@ -1947,14 +1947,15 @@ class _FailsFirstWrite(io.StringIO):
     for a signal whose child has already started AND returned.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, exc_factory=BrokenPipeError) -> None:
         super().__init__()
         self.failed_first = False
+        self._exc_factory = exc_factory
 
     def write(self, text: str) -> int:
         if not self.failed_first:
             self.failed_first = True
-            raise BrokenPipeError("first post-handoff warning write failed")
+            raise self._exc_factory("first post-handoff write failed")
         return super().write(text)
 
 
@@ -2355,16 +2356,21 @@ class _Teardown:
     the failure being studied is somewhere else.
     """
 
-    MODES = ("raises", "suppresses", "passes")
+    MODES = ("raises", "suppresses", "passes", "interrupts")
 
-    def __init__(self, frames, mode):
+    def __init__(self, frames, mode, *, connection=None):
         assert mode in self.MODES, f"unknown teardown mode {mode!r}"
         self._frames = frames
         self._mode = mode
+        self._connection = connection
         self.calls = 0
         self.saw = None
 
     async def __aenter__(self):
+        # `connection` is for the cases whose failure is in the WS conversation itself rather than
+        # in the frames it replays -- a PRE-handoff interrupt, for instance.
+        if self._connection is not None:
+            return self._connection()
         return _ScriptedConn(list(self._frames))
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -2372,6 +2378,9 @@ class _Teardown:
         self.saw = exc_type
         if self._mode == "raises":
             raise RuntimeError("connection teardown also failed")
+        if self._mode == "interrupts":
+            # A teardown that is itself interrupted -- the `BaseException` twin of `"raises"`.
+            raise KeyboardInterrupt
         return self._mode == "suppresses"
 
 
@@ -2625,6 +2634,283 @@ def test_the_post_handoff_chain_walk_is_COMPLETE_over_both_links():
     a.__context__ = b
     b.__context__ = a
     assert walk(a) is None
+
+
+class _MainOutcome:
+    """Everything one `main` invocation produced, INCLUDING what escaped it.
+
+    `_MainResult` records a status and stderr, which presumes `main` returned. The whole point of
+    the `BaseException` family is that sometimes it must NOT return -- Ctrl-C has to stay Ctrl-C --
+    so the thing that escaped is evidence too, and a runner that cannot see it cannot tell
+    "swallowed the interrupt" from "warned and re-raised".
+    """
+
+    def __init__(self, status, err, escaped):
+        self.status = status
+        self.err = err
+        self.escaped = escaped
+
+
+def _main_outcome(module, *, ctx, dry_run, handoff):
+    """Run `main` over an injected connection and handoff, recording a return OR an escape."""
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    if dry_run:
+        argv.append("--dry-run")
+    original = module._subprocess_handoff
+    module._subprocess_handoff = handoff
+    buffer = io.StringIO()
+    status, escaped = None, None
+    try:
+        with contextlib.redirect_stderr(buffer):
+            status = module.main(argv, connect_factory=lambda _url: ctx)
+    except BaseException as error:  # noqa: BLE001 - what ESCAPES main is the measurement
+        escaped = error
+    finally:
+        module._subprocess_handoff = original
+    return _MainOutcome(status, buffer.getvalue(), escaped)
+
+
+def _sentence_class(module, err):
+    """Classify the operator-facing stderr into the three sentences this program can produce."""
+    if err.startswith("refused AFTER handoff:") and module.INDETERMINATE_WARNING in err:
+        return "AFTER+warn"
+    if err.startswith("refused: "):
+        return "ordinary"
+    if err == "":
+        return "silent"
+    return f"other({err!r})"
+
+
+def test_a_BASE_EXCEPTION_after_the_handoff_still_reaches_the_operator_as_post_handoff():
+    """SPEC R4 MAJOR-2 -- the NINTH instance, and the first carried by `BaseException`.
+
+    MAJOR-1 with `KeyboardInterrupt` substituted for `PostHandoffError`. `exhibit_one_signal`
+    marked the phase with `except Exception`, and `_run` recorded it with `except
+    PostHandoffError`; a SIGINT delivered while the child is running matches NEITHER, so the phase
+    was never recorded. If `__aexit__` then raised, the `RuntimeError` REPLACED the interrupt --
+    and a `RuntimeError` IS an `Exception`, so it was caught, fell through the arbitration, and the
+    chain walk found only a `KeyboardInterrupt`. The operator got `refused: RuntimeError: teardown
+    failed` over a child that may already have published.
+
+    I DISCLOSED THE WEAKER FORM OF THIS AND THAT IS THE LESSON. My report called it "a traceback
+    and no indeterminate warning", which is true only with a CLEAN `__aexit__`. Composed with the
+    failing teardown that this whole round was about, it is not a missing sentence but the
+    affirmatively WRONG one -- the pre-handoff refusal, which invites the REST fallback. A
+    disclosure is only as good as its worst case, and I had not composed my gap with the failure
+    mode already in scope.
+
+    THE POPULATION MOVED AGAIN: statements -> paths -> `await` SUSPENSION POINTS. The R3 census
+    enumerated statement-boundary constructs and was correct for `Exception`; `BaseException`
+    enters at a suspension point, which that census did not cover.
+
+    THE CLASS, NOT ONE MEMBER. Rows are run for `KeyboardInterrupt` and `SystemExit` both, because
+    the claim is about `BaseException` and a guard must be expressed in the units of its claim.
+
+    NO SOCKET: the connection is injected and the handoff is a function; nothing is spawned.
+    """
+    module = _ws_exhibition_module()
+    started = []
+
+    def _interrupted(exc_factory):
+        def _handoff(_argv, _stdin):
+            started.append(_argv)
+            raise exc_factory()
+
+        return _handoff
+
+    def _succeeds(_argv, _stdin):
+        started.append(_argv)
+        return 0
+
+    def _never_reached(_argv, _stdin):
+        started.append(_argv)
+        raise AssertionError("a pre-handoff interrupt must never reach the handoff")
+
+    def _interrupted_send(exc_factory):
+        """A connection interrupted during the SUBSCRIBE, which is before anything is spawned.
+
+        The interrupt lands on `send` rather than `recv` deliberately. `recv` is wrapped in
+        `asyncio.wait_for`, which runs the awaited coroutine in a NESTED TASK, and `Task.__step`
+        re-raises `KeyboardInterrupt`/`SystemExit` into the event loop instead of returning them
+        through the awaiting frame -- so the interrupt bypasses the `async with` entirely and the
+        teardown mode stops meaning anything. That is asyncio's behaviour, not this program's, and
+        a row whose outcome is decided by it would be measuring the wrong subject. `send` is on the
+        ordinary coroutine path, so the three teardown modes discriminate as designed.
+        """
+
+        class _SendInterrupted:
+            async def send(self, message):
+                raise exc_factory()
+
+            async def recv(self):
+                raise AssertionError("the subscribe never completed; recv must not be reached")
+
+            async def close(self):
+                pass
+
+        return lambda: _SendInterrupted()
+
+    push = [_ws_push(H22_WS)]
+    rows = {}
+    # label -> (frames, connection, mode, dry_run, handoff)
+    cases = {}
+    for exc_name, exc_factory in (("KeyboardInterrupt", KeyboardInterrupt), ("SystemExit", SystemExit)):
+        for mode in ("passes", "raises", "suppresses"):
+            cases[f"post-handoff {exc_name} + {mode}"] = (push, None, mode, False, _interrupted(exc_factory))
+            cases[f"PRE-handoff {exc_name} + {mode}"] = (
+                push, _interrupted_send(exc_factory), mode, False, _never_reached,
+            )
+    # The hole the compound case exposes from the other side: the child SUCCEEDED, so a trial
+    # definitely exists, and the interrupt arrives during teardown instead of during the handoff.
+    cases["success then KeyboardInterrupt teardown"] = (push, None, "interrupts", False, _succeeds)
+    # Publication was impossible, so the ordinary refusal is the TRUE sentence.
+    cases["dry-run KeyboardInterrupt + raises"] = (push, None, "raises", True, _interrupted(KeyboardInterrupt))
+    cases["dry-run KeyboardInterrupt + passes"] = (push, None, "passes", True, _interrupted(KeyboardInterrupt))
+
+    for label, (frames, connection, mode, dry_run, handoff) in cases.items():
+        ctx = _Teardown(frames, mode, connection=connection)
+        outcome = _main_outcome(module, ctx=ctx, dry_run=dry_run, handoff=handoff)
+        rows[label] = (
+            _sentence_class(module, outcome.err),
+            type(outcome.escaped).__name__ if outcome.escaped is not None else None,
+        )
+        assert ctx.calls == 1, f"{label}: the reproduction requires the teardown to have run"
+
+    expected = {}
+    for exc_name in ("KeyboardInterrupt", "SystemExit"):
+        # A CLEAN teardown lets the interrupt out, so the operator gets the instruction AND the
+        # process still dies by interrupt. A failing or suppressing teardown has already destroyed
+        # the interrupt before `main` sees anything, so `main` returns 1 as it does for any refusal.
+        expected[f"post-handoff {exc_name} + passes"] = ("AFTER+warn", exc_name)
+        expected[f"post-handoff {exc_name} + raises"] = ("AFTER+warn", None)
+        expected[f"post-handoff {exc_name} + suppresses"] = ("AFTER+warn", None)
+        # DISCRIMINATION: nothing was spawned, so no sentence may claim a trial might exist.
+        expected[f"PRE-handoff {exc_name} + passes"] = ("silent", exc_name)
+        expected[f"PRE-handoff {exc_name} + raises"] = ("ordinary", None)
+        expected[f"PRE-handoff {exc_name} + suppresses"] = ("ordinary", None)
+    expected["success then KeyboardInterrupt teardown"] = ("AFTER+warn", "KeyboardInterrupt")
+    expected["dry-run KeyboardInterrupt + raises"] = ("ordinary", None)
+    expected["dry-run KeyboardInterrupt + passes"] = ("silent", "KeyboardInterrupt")
+
+    assert rows == expected, rows
+    assert len(started) == len(cases) - 6, "every non-pre-handoff row must actually have begun the handoff"
+
+
+def test_CTRL_C_after_the_handoff_warns_and_STILL_terminates_as_an_interrupt():
+    """The instruction must not be bought with Ctrl-C's meaning.
+
+    Converting a `KeyboardInterrupt` into an ordinary refusal would emit the right sentence and
+    silently take Ctrl-C away -- an operator who interrupts a demo would get exit 1 and a program
+    that claims it merely "refused". So `main` prints the instruction and RE-RAISES the original.
+
+    The `refused:`/`refused AFTER handoff:` split exists because the operator's next ACTION
+    differs; the interrupt's meaning is a second thing they rely on, and both are kept.
+    """
+    module = _ws_exhibition_module()
+
+    def _interrupted(_argv, _stdin):
+        raise KeyboardInterrupt
+
+    outcome = _main_outcome(
+        module, ctx=_Teardown([_ws_push(H22_WS)], "passes"), dry_run=False, handoff=_interrupted
+    )
+
+    assert isinstance(outcome.escaped, KeyboardInterrupt), (
+        f"the interrupt was swallowed; escaped={outcome.escaped!r} status={outcome.status!r}"
+    )
+    assert outcome.status is None, "main must not return a status for an interrupt it re-raises"
+    assert outcome.err.startswith("refused AFTER handoff:"), f"got {outcome.err!r}"
+    assert module.INDETERMINATE_WARNING in outcome.err
+
+    # ...AND THE LINE SAYS SOMETHING. `str(KeyboardInterrupt())` is the EMPTY STRING, so a naive
+    # `f"{type(e).__name__}: {e}"` renders `KeyboardInterrupt: ` -- a refusal whose detail is a
+    # bare colon, which is the defect `_WebsocketsTransport.recv`'s docstring already records for
+    # `TimeoutError`. The detail is the type alone when there is no message.
+    detail = outcome.err.split(" -- ", 1)[0]
+    assert detail == "refused AFTER handoff: KeyboardInterrupt", f"got {detail!r}"
+
+
+def test_an_INTERRUPT_in_the_TAIL_after_the_child_returned_is_still_post_handoff():
+    """The third boundary, which had the same `Exception` width as the other two.
+
+    Everything in `_run`'s tail runs after the child has started AND returned, so a failure there
+    is post-handoff by construction — that was settled in round 3. But the boundary enclosing it
+    caught `Exception`, so an interrupt landing on the very print that carries the indeterminate
+    warning escaped it, exactly as one landing in the handoff did. I found this while choosing
+    mutants rather than from the verdict: the two boundaries the verdict named were fixed and this
+    one would have been left one clause narrower than its siblings.
+
+    BOTH HALVES, because the tail is also where the dry-run exemption changed. A `--dry-run` tail
+    failure published nothing, so it must NOT warn.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    original = module._subprocess_handoff
+    module._subprocess_handoff = lambda _argv, _stdin: 120  # published, then failed to print
+
+    # THE INTERRUPT LANDS ON THE WARNING PRINT ITSELF. First write raises, later writes succeed, so
+    # `main`'s own refusal line still reaches the operator through the same stream.
+    stderr = _FailsFirstWrite(KeyboardInterrupt)
+    try:
+        with contextlib.redirect_stderr(stderr), pytest.raises(KeyboardInterrupt):
+            module.main(argv, connect_factory=lambda _url: _Teardown([_ws_push(H22_WS)], "passes"))
+    finally:
+        module._subprocess_handoff = original
+
+    assert stderr.failed_first, "the reproduction is only valid if the first write actually failed"
+    err = stderr.getvalue()
+    assert err.startswith("refused AFTER handoff:"), f"got {err!r}"
+    assert module.INDETERMINATE_WARNING in err
+
+    # DISCRIMINATION: the same interrupt, in the same tail, under `--dry-run`. The child was
+    # invoked with `--dry-run` and wrote nothing, so the ordinary outcome is the true one.
+    dry_stdout = _FailsFirstWrite(KeyboardInterrupt)
+    dry_stderr = io.StringIO()
+    module._subprocess_handoff = lambda _argv, _stdin: 0
+    try:
+        with (
+            contextlib.redirect_stdout(dry_stdout),
+            contextlib.redirect_stderr(dry_stderr),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            module.main([*argv, "--dry-run"], connect_factory=lambda _url: _Teardown([_ws_push(H22_WS)], "passes"))
+    finally:
+        module._subprocess_handoff = original
+
+    assert dry_stdout.failed_first, "the dry-run half must also have executed a real failure"
+    assert module.INDETERMINATE_WARNING not in dry_stderr.getvalue(), (
+        f"a dry run published nothing; do not warn: {dry_stderr.getvalue()!r}"
+    )
+
+
+def test_the_post_handoff_marker_SPLICES_into_the_chain_without_replacing_the_exception():
+    """Why a `BaseException` is marked rather than converted, measured at the seam.
+
+    An `Exception` can be replaced by `PostHandoffError` because nothing downstream depends on its
+    identity. A `KeyboardInterrupt` cannot: replacing it is what swallows Ctrl-C. So the phase is
+    SPLICED into the exception's chain, where the existing walk already looks, and the exception
+    itself is re-raised unchanged.
+
+    The splice must not cost the context it displaces -- an interrupt raised while another failure
+    was being handled still has that failure to explain it -- so the previous `__context__` is
+    carried on the marker rather than dropped.
+    """
+    module = _ws_exhibition_module()
+
+    earlier = ValueError("the failure that was already being handled")
+    interrupt = KeyboardInterrupt()
+    interrupt.__context__ = earlier
+
+    module._splice_post_handoff(interrupt)
+
+    marker = module._post_handoff_in_chain(interrupt)
+    assert isinstance(marker, module.PostHandoffError), "the walk cannot find the spliced phase"
+    assert interrupt.__context__ is marker, "the marker must sit in the chain of the ORIGINAL"
+    assert marker.__context__ is earlier, "the displaced context was dropped rather than carried"
+    assert type(interrupt) is KeyboardInterrupt, "the exception's identity must be untouched"
+
+    # DISCRIMINATION: an unspliced interrupt is not post-handoff, or every interrupt would warn.
+    assert module._post_handoff_in_chain(KeyboardInterrupt()) is None
 
 
 async def test_a_failure_AFTER_the_handoff_says_so_because_the_operator_acts_differently():

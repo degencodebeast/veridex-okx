@@ -44,7 +44,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, NoReturn, Protocol
 
 from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, normalize_signal
 from veridex.signal_trials.okx_client import WS_SIGNAL_CHANNEL, WSTransport, subscribe_one_signal
@@ -258,6 +258,13 @@ async def exhibit_one_signal(
     #
     # `dry_run` is the only exemption, and it is a real one: the child is invoked with
     # `--dry-run`, writes nothing, so a failure there genuinely leaves nothing behind.
+    #
+    # `except BaseException`, and the WIDTH is the correction. It read `except Exception`, which is
+    # the whole exception hierarchy MINUS exactly the failures an operator causes: a `Ctrl-C`
+    # delivered while `subprocess.run` is inside the child raises `KeyboardInterrupt`, which is a
+    # `BaseException`, so the one interruption most likely to land in the middle of a live demo was
+    # the one this boundary did not cover. `_reraise_as_post_handoff` converts what may be
+    # converted and marks what may not, so Ctrl-C stays Ctrl-C.
     try:
         status = run_handoff(argv, payload)
         return ExhibitionSummary(
@@ -266,10 +273,8 @@ async def exhibit_one_signal(
             handoff_status=status,
             dry_run=dry_run,
         )
-    except Exception as error:
-        if dry_run:
-            raise
-        raise PostHandoffError(error) from error
+    except BaseException as error:
+        _reraise_as_post_handoff(error, dry_run=dry_run)
 
 
 def _post_handoff_in_chain(error: BaseException) -> PostHandoffError | None:
@@ -298,6 +303,64 @@ def _post_handoff_in_chain(error: BaseException) -> PostHandoffError | None:
             return current
         pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
     return None
+
+
+def _splice_post_handoff(error: BaseException) -> None:
+    """Record the post-handoff phase INSIDE ``error``'s chain, leaving ``error`` itself untouched.
+
+    **For the exceptions that must not be converted.** An ``Exception`` can be replaced by
+    ``PostHandoffError`` because nothing downstream depends on its identity. A ``KeyboardInterrupt``
+    cannot: replacing it is precisely what swallows Ctrl-C, turning an operator's interrupt into a
+    program that claims it merely "refused". ``SystemExit`` and ``CancelledError`` are the same
+    shape. So the fact is written into the chain — where :func:`_post_handoff_in_chain` already
+    looks — and the exception is re-raised as itself.
+
+    The displaced ``__context__`` is carried on the marker rather than dropped: an interrupt raised
+    while another failure was being handled still has that failure to explain it, and a phase
+    record bought by deleting the diagnosis would be trading one truth for another.
+
+    Idempotent, because the phase can be recognised at more than one boundary on the way out and a
+    second marker would add nothing but traceback noise.
+    """
+    if _post_handoff_in_chain(error) is not None:
+        return
+    marker = PostHandoffError(error)
+    marker.__context__ = error.__context__
+    error.__context__ = marker
+
+
+def _reraise_as_post_handoff(error: BaseException, *, dry_run: bool) -> NoReturn:
+    """Re-raise ``error`` carrying the post-handoff phase, whatever kind of exception it is.
+
+    THE ONE PLACE THE RULE IS SPELLED. Three boundaries in this module need it — the handoff region
+    in ``exhibit_one_signal``, the connect/teardown arbitration in ``_run``, and ``_run``'s tail —
+    and each previously spelled its own version. That is how the ninth instance of this lane's
+    class arrived: the handoff region said ``except Exception``, ``_run`` said
+    ``except PostHandoffError``, and a ``KeyboardInterrupt`` delivered while the child was running
+    matched neither, so the phase was never recorded at all.
+
+    ``dry_run`` is the single exemption and it is applied HERE for the same reason: the child was
+    invoked with ``--dry-run`` and wrote nothing, so the ordinary refusal is the TRUE sentence, and
+    a warning that fires when publication was impossible erodes the one that matters.
+    """
+    if dry_run:
+        raise error
+    if isinstance(error, Exception):
+        raise PostHandoffError(error) from error
+    _splice_post_handoff(error)
+    raise error
+
+
+def _describe(error: BaseException) -> str:
+    """``Type: message`` — or the type ALONE when the message is empty.
+
+    ``str(KeyboardInterrupt())`` is the empty string, and so is ``str(TimeoutError())``. Formatted
+    naively that renders ``refused: KeyboardInterrupt: `` — a refusal whose detail is a bare colon,
+    which is the defect ``_WebsocketsTransport.recv``'s docstring already records having been
+    measured once on the timeout path.
+    """
+    message = str(error)
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
 
 
 def _refuse_after_handoff(detail: str) -> int:
@@ -458,19 +521,24 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
                     data_dir=args.data_dir,
                     dry_run=args.dry_run,
                 )
-            except PostHandoffError:
-                handoff_may_have_started = True
+            except BaseException as error:
+                # `BaseException`, not `PostHandoffError`, and that width is the ninth instance's
+                # correction. A `KeyboardInterrupt` carries the phase in its CHAIN rather than in
+                # its type — it cannot be converted without swallowing Ctrl-C — so the question
+                # this clause asks is "does anything in the chain say post-handoff", which is true
+                # of a `PostHandoffError` trivially and of a marked interrupt equally.
+                if _post_handoff_in_chain(error) is not None:
+                    handoff_may_have_started = True
                 raise
-    except Exception as error:
+    except BaseException as error:
         if isinstance(error, PostHandoffError):
             raise
         # A live `summary` still means the same thing — the exhibition returned, so the child ran
-        # and only the teardown failed — EXCEPT under `--dry-run`, where the child was invoked with
-        # `--dry-run` and wrote nothing. That is the same exemption `exhibit_one_signal` already
-        # applies to its own raising path; stating it at one site and not the other is how two
-        # spellings of one rule drift apart.
-        if handoff_may_have_started or (summary is not None and not args.dry_run):
-            raise PostHandoffError(error) from error
+        # and only the teardown failed. The `--dry-run` exemption is not spelled here: it lives in
+        # `_reraise_as_post_handoff` with the other two boundaries, because stating one rule at
+        # three sites is how the three drift apart.
+        if handoff_may_have_started or summary is not None:
+            _reraise_as_post_handoff(error, dry_run=args.dry_run)
         raise
 
     if summary is None:
@@ -508,8 +576,8 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
                 file=sys.stderr,
             )
         return exit_status(summary)
-    except Exception as error:
-        raise PostHandoffError(error) from error
+    except BaseException as error:
+        _reraise_as_post_handoff(error, dry_run=args.dry_run)
 
 
 def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | None = None) -> int:
@@ -555,9 +623,22 @@ def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | Non
         # child may still have published. Nothing recovers the phase for a failure that never had
         # one, so an ordinary refusal stays ordinary.
         if _post_handoff_in_chain(error) is not None:
-            return _refuse_after_handoff(f"{type(error).__name__}: {error}")
-        print(f"refused: {type(error).__name__}: {error}", file=sys.stderr)
+            return _refuse_after_handoff(_describe(error))
+        print(f"refused: {_describe(error)}", file=sys.stderr)
         return 1
+    except BaseException as error:
+        # CTRL-C KEEPS ITS MEANING, AND THE OPERATOR STILL GETS THE INSTRUCTION. Converting a
+        # `KeyboardInterrupt` into a returned status would emit the right sentence and silently
+        # take the interrupt away — an operator who stops a demo would get exit 1 and a program
+        # claiming it merely "refused". So this prints and RE-RAISES: the process still dies by
+        # interrupt, and the line saying a trial may already exist has already been written.
+        #
+        # Nothing is printed when the phase is absent, because a pre-handoff interrupt published
+        # nothing and has no message this program can usefully add. (`subscribe_one_signal` uses
+        # the same `except BaseException: ...; raise` shape for its own close discipline.)
+        if _post_handoff_in_chain(error) is not None:
+            _refuse_after_handoff(_describe(error))
+        raise
 
 
 if __name__ == "__main__":
