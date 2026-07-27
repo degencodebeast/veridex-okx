@@ -37,9 +37,16 @@ import pytest
 
 from veridex.signal_trials import published
 from veridex.signal_trials.okx_client import Candle, CandleSeries, SignalFilters, SignalPage
-from veridex.signal_trials.pack import MixedBarError, PackRef, load_pack, read_pack_ref
+from veridex.signal_trials.pack import (
+    PACK_FORMAT_VERSION,
+    MixedBarError,
+    PackRef,
+    load_pack,
+    read_pack_ref,
+)
 from veridex.signal_trials.preflight import (
     COMBO_ORDER,
+    FROZEN_COOLDOWN_MS,
     FROZEN_HORIZON_MS,
     ComboCount,
     ComboSelection,
@@ -85,6 +92,11 @@ BAR_MS = 60_000
 CHAIN = "196"
 T0_MS = 1_753_400_000_000
 
+#: What the fake transport answers each bar at. Independent of the module under test's own table on
+#: purpose — a fake that imported ``FROZEN_BAR_MS`` could not disagree with it, and a wire that
+#: disagrees with the request is exactly what ``MislabelledWidthClient`` exists to simulate.
+_BAR_MS_BY_NAME = {"1m": 60_000, "1H": 3_600_000}
+
 
 class RecordingClient:
     """A ``MarketClient`` that records every call it receives and issues no transport.
@@ -114,11 +126,15 @@ class RecordingClient:
         limit: int = 100,
     ) -> CandleSeries:
         self.calls.append(("get_candles", chain_index, token, bar))
+        # Answers at the width it was ASKED for. A fake that always returned 1m would make every
+        # non-1m combo trip the mixed-bar guard for a reason the venue never caused, and would hide
+        # whether the caller requests the right bar at all.
+        width = _BAR_MS_BY_NAME[bar]
         settle_ms = T0_MS + FROZEN_HORIZON_MS
         candles = tuple(
-            Candle(settle_ms - BAR_MS * offset, 1.0, 1.5, 0.5, 1.0 + offset, 10.0, 100.0, True) for offset in (1, 0)
+            Candle(settle_ms - width * offset, 1.0, 1.5, 0.5, 1.0 + offset, 10.0, 100.0, True) for offset in (1, 0)
         )
-        return CandleSeries(bar=bar, bar_ms=BAR_MS, candles=candles)
+        return CandleSeries(bar=bar, bar_ms=width, candles=candles)
 
 
 class WrongWidthClient(RecordingClient):
@@ -218,18 +234,29 @@ class DuplicateOpenTimeClient(RecordingClient):
         return CandleSeries(bar=clean.bar, bar_ms=clean.bar_ms, candles=(first, twin))
 
 
-def _wire_signal(index: int) -> dict[str, Any]:
-    """One raw REST row that survives the frozen filters (verified against ``preflight._screen``)."""
+def _wire_signal(
+    index: int, *, token: str | None = None, offset_ms: int | None = None, chain: str = CHAIN
+) -> dict[str, Any]:
+    """One raw REST row that survives the frozen filters (verified against ``preflight._screen``).
+
+    ``token`` and ``offset_ms`` default to being derived from ``index``, which gives every row a
+    DISTINCT token — the shape every other vector in this file wants. The cooldown vector needs the
+    opposite (one token at several times), so both are overridable rather than duplicated. ``chain``
+    is overridable because ``_screen`` rejects a row whose ``chainIndex`` does not match the combo
+    being probed, so a vector covering the whole frozen matrix has to speak each combo's chain.
+    """
+    address = token if token is not None else f"0xtoken{index}"
+    t0_ms = T0_MS + (offset_ms if offset_ms is not None else index * BAR_MS)
     return {
-        "timestamp": str(T0_MS + index * BAR_MS),
-        "chainIndex": CHAIN,
+        "timestamp": str(t0_ms),
+        "chainIndex": chain,
         "price": "0.042",
         "walletType": "1",
         "triggerWalletCount": "7",
         "triggerWalletAddress": f"0xwallet{index}",
         "amountUsd": "25000",
         "token": {
-            "tokenAddress": f"0xtoken{index}",
+            "tokenAddress": address,
             "symbol": f"TOK{index}",
             "name": f"Token {index}",
             "marketCapUsd": "5000000",
@@ -545,6 +572,30 @@ async def test_the_sealed_pack_loads_and_carries_the_selected_combo(tmp_path: Pa
     assert len(pack.trials) == 3
 
 
+async def test_the_sealed_pack_declares_its_format_version_only_once(tmp_path: Path) -> None:
+    """``versions`` may not restate the pack format — ``PackMeta`` owns that field.
+
+    Removing the duplicate was the fix; this is what keeps it removed. Nothing else in the suite
+    notices a second surface being reintroduced: the copy is inert, so every roundtrip, digest and
+    refusal vector stays green while the pack once again declares its own format in two places that
+    can drift. That is the defect this module refuses for the bar, one level up, and it is the
+    reason the duplicate existed in the first place.
+    """
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    result = await run_fetch_and_seal(preflight_path, client, data_dir)
+    assert result is not None
+    pack = load_pack(read_pack_ref(result))
+
+    assert pack.meta.pack_format_version == PACK_FORMAT_VERSION
+    assert "pack_format" not in pack.meta.versions
+    # ACCEPTANCE: `versions` still carries what it IS for — provenance pack.py does not own.
+    assert "preflight_policy" in pack.meta.versions
+
+
 async def test_the_seal_path_publishes_no_season_state(tmp_path: Path) -> None:
     """Sealing a pack is not scoring a season, so it may not claim one.
 
@@ -647,3 +698,119 @@ async def test_a_hand_edited_reason_cannot_displace_the_modules_own(tmp_path: Pa
     assert "failed" in published_reason
     # ACCEPTANCE: the artifact is still carried as evidence — the guard narrows one key, not the detail.
     assert published.read_state(data_dir)["detail"]["probe_status"] == "failed"
+
+
+# --- a combo outside the frozen matrix is refused BEFORE any transport ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "needle"),
+    [
+        ("bar", "5m", "not a frozen width"),
+        ("bar", "1D", "not a frozen width"),
+        ("chain_index", "999", "not in the frozen matrix"),
+        ("chain_index", "../../etc", "not in the frozen matrix"),
+    ],
+)
+async def test_a_combo_outside_the_frozen_matrix_fetches_nothing(
+    tmp_path: Path, field: str, value: str, needle: str
+) -> None:
+    """A non-frozen chain or bar is non-sealable, and is refused before the first ``await``.
+
+    ASSERTED AS A CALL COUNT, not as a raise. An earlier revision checked the combo only for
+    ``is None``, so an artifact carrying ``bar: "5m"`` passed the guard, ran the ENTIRE fetch at the
+    bogus bar — one ``list_signals`` plus one ``get_candles`` per token — and was refused only at
+    seal time by ``frozen_bar_ms``. It failed closed, so a bare ``pytest.raises`` would have passed
+    throughout; only the call count can tell the two apart. On a credentialed run those were real
+    requests against a venue at a bar the frozen matrix never selects.
+
+    ``chain_index`` is covered by the same vector because it is fetched just as eagerly, and a guard
+    on one axis only would leave the module's stated invariant half true.
+    """
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    artifact = json.loads(preflight_path.read_text(encoding="utf-8"))
+    artifact[field] = value
+    preflight_path.write_text(json.dumps(artifact), encoding="utf-8")
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    result = await run_fetch_and_seal(preflight_path, client, data_dir)
+
+    assert result is None
+    assert client.calls == []
+    assert _state_of(data_dir) == "not_built"
+    assert needle in _reason_of(data_dir)
+
+
+async def test_every_frozen_combo_still_reaches_the_fetch(tmp_path: Path) -> None:
+    """ACCEPTANCE CONTROL for the membership guard: it must SEPARATE, not merely refuse.
+
+    Without this, every vector above passes against a guard that rejects every combo — including one
+    whose frozen table is simply wrong. Run over the whole frozen matrix rather than one combo, so a
+    table that happened to omit a real entry is caught here rather than at Gate B.
+    """
+    for index, (chain, bar) in enumerate(COMBO_ORDER):
+        preflight_path = tmp_path / f"preflight_{index}.json"
+        data_dir = tmp_path / f"data_{index}"
+        write_preflight_result(ComboSelection(chain, bar, "qualified"), _matrix({(chain, bar): 41}), preflight_path)
+        client = RecordingClient(signals=tuple(_wire_signal(i, chain=chain) for i in range(3)))
+
+        result = await run_fetch_and_seal(preflight_path, client, data_dir)
+
+        assert result is not None, f"frozen combo {(chain, bar)} was refused"
+        assert client.calls != []
+        assert {call[3] for call in client.calls if call[0] == "get_candles"} == {bar}
+        assert load_pack(read_pack_ref(result)).meta.combo == ComboSelection(chain, bar, "qualified")
+
+
+# --- §8.6's same-token cooldown decides the season's scored population ----------------------------
+
+
+async def test_the_same_token_cooldown_decides_which_trials_are_sealed(tmp_path: Path) -> None:
+    """The 4h cooldown is applied to the trials that reach the pack, and it is a WINDOW.
+
+    Three properties, because §8.6 is a time-windowed rule that keeps a SPECIFIC member and a test
+    binding only the first would pass against two different wrong rules:
+
+    1. **The refusal** — a second signal on the same token INSIDE the window does not become a
+       second trial. Bound on the SEALED PACK rather than on ``_dedup_by_cooldown``'s return,
+       because the claim is about what gets sealed: a test calling the helper directly would still
+       pass if this module stopped calling it, which is the exact defect being closed.
+    2. **The window is a window** — a third signal on the same token OUTSIDE the window SURVIVES.
+       Without this the test passes against "one trial per token, forever", a strictly wrong rule.
+    3. **WHICH member survives** — the EARLIEST of each cluster, which ``_dedup_by_cooldown``
+       argues is the no-look-ahead choice a chronological replay reaches first. Without this,
+       keeping the latest — a look-ahead rule — satisfies 1 and 2.
+
+    Plus acceptance: a different token is untouched, so it cannot pass against a cooldown that eats
+    everything. The window is half-open (exactly ``cooldown_ms`` apart survives), so the outside
+    vector sits a full bar clear of the boundary rather than on it.
+    """
+    inside_ms = 3_600_000
+    outside_ms = FROZEN_COOLDOWN_MS + BAR_MS
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    client = RecordingClient(
+        signals=(
+            _wire_signal(0, token="0xtokenA", offset_ms=0),
+            _wire_signal(1, token="0xtokenA", offset_ms=inside_ms),
+            _wire_signal(2, token="0xtokenA", offset_ms=outside_ms),
+            _wire_signal(3, token="0xtokenB", offset_ms=inside_ms),
+        )
+    )
+
+    result = await run_fetch_and_seal(preflight_path, client, data_dir)
+    assert result is not None
+    pack = load_pack(read_pack_ref(result))
+
+    # 1 — four eligible signals in, three trials sealed.
+    assert len(pack.trials) == 3
+    # 2 and 3 — the token's surviving trials are the EARLIEST of each cluster, and the one beyond
+    # the window is one of them. The dropped signal is the middle one, inside the window.
+    a_offsets = sorted(trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenA")
+    assert a_offsets == [0, outside_ms]
+    assert inside_ms not in a_offsets
+    # ACCEPTANCE — a different token inside the same window is untouched.
+    assert [trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenB"] == [inside_ms]

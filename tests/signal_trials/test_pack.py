@@ -23,6 +23,7 @@ from veridex.signal_trials.challenge_spec import CanonicalSignal
 from veridex.signal_trials.okx_client import Candle, CandleSeries
 from veridex.signal_trials.pack import (
     MANIFEST_FILENAME,
+    PACK_FORMAT_VERSION,
     SETTLEMENT_FILENAME,
     TRIALS_FILENAME,
     MixedBarError,
@@ -40,6 +41,11 @@ T0_MS = 1_753_400_000_000
 
 # Every fixture trial carries a symbol beginning "TOK", which is what the plan's tamper vector flips.
 _TRIAL_COUNT = 3
+
+#: What the ``canonical_fixtures`` fixture yields. Named so the twelve consumers can annotate it
+#: without restating the triple, and so ``tmp_path: Path`` beside it is not the only annotated
+#: parameter in the file.
+CanonicalFixtures = tuple[list[CanonicalSignal], dict[str, CandleSeries], PackMeta]
 
 
 def _signal(index: int) -> CanonicalSignal:
@@ -79,7 +85,7 @@ def _series(signal: CanonicalSignal) -> CandleSeries:
 
 
 @pytest.fixture
-def canonical_fixtures() -> tuple[list[CanonicalSignal], dict[str, CandleSeries], PackMeta]:
+def canonical_fixtures() -> CanonicalFixtures:
     """Three canonical trials, one settlement series per token, and a matching 1m/25bps meta."""
     trials = [_signal(index) for index in range(_TRIAL_COUNT)]
     settlement = {signal.token_address: _series(signal) for signal in trials}
@@ -100,7 +106,7 @@ def canonical_fixtures() -> tuple[list[CanonicalSignal], dict[str, CandleSeries]
 # --- The three plan-mandated vectors -------------------------------------------------------------
 
 
-def test_seal_then_load_roundtrip(tmp_path: Path, canonical_fixtures) -> None:
+def test_seal_then_load_roundtrip(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """A sealed pack loads back with its meta and every trial intact.
 
     This is also the ACCEPTANCE CONTROL for every refusal below: a suite that only asserts refusal
@@ -115,7 +121,7 @@ def test_seal_then_load_roundtrip(tmp_path: Path, canonical_fixtures) -> None:
     assert pack.settlement[trials[0].token_address].bar_ms == BAR_MS
 
 
-def test_tampered_byte_fails_closed(tmp_path: Path, canonical_fixtures) -> None:
+def test_tampered_byte_fails_closed(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """One flipped byte in ``trials.json`` makes the pack refuse to load."""
     trials, settlement, meta = canonical_fixtures
     ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
@@ -128,7 +134,7 @@ def test_tampered_byte_fails_closed(tmp_path: Path, canonical_fixtures) -> None:
         load_pack(ref)
 
 
-def test_mixed_bar_series_rejected_at_seal(tmp_path: Path, canonical_fixtures) -> None:
+def test_mixed_bar_series_rejected_at_seal(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """One series at a different bar width refuses the whole seal."""
     trials, settlement, meta = canonical_fixtures
     key = next(iter(settlement))
@@ -141,7 +147,7 @@ def test_mixed_bar_series_rejected_at_seal(tmp_path: Path, canonical_fixtures) -
 # --- Properties the seal claims that the three above do not reach ---------------------------------
 
 
-def test_a_refused_seal_writes_nothing(tmp_path: Path, canonical_fixtures) -> None:
+def test_a_refused_seal_writes_nothing(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """A mixed-bar refusal leaves no partial pack behind.
 
     Validation before any write is the difference between "refused" and "refused, but the next reader
@@ -156,7 +162,7 @@ def test_a_refused_seal_writes_nothing(tmp_path: Path, canonical_fixtures) -> No
     assert list(tmp_path.iterdir()) == []
 
 
-def test_bar_name_disagreeing_with_bar_ms_is_rejected(tmp_path: Path, canonical_fixtures) -> None:
+def test_bar_name_disagreeing_with_bar_ms_is_rejected(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """A series whose ``bar`` name contradicts its own ``bar_ms`` is not a settled provenance.
 
     DISCRIMINATION CONTROL for the mixed-bar guard: ``test_mixed_bar_series_rejected_at_seal`` moves
@@ -170,10 +176,9 @@ def test_bar_name_disagreeing_with_bar_ms_is_rejected(tmp_path: Path, canonical_
         seal_pack(trials, settlement, meta, out_dir=tmp_path)
 
 
-def test_meta_bar_must_agree_with_its_own_combo(tmp_path: Path, canonical_fixtures) -> None:
+def test_meta_bar_must_agree_with_its_own_combo(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """``PackMeta`` names the bar twice, and a pack may not be sealed while the two disagree."""
-    trials, settlement, _ = canonical_fixtures
-    _, _, base = canonical_fixtures
+    trials, settlement, base = canonical_fixtures
     meta = PackMeta(
         season_id=base.season_id,
         combo=ComboSelection("196", "1H", "qualified"),
@@ -189,7 +194,7 @@ def test_meta_bar_must_agree_with_its_own_combo(tmp_path: Path, canonical_fixtur
         seal_pack(trials, settlement, meta, out_dir=tmp_path)
 
 
-def test_edited_meta_fails_closed(tmp_path: Path, canonical_fixtures) -> None:
+def test_edited_meta_fails_closed(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """Rewriting ``cost_bps`` in the manifest invalidates the pack.
 
     ``cost_bps`` prices every markout in the season. A content hash over the DATA FILES ALONE would
@@ -207,7 +212,7 @@ def test_edited_meta_fails_closed(tmp_path: Path, canonical_fixtures) -> None:
         load_pack(ref)
 
 
-def test_tampered_settlement_fails_closed(tmp_path: Path, canonical_fixtures) -> None:
+def test_tampered_settlement_fails_closed(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """The settlement leg is in the hash scope too, not just ``trials.json``."""
     trials, settlement, meta = canonical_fixtures
     ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
@@ -220,7 +225,7 @@ def test_tampered_settlement_fails_closed(tmp_path: Path, canonical_fixtures) ->
         load_pack(ref)
 
 
-def test_load_rejects_a_ref_whose_hash_disagrees(tmp_path: Path, canonical_fixtures) -> None:
+def test_load_rejects_a_ref_whose_hash_disagrees(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """A caller holding an independent record of the hash is honoured over the manifest.
 
     Tampering with the data AND the manifest together is self-consistent on disk. The ref the sealer
@@ -233,7 +238,7 @@ def test_load_rejects_a_ref_whose_hash_disagrees(tmp_path: Path, canonical_fixtu
         load_pack(forged)
 
 
-def test_seal_writes_exactly_the_three_pack_files(tmp_path: Path, canonical_fixtures) -> None:
+def test_seal_writes_exactly_the_three_pack_files(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """The pack directory holds the three named files and nothing else."""
     trials, settlement, meta = canonical_fixtures
     ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
@@ -259,7 +264,9 @@ _ESCAPING_SEASON_IDS = [
 
 
 @pytest.mark.parametrize("season_id", _ESCAPING_SEASON_IDS)
-def test_a_season_id_that_could_escape_out_dir_is_refused(tmp_path: Path, canonical_fixtures, season_id: str) -> None:
+def test_a_season_id_that_could_escape_out_dir_is_refused(
+    tmp_path: Path, canonical_fixtures: CanonicalFixtures, season_id: str
+) -> None:
     """``season_id`` becomes a directory name, and it arrives from a hand-editable artifact.
 
     ``run_fetch_and_seal`` builds it as ``season-{chain_index}-{bar}-{moment}`` with ``chain_index``
@@ -283,7 +290,7 @@ def test_a_season_id_that_could_escape_out_dir_is_refused(tmp_path: Path, canoni
     assert sorted(entry.name for entry in tmp_path.iterdir()) == before
 
 
-def test_a_generated_season_id_is_accepted(tmp_path: Path, canonical_fixtures) -> None:
+def test_a_generated_season_id_is_accepted(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """ACCEPTANCE CONTROL for the ``season_id`` guard: it must SEPARATE, not merely refuse.
 
     Without this, every vector above passes against a guard that rejects every id — including one
@@ -326,7 +333,7 @@ def test_sealing_twice_into_one_season_dir_is_refused_and_the_first_survives(
     )
 
 
-def test_two_seasons_may_share_one_out_dir(tmp_path: Path, canonical_fixtures) -> None:
+def test_two_seasons_may_share_one_out_dir(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
     """DISCRIMINATION CONTROL: the refusal is about the SEASON directory, not about ``out_dir``.
 
     ``out_dir`` is ``<data_dir>/packs/`` and is expected to accumulate seasons. A guard that refused
@@ -340,3 +347,110 @@ def test_two_seasons_may_share_one_out_dir(tmp_path: Path, canonical_fixtures) -
     assert first.dir.parent == second.dir.parent == tmp_path
     assert load_pack(first).meta.season_id == "season-one"
     assert load_pack(second).meta.season_id == "season-two"
+
+
+# --- the format version is declared once, hash-bound, and enforced on read ------------------------
+
+
+def test_a_pack_from_another_format_version_is_refused(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
+    """A pack sealed under a different format version will not load, even though it is INTACT.
+
+    This is the case the digest alone cannot catch, and it is the whole reason the check exists. A
+    hand-edited version breaks the hash and would be refused anyway; a pack sealed legitimately by a
+    FUTURE build carries a version this module does not implement together with a digest that is
+    perfectly valid under that build's rules. Nothing but comparing the version can refuse it.
+
+    The assertions separate the two failure modes deliberately: the pack's own digest is verified to
+    MATCH first, so the refusal below is provably about the version and not about tampering.
+    """
+    trials, settlement, base = canonical_fixtures
+    future = replace(base, pack_format_version=PACK_FORMAT_VERSION + 1)
+    ref = seal_pack(trials, settlement, future, out_dir=tmp_path)
+
+    manifest = json.loads((ref.dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["meta"]["pack_format_version"] == PACK_FORMAT_VERSION + 1
+    # The pack is INTACT: the sealer's own hash is what the manifest records.
+    assert manifest["content_hash"] == ref.content_hash
+
+    with pytest.raises(PackIntegrityError, match="format version"):
+        load_pack(ref)
+
+
+def test_the_format_version_is_hash_bound(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
+    """Editing the version in the manifest changes the digest, so it cannot be swapped silently.
+
+    DISCRIMINATION against the previous test: that one proves a *validly sealed* other-version pack
+    is refused. This one proves the version is inside the hashed region rather than beside it — the
+    property the constant's own comment claims. If it sat outside ``meta``, this edit would produce a
+    pack that loads clean under the wrong rules.
+    """
+    trials, settlement, meta = canonical_fixtures
+    ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
+    path = ref.dir / MANIFEST_FILENAME
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert manifest["meta"]["pack_format_version"] == PACK_FORMAT_VERSION
+    manifest["meta"]["pack_format_version"] = PACK_FORMAT_VERSION + 1
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PackIntegrityError):
+        load_pack(ref)
+
+
+def test_the_version_is_declared_in_exactly_one_place(tmp_path: Path, canonical_fixtures: CanonicalFixtures) -> None:
+    """ACCEPTANCE plus single-surface: the sealed pack declares its format once, inside ``meta``.
+
+    Two authoritative-looking surfaces that can disagree is the defect this module refuses for the
+    bar; a manifest-level copy of the version would reintroduce it one level up.
+    """
+    trials, settlement, meta = canonical_fixtures
+    ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
+    manifest = json.loads((ref.dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+    assert "pack_format_version" not in manifest
+    assert manifest["meta"]["pack_format_version"] == PACK_FORMAT_VERSION
+    assert load_pack(ref).meta.pack_format_version == PACK_FORMAT_VERSION
+
+
+def test_a_manifest_declaring_another_hash_scope_is_refused(
+    tmp_path: Path, canonical_fixtures: CanonicalFixtures
+) -> None:
+    """``manifest["files"]`` records the hash scope, and a reader that ignored it would be lying.
+
+    The field is not hash-bound — it is a description of what this reader will hash, not evidence —
+    so this is a consistency refusal rather than a tamper check, and it is asserted as such: the
+    manifest can be edited, and the point is that the edit is NOTICED rather than silently ignored.
+    """
+    trials, settlement, meta = canonical_fixtures
+    ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
+    path = ref.dir / MANIFEST_FILENAME
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert manifest["files"] == sorted([SETTLEMENT_FILENAME, TRIALS_FILENAME])
+    manifest["files"] = ["not-even-a-real-file.json"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PackIntegrityError, match="hash scope"):
+        load_pack(ref)
+
+
+def test_the_content_hash_is_independent_of_mapping_order(
+    tmp_path: Path, canonical_fixtures: CanonicalFixtures
+) -> None:
+    """Identical content in a different insertion order seals to the SAME digest (probe G3).
+
+    ``_canonical_bytes`` uses ``sort_keys=True`` and argues that this is what makes the encoding
+    independent of insertion order. Nothing bound that claim: seal and load share the function, so
+    a non-canonical encoding keeps every roundtrip and every tamper vector working and only breaks
+    reproducibility ACROSS builds — which no test reached. This is that test.
+    """
+    trials, settlement, meta = canonical_fixtures
+    reversed_settlement = dict(reversed(list(settlement.items())))
+    assert list(reversed_settlement) != list(settlement), "the vector must actually reverse the order"
+    assert reversed_settlement == settlement, "and must not change the content while doing so"
+
+    # The two arms go to DIFFERENT out_dirs under the SAME meta. Varying `season_id` to avoid the
+    # second-generation refusal would confound the measurement: `season_id` is itself hash-bound, so
+    # both arms would differ for a reason that has nothing to do with insertion order.
+    forward = seal_pack(trials, settlement, meta, out_dir=tmp_path / "a")
+    backward = seal_pack(trials, reversed_settlement, meta, out_dir=tmp_path / "b")
+
+    assert forward.content_hash == backward.content_hash

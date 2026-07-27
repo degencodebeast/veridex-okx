@@ -46,12 +46,13 @@ under them — see the note at the import site.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from veridex.signal_trials import published
 from veridex.signal_trials.challenge_spec import CanonicalSignal
@@ -72,11 +73,13 @@ from veridex.signal_trials.pack import PackMeta, seal_pack
 # un-normalized series would make the season's own numbers depend on how a page happened to paginate.
 from veridex.signal_trials.preflight import (
     CANDLE_LIMIT,
+    COMBO_ORDER,
     FROZEN_COOLDOWN_MS,
     FROZEN_HORIZON_MS,
     PROBE_COMPLETED,
     ComboSelection,
     MarketClient,
+    SeasonStatus,
     _collect_signals,
     _dedup_by_cooldown,
     _screen,
@@ -94,6 +97,10 @@ PACKS_DIRNAME = "packs"
 #: widths are the OKX candle bars those names denote; ``test_frozen_bar_ms_covers_the_frozen_matrix``
 #: is what fails if the matrix ever names a bar this table does not price.
 FROZEN_BAR_MS: dict[str, int] = {"1m": 60_000, "1H": 3_600_000}
+
+#: The chains the frozen matrix can select, DERIVED from ``COMBO_ORDER`` rather than restated, so a
+#: change to the frozen matrix cannot leave this guard behind.
+FROZEN_CHAINS: frozenset[str] = frozenset(chain for chain, _bar in COMBO_ORDER)
 
 #: The season statuses that authorize a seal. ``no_season`` is handled before this is consulted, so
 #: these are the whole remainder of the ``SeasonStatus`` domain — a value outside it is a corrupted
@@ -157,6 +164,26 @@ def non_sealable_reason(artifact: Mapping[str, Any]) -> NonSealable | None:
         return NonSealable(
             published.NOT_BUILT,
             f"season_status {season_status!r} is outside the frozen set {sorted(SEALABLE_SEASON_STATUSES)}",
+        )
+
+    # The combo must name a market the FROZEN MATRIX could actually have selected, not merely a
+    # non-null one. Membership is checked HERE, before the caller's first `await`, because that is
+    # what makes the zero-transport claim true for every non-sealable artifact rather than only for
+    # the ones caught above: a bar of "5m" would otherwise pass this guard and be fetched at, one
+    # request per token, before `frozen_bar_ms` refused it at seal time. The chain is checked for
+    # the same reason and in the same breath — an unfrozen chain is fetched just as eagerly, and
+    # guarding one axis while leaving the other open would make the invariant half true.
+    if chain_index not in FROZEN_CHAINS:
+        return NonSealable(
+            published.NOT_BUILT,
+            f"chain_index {chain_index!r} is not in the frozen matrix {sorted(FROZEN_CHAINS)}: "
+            f"a season may only be sealed against a market the frozen probe could have selected",
+        )
+    if bar not in FROZEN_BAR_MS:
+        return NonSealable(
+            published.NOT_BUILT,
+            f"bar {bar!r} is not a frozen width {sorted(FROZEN_BAR_MS)}: "
+            f"a season may only be sealed at a bar the frozen probe could have selected",
         )
 
     return None
@@ -252,9 +279,14 @@ async def run_fetch_and_seal(
 
     ``async`` because the market client's read surface is async (``preflight.MarketClient``). The
     plan's ``Produces`` sketch writes it ``def``; per PKT-DEC-C16 a Produces signature is a sketch
-    and may be adjusted where reality requires, and the transport contract requires it here. The
-    short-circuits return before the first ``await``, so a non-sealable artifact issues no transport
-    call at all rather than merely discarding the result of one.
+    and may be adjusted where reality requires, and the transport contract requires it here.
+
+    **EVERY non-sealable artifact returns before the first ``await``, so it issues no transport call
+    at all** rather than merely discarding the result of one. That is a claim about which artifacts
+    reach the fetch, not only about where the returns sit, and it is why ``non_sealable_reason``
+    tests the combo for MEMBERSHIP in the frozen matrix rather than merely for non-nullness — an
+    earlier revision checked only ``is None``, and an artifact naming a bar of ``"5m"`` therefore
+    passed the guard and was fetched once per token before the seal refused it.
 
     **Nothing here publishes a season.** ``qualified`` and ``exploratory`` are the SCORER's verdicts
     (H3.5). Writing one at seal time would assert a season over a pack nothing has scored yet, and
@@ -273,8 +305,12 @@ async def run_fetch_and_seal(
         The sealed pack's directory, or ``None`` when the artifact was not sealable.
 
     Raises:
-        ValueError: The preflight artifact exists but cannot be read as a JSON object.
-        MixedBarError: A fetched series disagrees with the season's bar.
+        ValueError: The preflight artifact exists but cannot be read as a JSON object, or the
+            season id derived from it cannot safely be a directory name.
+        MixedBarError: A fetched series disagrees with the season's bar. A ``ValueError`` subclass.
+        FileExistsError: A pack directory for this season already exists and is not empty. Named
+            explicitly because it is an ``OSError``, NOT a ``ValueError`` — a caller catching only
+            ``ValueError`` to mean "the seal was refused" would miss exactly this one.
     """
     data_dir = Path(data_dir)
     artifact = _read_artifact(Path(preflight_path))
@@ -312,14 +348,24 @@ async def run_fetch_and_seal(
     bar_ms = frozen_bar_ms(bar)
     meta = PackMeta(
         season_id=season_id or _season_id(chain_index, bar),
-        combo=ComboSelection(chain_index, bar, season_status),  # type: ignore[arg-type]
+        # Only `season_status` needs widening — it is a `SeasonStatus` Literal and `:325` has already
+        # narrowed it to `str`. A blanket `type: ignore[arg-type]` here would also suppress checking
+        # of `chain_index` and `bar`, so a later change to either type would go unnoticed under
+        # `--strict`; the cast puts the suppression on the one argument that needs it.
+        combo=ComboSelection(chain_index, bar, cast(SeasonStatus, season_status)),
         probe_counts={"counts": artifact.get("counts", []), "rejection_reasons": artifact.get("rejection_reasons", {})},
-        filters=dict(vars(filters)),
+        # `asdict` rather than `vars()`: `SignalFilters` is a frozen dataclass today, but `vars()`
+        # raises `TypeError` the moment anyone adds `slots=True`, and this is not the file that would
+        # find out.
+        filters=dataclasses.asdict(filters),
         cost_bps=cost_bps,
         horizon_ms=horizon_ms,
         bar=bar,
         bar_ms=bar_ms,
-        versions={"pack_format": "1", "preflight_policy": json.dumps(artifact.get("policy", {}), sort_keys=True)},
+        # The pack format version is NOT restated here. `PackMeta.pack_format_version` defaults to
+        # `pack.PACK_FORMAT_VERSION` and rides the hashed meta region, so there is exactly one
+        # surface declaring it; a copy in this dict could disagree with the module that owns it.
+        versions={"preflight_policy": json.dumps(artifact.get("policy", {}), sort_keys=True)},
     )
     ref = seal_pack(trials, settlement, meta, out_dir=data_dir / PACKS_DIRNAME)
     return ref.dir

@@ -54,9 +54,12 @@ from veridex.signal_trials.challenge_spec import CanonicalSignal
 from veridex.signal_trials.okx_client import Candle, CandleSeries
 from veridex.signal_trials.preflight import ComboSelection
 
-#: Bumped when the on-disk layout or the digest construction changes. Recorded in the manifest and
-#: folded into the hash with the rest of the meta, so a pack can never be read under a format whose
-#: rules it was not written by.
+#: Bumped when the on-disk layout or the digest construction changes. Carried as a ``PackMeta``
+#: FIELD, so it rides the hash-bound meta region and is compared by :func:`load_pack` against the
+#: version this module implements — a pack cannot be read under a format whose rules it was not
+#: written by. It is declared in exactly ONE place on disk (``manifest.meta.pack_format_version``);
+#: a second copy elsewhere in the manifest could disagree with it, which is the defect this module
+#: refuses for the bar and must not reintroduce for its own format version.
 PACK_FORMAT_VERSION = 1
 
 TRIALS_FILENAME = "trials.json"
@@ -101,6 +104,16 @@ class PackMeta:
 
     ``combo`` is the preflight selection the pack was authorized by, carried verbatim so the pack
     states which market it settled against rather than leaving it to be inferred from the trials.
+
+    ``probe_counts`` IS NOT A CENSUS OF ``trials``, and the two are not expected to match. It is the
+    PROBE's observation, made at an earlier moment against a signal list that has since moved on;
+    ``trials`` is fetched fresh at seal time. Both apply the same frozen rules — that is what the
+    shared eligibility code buys — but they describe different populations at different moments, so a
+    reader comparing ``len(trials)`` to the selected combo's count should expect them to differ.
+
+    ``pack_format_version`` defaults to this module's :data:`PACK_FORMAT_VERSION` so a caller cannot
+    silently declare a format it did not write. It is a field rather than a manifest-level key
+    precisely so it lands INSIDE the hashed meta region.
     """
 
     season_id: str
@@ -112,6 +125,7 @@ class PackMeta:
     bar: str
     bar_ms: int
     versions: dict[str, str]
+    pack_format_version: int = PACK_FORMAT_VERSION
 
 
 @dataclass(frozen=True)
@@ -149,8 +163,7 @@ def _canonical_bytes(payload: Any) -> bytes:
 
 def _meta_to_json(meta: PackMeta) -> dict[str, Any]:
     """The manifest's ``meta`` block. ``asdict`` flattens the nested ``ComboSelection``."""
-    encoded: dict[str, Any] = dataclasses.asdict(meta)
-    return encoded
+    return dataclasses.asdict(meta)
 
 
 def _meta_from_json(raw: Any) -> PackMeta:
@@ -180,6 +193,10 @@ def _meta_from_json(raw: Any) -> PackMeta:
             bar=raw["bar"],
             bar_ms=raw["bar_ms"],
             versions=raw["versions"],
+            # Read STRICTLY, with no default: a pack that declares no format version cannot be
+            # checked against one, and silently treating it as the current format is the exact
+            # "read under rules it was not written by" outcome the version exists to prevent.
+            pack_format_version=raw["pack_format_version"],
         )
     except (KeyError, TypeError) as error:
         raise PackIntegrityError(f"manifest meta is missing or malformed: {error}") from error
@@ -337,9 +354,12 @@ def seal_pack(
         SETTLEMENT_FILENAME: _canonical_bytes({token: _series_to_json(series) for token, series in settlement.items()}),
     }
     content_hash = _content_hash(file_bytes, meta)
+    # `pack_format_version` is NOT repeated here: it lives in `meta`, inside the digest, and a
+    # manifest-level copy would be a second authoritative-looking surface that could disagree with
+    # it. `files` records the hash SCOPE for a human reading the manifest, and `load_pack` compares
+    # it against `DATA_FILENAMES` so it cannot quietly become decorative.
     manifest_bytes = _canonical_bytes(
         {
-            "pack_format_version": PACK_FORMAT_VERSION,
             "files": sorted(DATA_FILENAMES),
             "meta": _meta_to_json(meta),
             "content_hash": content_hash,
@@ -414,12 +434,31 @@ def load_pack(ref: PackRef) -> SealedPack:
     Returns:
         The verified pack.
 
+    The FORMAT VERSION is checked before anything else is trusted. That check is not redundant with
+    the digest: a hand-edited version breaks the hash and is caught either way, but a pack sealed
+    legitimately by a FUTURE build carries a version this module does not implement together with a
+    digest that is perfectly valid under that build's rules. Only comparing the version can refuse
+    it, and accepting it would be reading a pack under rules it was not written by.
+
     Raises:
-        PackIntegrityError: Any leg is missing or unreadable, the pack does not parse, or either
-            digest comparison fails. Nothing partially-loaded is ever returned.
+        PackIntegrityError: Any leg is missing or unreadable, the pack does not parse, the manifest
+            declares a hash scope this module does not implement, the format version is not this
+            module's, or either digest comparison fails. Nothing partially-loaded is ever returned.
     """
     manifest = _load_manifest(ref.dir)
     meta = _meta_from_json(manifest.get("meta"))
+    if meta.pack_format_version != PACK_FORMAT_VERSION:
+        raise PackIntegrityError(
+            f"pack at {ref.dir} declares pack format version {meta.pack_format_version!r} but this "
+            f"module implements {PACK_FORMAT_VERSION!r}; refusing to read a pack under rules it was "
+            f"not written by"
+        )
+    declared_files = manifest.get("files")
+    if declared_files != sorted(DATA_FILENAMES):
+        raise PackIntegrityError(
+            f"pack at {ref.dir} declares hash scope {declared_files!r} but this module hashes "
+            f"{sorted(DATA_FILENAMES)!r}; the manifest describes a pack this reader cannot verify"
+        )
     try:
         file_bytes = {name: (ref.dir / name).read_bytes() for name in DATA_FILENAMES}
     except OSError as error:
