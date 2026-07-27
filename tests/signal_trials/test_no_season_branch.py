@@ -174,6 +174,50 @@ class MislabelledWidthClient(RecordingClient):
         )
 
 
+class DuplicateOpenTimeClient(RecordingClient):
+    """Returns ONE token's series with two candles sharing a ``ts_open_ms``.
+
+    ``identical`` selects which of ``_with_unique_open_times``' two outcomes the response lands in,
+    and the pair is what makes this a discriminating vector rather than a single rejection:
+
+    * ``identical=False`` — the duplicates carry DIFFERENT closes, so the series is irreducibly
+      ambiguous and the token is dropped from settlement;
+    * ``identical=True`` — the duplicates are equal, so the series is COLLAPSED and kept.
+
+    ``spot_markout.select_settlement_candle`` is why the first case cannot be sealed: on a duplicate
+    ``ts_open_ms`` the two rows tie on ``close_ts``, ``min`` keeps whichever the wire put first, and
+    the settlement PRICE then follows wire order. Sealing it would make the season's own numbers
+    depend on how a page happened to paginate.
+    """
+
+    def __init__(
+        self,
+        signals: tuple[dict[str, Any], ...] = (),
+        *,
+        duplicated_token: str,
+        identical: bool,
+    ) -> None:
+        super().__init__(signals)
+        self._duplicated_token = duplicated_token
+        self._identical = identical
+
+    async def get_candles(
+        self,
+        chain_index: str,
+        token: str,
+        bar: str,
+        *,
+        before_ms: int | None = None,
+        limit: int = 100,
+    ) -> CandleSeries:
+        clean = await super().get_candles(chain_index, token, bar, before_ms=before_ms, limit=limit)
+        if token != self._duplicated_token:
+            return clean
+        first = clean.candles[-1]
+        twin = first if self._identical else Candle(first.ts_open_ms, 1.0, 1.5, 0.5, 99.0, 10.0, 100.0, True)
+        return CandleSeries(bar=clean.bar, bar_ms=clean.bar_ms, candles=(first, twin))
+
+
 def _wire_signal(index: int) -> dict[str, Any]:
     """One raw REST row that survives the frozen filters (verified against ``preflight._screen``)."""
     return {
@@ -516,3 +560,90 @@ async def test_the_seal_path_publishes_no_season_state(tmp_path: Path) -> None:
     await run_fetch_and_seal(preflight_path, client, data_dir)
 
     assert _state_of(data_dir) == "not_built"
+
+
+# --- Settlement normalization: the property the private import is justified BY --------------------
+
+
+async def _seal_with_duplicates(tmp_path: Path, *, identical: bool) -> tuple[Any, str]:
+    """Seal a pack where one token's series carries duplicate ``ts_open_ms``. Returns (pack, token)."""
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    signals = tuple(_wire_signal(index) for index in range(3))
+    duplicated_token = str(signals[0]["token"]["tokenAddress"])
+    client = DuplicateOpenTimeClient(signals=signals, duplicated_token=duplicated_token, identical=identical)
+
+    result = await run_fetch_and_seal(preflight_path, client, data_dir)
+    assert result is not None
+    return load_pack(read_pack_ref(result)), duplicated_token
+
+
+async def test_an_ambiguous_series_is_omitted_while_its_trial_is_retained(tmp_path: Path) -> None:
+    """A series that cannot be settled deterministically is dropped; its TRIAL stays in the pack.
+
+    Both halves are asserted because both are the documented behaviour, and they pull in opposite
+    directions. Omitting the series is what keeps the season's prices independent of pagination
+    order; retaining the trial is what keeps the scored POPULATION unchanged — dropping it would
+    quietly shrink the season instead of reporting the trial UNSCORED.
+
+    The ACCEPTANCE half rides in the same assertion: the two unambiguous tokens ARE present, so this
+    cannot pass against an implementation that seals an empty settlement.
+    """
+    pack, duplicated_token = await _seal_with_duplicates(tmp_path, identical=False)
+
+    assert duplicated_token not in pack.settlement
+    assert [trial.token_address for trial in pack.trials].count(duplicated_token) == 1
+    assert len(pack.trials) == 3
+    assert sorted(pack.settlement) == sorted(
+        trial.token_address for trial in pack.trials if trial.token_address != duplicated_token
+    )
+
+
+async def test_duplicate_but_identical_candles_are_collapsed_and_kept(tmp_path: Path) -> None:
+    """DISCRIMINATION CONTROL: only an IRREDUCIBLE ambiguity is dropped.
+
+    ``test_an_ambiguous_series_is_omitted_while_its_trial_is_retained`` on its own is satisfied by an
+    implementation that discards any series carrying a repeated ``ts_open_ms`` at all — and equally
+    by one that never normalizes and simply mislays a token. This separates those: equal duplicates
+    are collapsed to one candle and the token is KEPT, which is a different outcome from both.
+
+    The collapse assertion is also what makes this vector fail against a pack sealed from the raw
+    response, where the duplicate would still be sitting in the series.
+    """
+    pack, duplicated_token = await _seal_with_duplicates(tmp_path, identical=True)
+
+    assert duplicated_token in pack.settlement
+    assert len(pack.settlement) == 3
+    series = pack.settlement[duplicated_token]
+    assert len(series.candles) == 1
+    assert len({candle.ts_open_ms for candle in series.candles}) == 1
+
+
+# --- The published reason is this module's, not the artifact's ------------------------------------
+
+
+async def test_a_hand_edited_reason_cannot_displace_the_modules_own(tmp_path: Path) -> None:
+    """The artifact is spread into ``detail`` as evidence; it may not overwrite the verdict.
+
+    ``reason`` is spread LAST so a same-named key in the artifact cannot displace this module's
+    explanation of its own decision. No preflight writer emits a bare ``reason`` (they emit
+    ``failure_reason``), so this defends against the hand-edited artifact the read path already takes
+    seriously — and it is the field the whole probe-status binding is asserted through, so a
+    displaced reason would silently weaken four other tests.
+    """
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    write_preflight_failure("sentinel reason: probe did not complete", preflight_path)
+    artifact = json.loads(preflight_path.read_text(encoding="utf-8"))
+    artifact["reason"] = "SENTINEL-INJECTED-REASON-the season was fine"
+    preflight_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    result = await run_fetch_and_seal(preflight_path, RecordingClient(), data_dir)
+
+    assert result is None
+    published_reason = _reason_of(data_dir)
+    assert "SENTINEL-INJECTED-REASON" not in published_reason
+    assert "failed" in published_reason
+    # ACCEPTANCE: the artifact is still carried as evidence — the guard narrows one key, not the detail.
+    assert published.read_state(data_dir)["detail"]["probe_status"] == "failed"

@@ -14,6 +14,7 @@ it, which is all the plan's snippet requires.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -238,3 +239,104 @@ def test_seal_writes_exactly_the_three_pack_files(tmp_path: Path, canonical_fixt
     ref = seal_pack(trials, settlement, meta, out_dir=tmp_path)
     written = sorted(entry.name for entry in ref.dir.iterdir())
     assert written == sorted([MANIFEST_FILENAME, SETTLEMENT_FILENAME, TRIALS_FILENAME])
+
+
+# --- season_id is untrusted input to a path join --------------------------------------------------
+
+# The shape ``fetch_and_seal._season_id`` emits. That generator's output is proven ACCEPTABLE on the
+# integration side — every seal-path test in ``test_no_season_branch.py`` runs through it, so a guard
+# that rejected the real format would fail there. This literal is the acceptance control for the
+# guard read in isolation.
+_GENERATED_SHAPE_SEASON_ID = "season-196-1m-20260727T010553Z"
+
+_ESCAPING_SEASON_IDS = [
+    "../escaped",
+    "..",
+    "nested/child",
+    "/absolute",
+    ".",
+]
+
+
+@pytest.mark.parametrize("season_id", _ESCAPING_SEASON_IDS)
+def test_a_season_id_that_could_escape_out_dir_is_refused(tmp_path: Path, canonical_fixtures, season_id: str) -> None:
+    """``season_id`` becomes a directory name, and it arrives from a hand-editable artifact.
+
+    ``run_fetch_and_seal`` builds it as ``season-{chain_index}-{bar}-{moment}`` with ``chain_index``
+    read straight off ``preflight_result.json``, and the non-sealable check tests that field only for
+    ``is None`` — never for CONTENT. So a restored or hand-edited artifact carrying a traversal in
+    ``chain_index`` reaches this guard, and nothing else stands between it and the path join.
+
+    Asserted in the units of the claim: not merely that it raises, but that NOTHING was written
+    outside ``out_dir``. A guard that raised after creating the directory would pass a raises-only
+    test while having already escaped.
+    """
+    trials, settlement, base = canonical_fixtures
+    out_dir = tmp_path / "packs"
+    out_dir.mkdir()
+    before = sorted(entry.name for entry in tmp_path.iterdir())
+
+    with pytest.raises(ValueError, match="not a usable directory name"):
+        seal_pack(trials, settlement, replace(base, season_id=season_id), out_dir=out_dir)
+
+    assert list(out_dir.iterdir()) == []
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == before
+
+
+def test_a_generated_season_id_is_accepted(tmp_path: Path, canonical_fixtures) -> None:
+    """ACCEPTANCE CONTROL for the ``season_id`` guard: it must SEPARATE, not merely refuse.
+
+    Without this, every vector above passes against a guard that rejects every id — including one
+    whose pattern is simply broken.
+    """
+    trials, settlement, base = canonical_fixtures
+    ref = seal_pack(trials, settlement, replace(base, season_id=_GENERATED_SHAPE_SEASON_ID), out_dir=tmp_path)
+
+    assert ref.dir.name == _GENERATED_SHAPE_SEASON_ID
+    assert ref.dir.parent == tmp_path
+    assert load_pack(ref).meta.season_id == _GENERATED_SHAPE_SEASON_ID
+
+
+# --- one pack directory holds one generation ------------------------------------------------------
+
+
+def test_sealing_twice_into_one_season_dir_is_refused_and_the_first_survives(
+    tmp_path: Path, canonical_fixtures
+) -> None:
+    """A second seal over an existing pack is refused, and the first pack is left intact.
+
+    Both halves matter. The hash scope is a FIXED set of three filenames, so a file left by an
+    earlier build would not even be VISIBLE in the digest — two generations side by side is a pack
+    that verifies while not being what it appears to be. And a refusal that had already clobbered the
+    first pack would trade one failure for a worse one.
+    """
+    trials, settlement, base = canonical_fixtures
+    meta = replace(base, season_id="season-fixed-id")
+    first = seal_pack(trials, settlement, meta, out_dir=tmp_path)
+    original_hash = first.content_hash
+
+    with pytest.raises(FileExistsError):
+        seal_pack(trials, settlement, meta, out_dir=tmp_path)
+
+    reloaded = load_pack(first)
+    assert reloaded.ref.content_hash == original_hash
+    assert len(reloaded.trials) == _TRIAL_COUNT
+    assert sorted(entry.name for entry in first.dir.iterdir()) == sorted(
+        [MANIFEST_FILENAME, SETTLEMENT_FILENAME, TRIALS_FILENAME]
+    )
+
+
+def test_two_seasons_may_share_one_out_dir(tmp_path: Path, canonical_fixtures) -> None:
+    """DISCRIMINATION CONTROL: the refusal is about the SEASON directory, not about ``out_dir``.
+
+    ``out_dir`` is ``<data_dir>/packs/`` and is expected to accumulate seasons. A guard that refused
+    any non-empty ``out_dir`` would pass the test above and break the directory's actual purpose.
+    """
+    trials, settlement, base = canonical_fixtures
+    first = seal_pack(trials, settlement, replace(base, season_id="season-one"), out_dir=tmp_path)
+    second = seal_pack(trials, settlement, replace(base, season_id="season-two"), out_dir=tmp_path)
+
+    assert first.dir != second.dir
+    assert first.dir.parent == second.dir.parent == tmp_path
+    assert load_pack(first).meta.season_id == "season-one"
+    assert load_pack(second).meta.season_id == "season-two"
