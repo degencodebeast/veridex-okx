@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Exhibit ONE live signal arriving over the OKX WS push channel, and open a trial over it.
+
+    python scripts/signal_trials/ws_exhibition.py --ws-url wss://... --chain-index 501 \
+        --data-dir ./data [--dry-run]
+
+The composition is script-level and deliberately so: this script subscribes, takes the first
+pushed signal, and hands the RAW signal to the payments-lane ``open_live_trial.py`` on stdin. It
+edits nothing that lane owns and imports nothing from it. ``open_live_trial.py`` does its own
+canonicalization, so the leakage boundary stays in ``challenge_spec.normalize_signal`` where a
+reviewer of that boundary will look for it, rather than being quietly relocated here.
+
+**The source is a recorded fact, not an operator's assertion.**
+
+The frozen plan's truth rule reads: *if live WS is unreliable at demo time, the demo says
+"REST-sourced live trial" — REST is never labeled a WS arrival.* The obligation that rule creates
+for this script is structural rather than editorial, so it is met structurally:
+
+* There is **no ``--source`` flag and no ``source=`` parameter**, on any surface. The one thing an
+  operator under demo-time pressure could do to produce a false label is not offered.
+* ``ws`` is a module constant emitted on a path that can only be reached by having consumed a real
+  WS push frame, because :func:`~veridex.signal_trials.okx_client.subscribe_one_signal` refuses
+  every frame that is not a push on the signal channel — including a REST envelope replayed onto
+  the WS wire, which is otherwise indistinguishable by payload alone.
+* :class:`ExhibitionSummary` derives ``source`` rather than storing it, so no construction path
+  writes it and no caller can reassign it.
+
+Consequently there is no code path in this program that turns a REST arrival into a WS-labelled
+record. If WS is unreliable at demo time the honest fallback is to run ``open_live_trial.py``
+directly with ``--source rest``, which labels it truthfully.
+
+**This script reads no credential.** ``subscribe_one_signal`` authenticates nothing — the WS
+handshake belongs to the transport — so nothing here touches ``OKX_API_KEY`` or its siblings. A
+process that never reads a secret cannot leak one into a demo transcript.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final, Literal, NoReturn, Protocol
+
+from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, normalize_signal
+from veridex.signal_trials.okx_client import WS_SIGNAL_CHANNEL, WSTransport, subscribe_one_signal
+
+#: The transport tag for everything this script produces. A constant, never an argument: see the
+#: module docstring. A mutation of this value is killed by
+#: `test_the_handoff_labels_the_signal_ws_and_there_is_no_argv_that_says_rest`.
+#:
+#: `Final[Literal["ws"]]` rather than `str`, and that is the truth rule expressed in the type
+#: system: the declared type of this module's source tag admits exactly one value, so a type check
+#: rejects any edit that widens it — including the one that would let `"rest"` be written here.
+WS_SOURCE: Final[Literal["ws"]] = "ws"
+
+#: The payments-lane script this one composes with. Resolved as a path and never imported, so this
+#: script holds no code-level coupling to a module another lane owns.
+OPEN_LIVE_TRIAL_SCRIPT = Path(__file__).resolve().parent / "open_live_trial.py"
+
+#: The one sentence an operator must see whenever a trial MIGHT exist. Shared by both routes that
+#: can reach that state — an exception raised after the handoff began, and a nonzero child status —
+#: because they are the same situation and a reader who learns the phrase from one must recognise
+#: it from the other. Two spellings of one warning is how the two paths drift apart.
+INDETERMINATE_WARNING = (
+    "a live trial MAY ALREADY EXIST for this signal; check the data dir before opening a REST-sourced one"
+)
+
+#: Receive bound, in seconds. `WSTransport` states that a real implementation MUST set one, because
+#: `_ws_converse` loops with no frame budget. Generous rather than tight: a signal push is a market
+#: event and may legitimately be minutes away, so this is the "the socket has gone quiet and the
+#: demo needs an answer" bound, not a latency SLA. An expiry becomes a clean `refused:` line.
+RECV_TIMEOUT_S = 90.0
+
+#: Handshake and close bounds, passed explicitly rather than left to library defaults — the same
+#: choice `scripts/smoke_public_ws.py::_default_connect` makes.
+OPEN_TIMEOUT_S = 10.0
+CLOSE_TIMEOUT_S = 5.0
+
+#: How the connection is opened. Injected so tests never reach a socket — see `_run`.
+ConnectFactory = Callable[[str], Any]
+
+
+class Handoff(Protocol):
+    """How the open-trial script gets run. Injected so tests never spawn a process."""
+
+    def __call__(self, argv: list[str], stdin_text: str) -> int: ...
+
+
+class PostHandoffError(RuntimeError):
+    """A failure that happened AFTER the open-trial handoff fired — so a trial MAY EXIST.
+
+    This type exists because of what ``main``'s ``refused:`` line instructs an operator to do. The
+    module docstring's fallback is "say REST-sourced and open a REST trial instead", and that is
+    correct advice for a failure BEFORE the handoff, when nothing was published. Applied to a
+    failure AFTER it, the same advice produces a SECOND live trial for one signal — one labelled
+    ``ws``, one labelled ``rest``. A single word in a stderr line is the difference.
+
+    The window is small but it is not empty: the summary construction, the connection ``__aexit__``
+    and the final ``print`` all run after the child has been spawned. Low probability is a reason
+    to make the message precise, not a reason to let it be wrong — the guarantee the docstring
+    makes about what ``refused:`` MEANS is the thing being kept honest here.
+
+    ``RuntimeError`` rather than a bare ``Exception`` so it is still caught by ``main``'s broad
+    handler with no special-casing needed for the exit status; only the WORDING differs.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        # `_describe`, not `f"{type(cause).__name__}: {cause}"`, and this line reaches an operator
+        # by a route the module's other renderings do not. On the Ctrl-C path the marker built here
+        # is spliced into the interrupt's `__context__` and `main` RE-RAISES, so this text is
+        # printed by the DEFAULT EXCEPTHOOK, in the operator's terminal, on the most likely
+        # interruption of a live demo. `str(KeyboardInterrupt())` is the empty string, so the naive
+        # form rendered `KeyboardInterrupt: ` — a line whose detail is a bare colon. Fixing it here
+        # rather than at the call site fixes `main`'s `str(error)` rendering transitively, because
+        # that is this same string.
+        super().__init__(_describe(cause))
+        self.cause = cause
+
+
+@dataclass(frozen=True)
+class ExhibitionSummary:
+    """What one exhibition did — the operator-facing record of a WS arrival.
+
+    ``source`` is a property, not a field. Frozen would already block reassignment, but a field
+    would still be settable AT CONSTRUCTION, which is enough for a future caller to record a WS
+    arrival as something else. Deriving it means the value has exactly one origin.
+    """
+
+    evidence_hash: str
+    evidence_fields: tuple[str, ...]
+    handoff_status: int
+    dry_run: bool
+
+    @property
+    def source(self) -> Literal["ws"]:
+        """Where this signal came from. Always ``ws``: nothing else can reach this class."""
+        return WS_SOURCE
+
+    @property
+    def published(self) -> bool:
+        """Whether a live trial DEFINITELY exists now.
+
+        True only for a non-dry-run handoff that returned 0. A summary claiming a publication the
+        open-trial script refused would be the demo asserting a live trial exists when none does.
+        """
+        return self.handoff_status == 0 and not self.dry_run
+
+    @property
+    def publication_indeterminate(self) -> bool:
+        """Whether a trial MIGHT exist despite the handoff failing — the false-NEGATIVE case.
+
+        ``published`` guards one direction: never claim a publication that did not happen. That
+        left the inverse unguarded, and the inverse is the one that produces a second trial.
+
+        **A nonzero child status does not mean nothing was written.** ``open_live_trial.py``
+        publishes durably FIRST and prints its summary AFTERWARDS, so a terminal-output failure —
+        a closed pipe, a full disk — leaves a real trial on disk while the child exits nonzero.
+        Reported as ``published: false``, that tells an operator to open a REST-sourced fallback
+        for a signal that already has a WS-sourced trial: one signal, two live trials, contradictory
+        source labels. Exactly what the truth rule exists to prevent.
+
+        So the honest report has THREE states, not two: definitely published, definitely not
+        (nothing was ever spawned, or it was a dry run), and INDETERMINATE — the child began and
+        did not cleanly succeed, and only the data directory can settle it.
+        """
+        return self.handoff_status != 0 and not self.dry_run
+
+    def render(self) -> dict[str, Any]:
+        """The JSON-safe view printed to stdout.
+
+        **Evidence VALUES are absent, with NO exception** — only the field NAMES and the hash. The
+        payload is public through the free read; a terminal transcript is not where it should be
+        published, and the hash is what an operator compares against a receipt.
+
+        **The "no exception" is the load-bearing half.** Two fields were printed here and both were
+        wrong to print; the second, ``t0_ms``, was RETAINED for a round under a written exception
+        that read plausibly and was false in three ways, none of which had been measured. Anyone
+        reaching for a fresh exception should assume theirs reads just as plausibly. The rule is
+        also what makes the guard general: ``test_the_rendered_summary_publishes_NO_evidence_VALUE_
+        without_exception`` walks EVERY field of the signal, which a hand-kept exception list would
+        make impossible.
+
+        An operator who needs the deadline already has it — the handoff does not capture the
+        child's stdout, so ``open_live_trial.py`` prints the authoritative ``t0_ms`` and
+        ``commit_deadline_ms`` into the same terminal, in the same run.
+
+        Full history — the three false claims, the measurements that refuted them, and why
+        dropping beat relabelling — is in PKT-EVID-H2-5-MUTATION-3f9a4c7.txt SECTION 3, the commit
+        message, and the test's own docstring.
+        """
+        return {
+            "source": self.source,
+            "evidence_hash": self.evidence_hash,
+            "evidence_fields": list(self.evidence_fields),
+            "handoff_status": self.handoff_status,
+            "dry_run": self.dry_run,
+            "published": self.published,
+            "publication_indeterminate": self.publication_indeterminate,
+        }
+
+
+def build_handoff_argv(*, data_dir: str, dry_run: bool) -> list[str]:
+    """The argv for the open-trial script. Carries ``--source ws`` and no way to say otherwise."""
+    argv = [str(OPEN_LIVE_TRIAL_SCRIPT), "--data-dir", data_dir, "--source", WS_SOURCE]
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
+
+
+def _subprocess_handoff(argv: list[str], stdin_text: str) -> int:
+    """Spawn the open-trial script under this same interpreter and return its exit status."""
+    # No shell, and every element of `argv` is built by `build_handoff_argv` from this module's own
+    # constants plus `--data-dir` — there is no operator-supplied string that could become a word.
+    completed = subprocess.run(
+        [sys.executable, *argv],
+        input=stdin_text,
+        text=True,
+        check=False,
+    )
+    return completed.returncode
+
+
+async def exhibit_one_signal(
+    ws_transport: WSTransport,
+    chain_index: str,
+    *,
+    data_dir: str,
+    dry_run: bool = False,
+    handoff: Handoff | None = None,
+) -> ExhibitionSummary:
+    """Subscribe once, normalize the arrival as ``ws``, and hand it to the open-trial script.
+
+    ``normalize_signal`` runs here as well as inside the handoff, and the duplication is the point:
+    a signal that cannot be canonicalized must be refused BEFORE anything is published, so a
+    malformed arrival costs the exhibition rather than producing a half-opened trial. Its refusal
+    propagates — there is no partial-success path — and the handoff never fires.
+
+    Raises:
+        OKXClientError: the WS conversation failed or the frame was not a signal push.
+        ValueError: the arrived signal failed canonicalization (including leakage refusals).
+    """
+    # Resolved at CALL time for the same reason `_WebsocketsTransport._recv_timeout` is:
+    # `handoff: Handoff = _subprocess_handoff` in the signature FREEZES the function object at
+    # import, so rebinding `module._subprocess_handoff` is silently ignored and the real
+    # subprocess runs anyway. Measured — a test that patched the module attribute spawned
+    # `open_live_trial.py` for real while reporting that its fake had been used.
+    run_handoff: Handoff = _subprocess_handoff if handoff is None else handoff
+
+    raw = await subscribe_one_signal(ws_transport, chain_index)
+    signal: CanonicalSignal = normalize_signal(raw, WS_SOURCE)
+
+    # Both prepared BEFORE the boundary, so that a failure to BUILD the call is still an ordinary
+    # pre-handoff refusal — nothing has been spawned yet at that point.
+    argv = build_handoff_argv(data_dir=data_dir, dry_run=dry_run)
+    payload = json.dumps(raw, separators=(",", ":"), sort_keys=True)
+
+    # THE BOUNDARY CONTAINS THE CALL, and that is the correction. It previously began on the line
+    # AFTER `run_handoff(...)`, so an exception raised BY the handoff itself — a broken pipe while
+    # writing the child's stdin, say — escaped as an ordinary pre-handoff refusal. The comment
+    # naming the hazard sat one line below the statement that creates it.
+    #
+    # `dry_run` is the only exemption, and it is a real one: the child is invoked with
+    # `--dry-run`, writes nothing, so a failure there genuinely leaves nothing behind.
+    #
+    # `except BaseException`, and the WIDTH is the correction. It read `except Exception`, which is
+    # the whole exception hierarchy MINUS exactly the failures an operator causes: a `Ctrl-C`
+    # delivered while `subprocess.run` is inside the child raises `KeyboardInterrupt`, which is a
+    # `BaseException`, so the one interruption most likely to land in the middle of a live demo was
+    # the one this boundary did not cover. `_reraise_as_post_handoff` converts what may be
+    # converted and marks what may not, so Ctrl-C stays Ctrl-C.
+    try:
+        status = run_handoff(argv, payload)
+        return ExhibitionSummary(
+            evidence_hash=evidence_hash(signal),
+            evidence_fields=tuple(sorted(signal.model_dump())),
+            handoff_status=status,
+            dry_run=dry_run,
+        )
+    except BaseException as error:
+        _reraise_as_post_handoff(error, dry_run=dry_run)
+
+
+def _post_handoff_in_chain(error: BaseException) -> PostHandoffError | None:
+    """The first :class:`PostHandoffError` reachable from ``error``, following BOTH chain links.
+
+    A backstop for the one replacement no local of ``_run`` can record. ``asyncio.run`` has a
+    ``finally`` of its own — it cancels pending tasks, shuts async generators down and closes the
+    loop — and anything raised there REPLACES a propagating ``PostHandoffError`` exactly as a
+    failing ``__aexit__`` does, except ABOVE ``_run``, where ``handoff_may_have_started`` is already
+    out of scope. The fact is still in the chain, so this is where ``main`` looks for it.
+
+    **Both links, because both occur.** ``raise X from Y`` sets ``__cause__``; raising while another
+    exception is being handled sets ``__context__``; the replacement chains this module produces
+    contain both. A walk over one link is a census over half the population, which is the same error
+    the statement enumeration made one round earlier. ``seen`` makes it safe against the cycles
+    ``__context__`` can form — a walk that hangs is worse than one that misses.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, PostHandoffError):
+            return current
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+    return None
+
+
+def _splice_post_handoff(error: BaseException) -> None:
+    """Record the post-handoff phase INSIDE ``error``'s chain, leaving ``error`` itself untouched.
+
+    **For the exceptions that must not be converted.** An ``Exception`` can be replaced by
+    ``PostHandoffError`` because nothing downstream depends on its identity. A ``KeyboardInterrupt``
+    cannot: replacing it is precisely what swallows Ctrl-C, turning an operator's interrupt into a
+    program that claims it merely "refused". ``SystemExit`` and ``CancelledError`` are the same
+    shape. So the fact is written into the chain — where :func:`_post_handoff_in_chain` already
+    looks — and the exception is re-raised as itself.
+
+    The displaced ``__context__`` is carried on the marker rather than dropped: an interrupt raised
+    while another failure was being handled still has that failure to explain it, and a phase
+    record bought by deleting the diagnosis would be trading one truth for another.
+
+    Idempotent, because the phase can be recognised at more than one boundary on the way out and a
+    second marker would add nothing but traceback noise.
+    """
+    if _post_handoff_in_chain(error) is not None:
+        return
+    marker = PostHandoffError(error)
+    marker.__context__ = error.__context__
+    error.__context__ = marker
+
+
+def _reraise_as_post_handoff(error: BaseException, *, dry_run: bool) -> NoReturn:
+    """Re-raise ``error`` carrying the post-handoff phase, whatever kind of exception it is.
+
+    THE ONE PLACE THE RULE IS SPELLED. FOUR boundaries in this module need it — the handoff region
+    in ``exhibit_one_signal``, the connect/teardown arbitration in ``_run``, ``_run``'s
+    suppressed-teardown guard, and ``_run``'s tail — and each previously spelled its own version.
+    That is how the ninth instance of this lane's class arrived: the handoff region said
+    ``except Exception``, ``_run`` said ``except PostHandoffError``, and a ``KeyboardInterrupt``
+    delivered while the child was running matched neither, so the phase was never recorded at all.
+
+    The count in this sentence was itself wrong for a round: it said THREE while the
+    suppressed-teardown guard spelled the rule inline fourteen lines from a comment claiming it did
+    not. A docstring that enumerates its call sites is a claim, and this one is now the enumeration
+    a reader can check — four, listed above.
+
+    ``dry_run`` is the single exemption and it is applied HERE for the same reason: the child was
+    invoked with ``--dry-run`` and wrote nothing, so the ordinary refusal is the TRUE sentence, and
+    a warning that fires when publication was impossible erodes the one that matters.
+    """
+    if dry_run:
+        raise error
+    if isinstance(error, Exception):
+        raise PostHandoffError(error) from error
+    _splice_post_handoff(error)
+    raise error
+
+
+def _describe(error: BaseException) -> str:
+    """``Type: message`` — or the type ALONE when the message is empty.
+
+    ``str(KeyboardInterrupt())`` is the empty string, and so is ``str(TimeoutError())``. Formatted
+    naively that renders ``refused: KeyboardInterrupt: `` — a refusal whose detail is a bare colon,
+    which is the defect ``_WebsocketsTransport.recv``'s docstring already records having been
+    measured once on the timeout path.
+    """
+    message = str(error)
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _refuse_after_handoff(detail: str) -> int:
+    """Print the post-handoff refusal and return the process status. ONE spelling, two callers.
+
+    ``main`` reaches this from two directions — a ``PostHandoffError`` that arrived intact, and one
+    recovered from the chain after something replaced it — and they are the same situation. Two
+    inlined copies of this sentence is how the two would drift apart, which is the reason
+    :data:`INDETERMINATE_WARNING` is a constant in the first place.
+    """
+    print(f"refused AFTER handoff: {detail} -- {INDETERMINATE_WARNING}", file=sys.stderr)
+    return 1
+
+
+def exit_status(summary: ExhibitionSummary) -> int:
+    """The process status for ``summary``. Non-zero unless a trial really was opened.
+
+    A dry run is a success (nothing was meant to be published), so it maps to 0; a refused handoff
+    does not, so a shell driving this cannot read a printed summary as a published trial.
+    """
+    return 0 if summary.handoff_status == 0 else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI. Note the absence of any option that names a transport source — see the docstring."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Exhibit one WS-arriving OKX signal and open a live trial over it. "
+            "Signals exhibited by this script are recorded as WS arrivals because they are; "
+            "there is no option to label them otherwise."
+        ),
+    )
+    parser.add_argument("--ws-url", required=True, help="WS endpoint to connect to.")
+    parser.add_argument("--chain-index", required=True, help="Chain to subscribe the signal channel for.")
+    parser.add_argument("--data-dir", required=True, help="Signal-trials data directory; the API must serve it.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Render what would be published and write nothing.",
+    )
+    return parser
+
+
+class _WebsocketsTransport:
+    """Adapter over a `websockets` client connection, satisfying :class:`WSTransport`.
+
+    Exists for two reasons. First, to keep the byte/str ambiguity at the edge: `recv` can yield
+    either, and the frame parsing upstream is written against exactly one input type.
+
+    Second, and this is the load-bearing one, **to honour the receive-timeout MUST that
+    ``WSTransport``'s docstring states.** ``_ws_converse`` is a ``while True`` with no frame budget
+    BY DESIGN — the protocol layer cannot know what a reasonable wait is, so the whole safety of
+    that loop rests on the transport imposing a bound. This class is the repo's ONLY real
+    implementation of that Protocol, and it previously did not impose one: `recv` was a bare
+    ``await``, which made the module's own stated MUST false at the only place it applied.
+
+    Why a bare await is not enough, measured rather than assumed: websockets 15.0.1's
+    ``ClientConnection.recv`` has signature ``(self, decode)`` — **there is no timeout parameter**,
+    so the bound can only come from the caller. ``connect()``'s ``open_timeout`` bounds the
+    handshake and ``ping_interval``/``ping_timeout`` detect a DEAD peer, but a peer that is alive
+    and answering Pings while pushing no signal blocks ``recv`` with nothing to interrupt it. That
+    is exactly the heartbeats-forever case, and on the H6.1 demo path it is a hung terminal in
+    front of an audience — the one state worse than the traceback ``main`` was fixed to avoid.
+
+    ``asyncio.wait_for`` is the same mechanism ``scripts/smoke_public_ws.py`` already uses for its
+    own WS reads; this is an in-repo pattern, not a novel demand. The expiry surfaces as
+    ``TimeoutError``, which ``main``'s existing ``except Exception`` renders as a clean ``refused:``
+    line — the documented operator behaviour.
+    """
+
+    def __init__(self, connection: Any, *, recv_timeout: float | None = None) -> None:
+        self._connection = connection
+        # Resolved at CALL time, not as a default argument. `recv_timeout=RECV_TIMEOUT_S` in the
+        # signature would freeze the constant at import, so an operator override or a test that
+        # rebinds the module attribute would be silently ignored — the default would already have
+        # been captured. Measured: a test that set it to 0.05 waited the full 90s default.
+        self._recv_timeout = RECV_TIMEOUT_S if recv_timeout is None else recv_timeout
+
+    async def send(self, message: str) -> None:
+        await self._connection.send(message)
+
+    async def recv(self) -> str:
+        try:
+            frame = await asyncio.wait_for(self._connection.recv(), timeout=self._recv_timeout)
+        except TimeoutError as error:
+            # `str(TimeoutError())` is the EMPTY STRING, so `main`'s formatter rendered the bare
+            # `refused: TimeoutError: ` with nothing after the colon — a refusal that tells an
+            # operator only that something did not happen. The detail is added HERE, at the one
+            # place that knows the bound and what waiting on it meant.
+            raise TimeoutError(
+                f"no WS frame arrived within {self._recv_timeout:g}s on the "
+                f"{WS_SIGNAL_CHANNEL!r} channel; the socket is open but the peer is pushing "
+                "nothing. Fall back to a REST-sourced trial and label it rest."
+            ) from error
+        return frame.decode("utf-8") if isinstance(frame, bytes) else str(frame)
+
+    async def close(self) -> None:
+        await self._connection.close()
+
+
+def _default_connect(ws_url: str) -> Any:
+    """Open the real connection. The ONLY place in this module that opens a socket.
+
+    Bounds the handshake explicitly rather than relying on defaults, matching
+    ``scripts/smoke_public_ws.py``'s ``_default_connect``.
+    """
+    import websockets
+
+    return websockets.connect(ws_url, open_timeout=OPEN_TIMEOUT_S, close_timeout=CLOSE_TIMEOUT_S)
+
+
+async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | None = None) -> int:
+    """Connect, exhibit once, print the summary.
+
+    ``connect_factory`` is INJECTED for the same reason ``handoff`` is, and the omission was a real
+    gap rather than a style point. While the connection was resolved by a function-local
+    ``import websockets``, the only way to intercept it was global ``sys.modules`` state — so
+    "no real socket is opened" rested on every future test remembering to patch it, with no
+    structural backstop, and three decision points here were disclosed as unbindable when they were
+    merely un-injected. ``scripts/smoke_public_ws.py`` already ships this seam; H2.5 had not
+    picked it up.
+
+    **Resolved at CALL time, and this is the THIRD seam in this file to need that correction.**
+    ``connect_factory: ConnectFactory = _default_connect`` in the signature freezes the function
+    object at import, so rebinding ``module._default_connect`` is silently ignored — and unlike the
+    other two, what escapes is not a stale value but the REAL LIBRARY: a genuine resolver call
+    (``gaierror``), from the seam whose whole purpose is that nothing reaches a socket.
+
+    The inconsistency was the trap, more than the individual defect. Two seams here taught that
+    module-attribute rebinding is the idiom that works; a third silently did not, and it was the
+    one that reaches the network. One rule for all three is worth more than a frozen default.
+    """
+    connect = _default_connect if connect_factory is None else connect_factory
+    summary: ExhibitionSummary | None = None
+
+    # THE PHASE IS RECORDED, NOT INFERRED — and inferring it is what failed for the eighth time.
+    #
+    # The previous arbitration read `summary`, which is bound only when `exhibit_one_signal`
+    # RETURNS. That is a sound inference right up until the moment something ELSE fails on the way
+    # out: if the inner call raises `PostHandoffError` and the connection's `__aexit__` then also
+    # raises, Python REPLACES the active exception with the teardown one. `summary` is still None
+    # and the outer type is no longer `PostHandoffError`, so both facts the arbitration consulted
+    # are gone, and the operator was handed the pre-handoff instruction over a child that may
+    # already have published.
+    #
+    # ENUMERATE THE PATHS, NOT THE LINES. The round before this one hardened the region by walking
+    # every STATEMENT in it, and `__aexit__`, `finally` and generator close run BETWEEN statements —
+    # invisible to that census, and `__aexit__` is exactly where an exception is REPLACED rather
+    # than passed along. A flag written where the phase is KNOWN survives any later replacement
+    # because it is not carried by the exception at all.
+    handoff_may_have_started = False
+    # What the suppression ERASED, kept so the operator is not told only that something was
+    # swallowed. An `__aexit__` returning True clears the handled exception, so by the time control
+    # reaches the guard below, `__context__` is `None` and the real failure is unrecoverable — but
+    # it was in scope one block earlier, because `__aexit__` can only suppress an exception raised
+    # by the block body and the handler below catches every one of them first.
+    suppressed_cause: BaseException | None = None
+    try:
+        async with connect(args.ws_url) as connection:
+            try:
+                summary = await exhibit_one_signal(
+                    _WebsocketsTransport(connection),
+                    args.chain_index,
+                    data_dir=args.data_dir,
+                    dry_run=args.dry_run,
+                )
+            except BaseException as error:
+                # `BaseException`, not `PostHandoffError`, and that width is the ninth instance's
+                # correction. A `KeyboardInterrupt` carries the phase in its CHAIN rather than in
+                # its type — it cannot be converted without swallowing Ctrl-C — so the question
+                # this clause asks is "does anything in the chain say post-handoff", which is true
+                # of a `PostHandoffError` trivially and of a marked interrupt equally.
+                if _post_handoff_in_chain(error) is not None:
+                    handoff_may_have_started = True
+                suppressed_cause = error
+                raise
+    except BaseException as error:
+        if isinstance(error, PostHandoffError):
+            raise
+        # A live `summary` still means the same thing — the exhibition returned, so the child ran
+        # and only the teardown failed. The `--dry-run` exemption is not spelled here: it lives in
+        # `_reraise_as_post_handoff` with the other three boundaries, because stating one rule at
+        # four sites is how the four drift apart.
+        if handoff_may_have_started or summary is not None:
+            _reraise_as_post_handoff(error, dry_run=args.dry_run)
+        raise
+
+    if summary is None:
+        # THE THIRD NON-STATEMENT EXIT, found by the same sweep. An `__aexit__` that returns True
+        # SUPPRESSES the failure: nothing propagates, the handler above never runs, and control
+        # simply arrives here with nothing assigned. Reaching the tail would raise `AttributeError`
+        # on `None` and get wrapped as post-handoff regardless of phase — a warning that fires on
+        # every refusal is not a warning. The run has still failed; what it must not do is guess.
+        #
+        # THE FOURTH BOUNDARY, AND IT NO LONGER SPELLS THE RULE ITSELF. It read
+        # `raise PostHandoffError(suppressed)` — fourteen lines below the comment above, which
+        # asserts that the `--dry-run` exemption lives in `_reraise_as_post_handoff` rather than at
+        # the boundaries; that was true of the line above it and false of this one. It was correct
+        # only by an
+        # emergent cross-function invariant that nothing stated and nothing tested: under
+        # `--dry-run` nothing splices a marker, so `handoff_may_have_started` never becomes True, so
+        # this branch was unreachable. A mutant that made it warn "a live trial MAY ALREADY EXIST"
+        # on a run where publication was IMPOSSIBLE survived the entire suite. Routing through the
+        # helper makes the exemption a fact of the code rather than of the call graph.
+        erased = "cause unrecorded" if suppressed_cause is None else _describe(suppressed_cause)
+        suppressed = RuntimeError(f"the connection's __aexit__ suppressed the exhibition failure ({erased})")
+        # The cause the suppression erased, restored for diagnosis as well as for the sentence.
+        suppressed.__cause__ = suppressed_cause
+        if handoff_may_have_started:
+            _reraise_as_post_handoff(suppressed, dry_run=args.dry_run)
+        raise suppressed
+
+    # ONE BOUNDARY OVER THE WHOLE TAIL, rather than one per statement, and the shape is the fix.
+    #
+    # Twice the correction enclosed everything that EXISTED and left what it ADDED outside: round 1
+    # wrapped the summary construction and left the handoff call out; round 2 wrapped the handoff
+    # call and left this warning print out. Wrapping statements individually is what produced that,
+    # because each new statement is a new decision nobody is prompted to make. Enclosing the REGION
+    # means anything added here later is inside by default, and the enumeration in
+    # `h25_postboundary.py` reports the region rather than the known gaps.
+    #
+    # Everything below runs after the child has started AND returned, so a failure here is
+    # post-handoff by construction — including `exit_status`, which the reviewer did not name and
+    # which has no business being reasoned about individually.
+    try:
+        print(json.dumps(summary.render(), indent=2, sort_keys=True))
+
+        # THE NONZERO-RETURN PATH. It never raises, so no exception handler could ever have covered
+        # the CHILD's failure — the child simply reports it, having published BEFORE it printed. The
+        # operator gets the same sentence here as on the raising path, from the same constant.
+        if summary.publication_indeterminate:
+            print(
+                f"handoff returned {summary.handoff_status} AFTER starting -- {INDETERMINATE_WARNING}",
+                file=sys.stderr,
+            )
+        return exit_status(summary)
+    except BaseException as error:
+        _reraise_as_post_handoff(error, dry_run=args.dry_run)
+
+
+def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | None = None) -> int:
+    """Run one exhibition. Refusals go to stderr and exit non-zero.
+
+    ``connect_factory`` is passed straight through to ``_run``. Without it ``main`` had NO connect
+    seam at all, so its two returns were reachable only by faking ``sys.modules`` — the exact
+    dependency the seam was introduced to remove. A test name in this file certified that removal
+    while two tests in the same file still needed the fake, and needed it precisely BECAUSE ``main``
+    had no seam. A name asserting a file-wide absence its own file refutes is worse than no name.
+
+    **The catch is deliberately broad, and the narrow version was measurably wrong.** This
+    previously caught ``(OSError, ValueError, OKXClientError)``, a tuple written by reasoning about
+    which exceptions a connection failure raises. Measured against the installed ``websockets``
+    15.0.1, ``InvalidURI``, ``InvalidHandshake`` and ``ConnectionClosed`` are subclasses of
+    ``WebSocketException`` and of NEITHER ``OSError`` nor ``ValueError`` — so not one of the
+    failures this script exists to survive was caught, and the documented refusal degraded to a
+    traceback. ``import websockets`` failing adds ``ModuleNotFoundError`` to the same list.
+
+    Re-enumerating a third-party hierarchy is the move that just failed, so this does not do it
+    again. ``Exception`` leaves ``KeyboardInterrupt`` and ``SystemExit`` alone (they are
+    ``BaseException``), so Ctrl-C still behaves, and the exception TYPE is printed alongside the
+    message so a genuine defect stays diagnosable rather than being flattened into a bare string.
+
+    This matters beyond tidiness: the scenario it fails on — live WS unreliable at demo time — is
+    the exact scenario the plan's truth rule is written for. An operator who gets a clean
+    ``refused:`` line falls back to a REST-sourced trial and says so; one who gets a traceback is
+    being invited to improvise.
+    """
+    args = build_parser().parse_args(argv)
+    try:
+        return asyncio.run(_run(args, connect_factory=connect_factory))
+    except PostHandoffError as error:
+        # A DIFFERENT SENTENCE, because the operator's correct next action is different. "refused"
+        # invites the documented REST fallback; after the handoff has fired that fallback would
+        # open a SECOND trial for one signal. This line tells them to check before acting.
+        return _refuse_after_handoff(str(error))
+    except Exception as error:
+        # ...AND THE TYPE IS NOT THE ONLY EVIDENCE OF THE PHASE. A teardown that fails inside
+        # `asyncio.run`'s own `finally` replaces the `PostHandoffError` on its way out of `_run`,
+        # and what arrives here is the replacement. The detail printed is that replacement, because
+        # it is what actually stopped the run; the INSTRUCTION is the post-handoff one, because the
+        # child may still have published. Nothing recovers the phase for a failure that never had
+        # one, so an ordinary refusal stays ordinary.
+        if _post_handoff_in_chain(error) is not None:
+            return _refuse_after_handoff(_describe(error))
+        print(f"refused: {_describe(error)}", file=sys.stderr)
+        return 1
+    except BaseException as error:
+        # CTRL-C KEEPS ITS MEANING, AND THE OPERATOR STILL GETS THE INSTRUCTION. Converting a
+        # `KeyboardInterrupt` into a returned status would emit the right sentence and silently
+        # take the interrupt away — an operator who stops a demo would get exit 1 and a program
+        # claiming it merely "refused". So this prints and RE-RAISES: the process still dies by
+        # interrupt, and the line saying a trial may already exist has already been written.
+        #
+        # Nothing is printed when the phase is absent, because a pre-handoff interrupt published
+        # nothing and has no message this program can usefully add. (`subscribe_one_signal` uses
+        # the same `except BaseException: ...; raise` shape for its own close discipline.)
+        if _post_handoff_in_chain(error) is not None:
+            _refuse_after_handoff(_describe(error))
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
