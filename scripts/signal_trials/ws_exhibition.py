@@ -272,6 +272,46 @@ async def exhibit_one_signal(
         raise PostHandoffError(error) from error
 
 
+def _post_handoff_in_chain(error: BaseException) -> PostHandoffError | None:
+    """The first :class:`PostHandoffError` reachable from ``error``, following BOTH chain links.
+
+    A backstop for the one replacement no local of ``_run`` can record. ``asyncio.run`` has a
+    ``finally`` of its own — it cancels pending tasks, shuts async generators down and closes the
+    loop — and anything raised there REPLACES a propagating ``PostHandoffError`` exactly as a
+    failing ``__aexit__`` does, except ABOVE ``_run``, where ``handoff_may_have_started`` is already
+    out of scope. The fact is still in the chain, so this is where ``main`` looks for it.
+
+    **Both links, because both occur.** ``raise X from Y`` sets ``__cause__``; raising while another
+    exception is being handled sets ``__context__``; the replacement chains this module produces
+    contain both. A walk over one link is a census over half the population, which is the same error
+    the statement enumeration made one round earlier. ``seen`` makes it safe against the cycles
+    ``__context__`` can form — a walk that hangs is worse than one that misses.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, PostHandoffError):
+            return current
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+    return None
+
+
+def _refuse_after_handoff(detail: str) -> int:
+    """Print the post-handoff refusal and return the process status. ONE spelling, two callers.
+
+    ``main`` reaches this from two directions — a ``PostHandoffError`` that arrived intact, and one
+    recovered from the chain after something replaced it — and they are the same situation. Two
+    inlined copies of this sentence is how the two would drift apart, which is the reason
+    :data:`INDETERMINATE_WARNING` is a constant in the first place.
+    """
+    print(f"refused AFTER handoff: {detail} -- {INDETERMINATE_WARNING}", file=sys.stderr)
+    return 1
+
+
 def exit_status(summary: ExhibitionSummary) -> int:
     """The process status for ``summary``. Non-zero unless a trial really was opened.
 
@@ -392,22 +432,57 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
     """
     connect = _default_connect if connect_factory is None else connect_factory
     summary: ExhibitionSummary | None = None
+
+    # THE PHASE IS RECORDED, NOT INFERRED — and inferring it is what failed for the eighth time.
+    #
+    # The previous arbitration read `summary`, which is bound only when `exhibit_one_signal`
+    # RETURNS. That is a sound inference right up until the moment something ELSE fails on the way
+    # out: if the inner call raises `PostHandoffError` and the connection's `__aexit__` then also
+    # raises, Python REPLACES the active exception with the teardown one. `summary` is still None
+    # and the outer type is no longer `PostHandoffError`, so both facts the arbitration consulted
+    # are gone, and the operator was handed the pre-handoff instruction over a child that may
+    # already have published.
+    #
+    # ENUMERATE THE PATHS, NOT THE LINES. The round before this one hardened the region by walking
+    # every STATEMENT in it, and `__aexit__`, `finally` and generator close run BETWEEN statements —
+    # invisible to that census, and `__aexit__` is exactly where an exception is REPLACED rather
+    # than passed along. A flag written where the phase is KNOWN survives any later replacement
+    # because it is not carried by the exception at all.
+    handoff_may_have_started = False
     try:
         async with connect(args.ws_url) as connection:
-            summary = await exhibit_one_signal(
-                _WebsocketsTransport(connection),
-                args.chain_index,
-                data_dir=args.data_dir,
-                dry_run=args.dry_run,
-            )
+            try:
+                summary = await exhibit_one_signal(
+                    _WebsocketsTransport(connection),
+                    args.chain_index,
+                    data_dir=args.data_dir,
+                    dry_run=args.dry_run,
+                )
+            except PostHandoffError:
+                handoff_may_have_started = True
+                raise
     except Exception as error:
-        # `summary` is bound only once `exhibit_one_signal` has RETURNED, which it cannot do before
-        # the handoff has fired. So a live `summary` here means the failure is the connection
-        # teardown — inside the may-have-published window — rather than the connect or the
-        # exhibition itself. `PostHandoffError` passes through unchanged; it already says so.
-        if summary is not None and not isinstance(error, PostHandoffError):
+        if isinstance(error, PostHandoffError):
+            raise
+        # A live `summary` still means the same thing — the exhibition returned, so the child ran
+        # and only the teardown failed — EXCEPT under `--dry-run`, where the child was invoked with
+        # `--dry-run` and wrote nothing. That is the same exemption `exhibit_one_signal` already
+        # applies to its own raising path; stating it at one site and not the other is how two
+        # spellings of one rule drift apart.
+        if handoff_may_have_started or (summary is not None and not args.dry_run):
             raise PostHandoffError(error) from error
         raise
+
+    if summary is None:
+        # THE THIRD NON-STATEMENT EXIT, found by the same sweep. An `__aexit__` that returns True
+        # SUPPRESSES the failure: nothing propagates, the handler above never runs, and control
+        # simply arrives here with nothing assigned. Reaching the tail would raise `AttributeError`
+        # on `None` and get wrapped as post-handoff regardless of phase — a warning that fires on
+        # every refusal is not a warning. The run has still failed; what it must not do is guess.
+        suppressed = RuntimeError("the connection's __aexit__ suppressed the exhibition failure; no summary exists")
+        if handoff_may_have_started:
+            raise PostHandoffError(suppressed)
+        raise suppressed
 
     # ONE BOUNDARY OVER THE WHOLE TAIL, rather than one per statement, and the shape is the fix.
     #
@@ -471,12 +546,16 @@ def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | Non
         # A DIFFERENT SENTENCE, because the operator's correct next action is different. "refused"
         # invites the documented REST fallback; after the handoff has fired that fallback would
         # open a SECOND trial for one signal. This line tells them to check before acting.
-        print(
-            f"refused AFTER handoff: {error} -- {INDETERMINATE_WARNING}",
-            file=sys.stderr,
-        )
-        return 1
+        return _refuse_after_handoff(str(error))
     except Exception as error:
+        # ...AND THE TYPE IS NOT THE ONLY EVIDENCE OF THE PHASE. A teardown that fails inside
+        # `asyncio.run`'s own `finally` replaces the `PostHandoffError` on its way out of `_run`,
+        # and what arrives here is the replacement. The detail printed is that replacement, because
+        # it is what actually stopped the run; the INSTRUCTION is the post-handoff one, because the
+        # child may still have published. Nothing recovers the phase for a failure that never had
+        # one, so an ordinary refusal stays ordinary.
+        if _post_handoff_in_chain(error) is not None:
+            return _refuse_after_handoff(f"{type(error).__name__}: {error}")
         print(f"refused: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 

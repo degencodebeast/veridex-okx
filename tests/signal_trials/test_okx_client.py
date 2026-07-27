@@ -2118,12 +2118,62 @@ def test_the_REAL_child_publishes_BEFORE_it_prints_which_is_why_nonzero_is_indet
 
     If a future edit made the child print BEFORE publishing, `publication_indeterminate` would
     become needless pessimism and this test is where that would be noticed.
+
+    CODEX R3 MINOR-1 — AND THE CONFIGURATION IS THE WHOLE TEST. This previously launched the child
+    with a plain pipe for stdout. A pipe is BLOCK-BUFFERED, so `print` returns long before the
+    EPIPE is ever observed and the failure surfaces only during the interpreter-exit flush — after
+    every statement in the child has already run. Under that regime BOTH statement orders publish,
+    so the test selected the one configuration in which its own premise could not bind. Measured
+    against this exact child (all four rows below reproduced locally, no network):
+
+        buffered   stdout=CLOSED rc=120 published=True   <- print failure deferred to exit flush
+        unbuffered stdout=CLOSED rc=1   published=True   <- print failure AT the print statement
+
+    `-u` is therefore load-bearing rather than tidiness: it is what moves the failure back to the
+    print statement, which is what makes "published anyway" evidence about the ORDER. The regime
+    control below executes both orders under both regimes and shows that only the unbuffered one
+    can tell them apart.
     """
     module = _ws_exhibition_module()
     data_dir = tmp_path / "data"
     argv = module.build_handoff_argv(data_dir=str(data_dir), dry_run=False)
 
     payload = json.dumps(H22_WS, separators=(",", ":"), sort_keys=True)
+
+    # THE REGIME CONTROL, and it is a DISCRIMINATION rather than an acceptance control: an
+    # acceptance control would prove only that a closed stdout can fail the child. What has to be
+    # proven is that the harness SEPARATES the two statement orders — because the previous harness
+    # did not, and passed anyway. Two synthetic children, identical but for the order of their two
+    # statements, run under both regimes. Local subprocesses; no network, no credential.
+    write_first = "import pathlib,sys\np=pathlib.Path(sys.argv[1])\np.write_text('published')\nprint('summary')\n"
+    print_first = "import pathlib,sys\np=pathlib.Path(sys.argv[1])\nprint('summary')\np.write_text('published')\n"
+
+    def _publishes_with_stdout_closed(source: str, *, unbuffered: bool, tag: str) -> bool:
+        child = tmp_path / f"child_{tag}.py"
+        child.write_text(source)
+        target = tmp_path / f"target_{tag}.txt"
+        child_argv = [sys.executable, *(["-u"] if unbuffered else []), str(child), str(target)]
+        probe = subprocess.Popen(child_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert probe.stdout is not None
+        probe.stdout.close()
+        if probe.stderr is not None:
+            probe.stderr.read()  # drained so the child cannot block on a full stderr pipe
+        assert probe.wait(timeout=30) != 0, f"{tag}: the closed stdout did not fail the child at all"
+        return target.exists()
+
+    # UNBUFFERED: the order is visible. A child that prints first never reaches its publish.
+    assert _publishes_with_stdout_closed(write_first, unbuffered=True, tag="u_write") is True
+    assert _publishes_with_stdout_closed(print_first, unbuffered=True, tag="u_print") is False, (
+        "under -u a print-first child must publish NOTHING; without that this harness cannot tell "
+        "the two orders apart and the premise below is unmeasured"
+    )
+
+    # BUFFERED: the finding itself, executed. Both orders publish, so the assertion further down
+    # would hold no matter which order the child used — which is why the launch below passes -u.
+    assert _publishes_with_stdout_closed(write_first, unbuffered=False, tag="b_write") is True
+    assert _publishes_with_stdout_closed(print_first, unbuffered=False, tag="b_print") is True, (
+        "block-buffered stdout defers the print failure to the exit flush, so it cannot bind order"
+    )
 
     # MADE TO DO WHAT IT SAYS, rather than narrowing the docstring to what it did. The previous
     # version used `stdout=DEVNULL` — where writes SUCCEED — and asserted `returncode == 0`, so it
@@ -2134,8 +2184,10 @@ def test_the_REAL_child_publishes_BEFORE_it_prints_which_is_why_nonzero_is_indet
     #
     # The read end of the child's stdout is closed before it writes, so its print raises EPIPE
     # AFTER the publish has landed. Local subprocess only — no socket, no network, no credential.
+    # `-u` for the reason the regime control just measured: with a buffered pipe the print would
+    # not fail until the exit flush and this would publish under either statement order.
     proc = subprocess.Popen(
-        [sys.executable, *argv],
+        [sys.executable, "-u", *argv],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -2158,12 +2210,21 @@ def test_the_REAL_child_publishes_BEFORE_it_prints_which_is_why_nonzero_is_indet
         f"the child succeeded despite a closed stdout (rc={returncode}); this test no longer "
         "demonstrates publish-before-print and the third state needs a different justification"
     )
+    # ...AND THE REGIME HELD. 120 is the code Python uses when the failure is the interpreter-exit
+    # flush, which is precisely the buffered regime in which both orders publish. Asserting it is
+    # absent is how this test states, in the units of its own claim, that the print failed AT the
+    # print. Measured here: rc=1 unbuffered, rc=120 buffered.
+    assert returncode != 120, (
+        f"rc=120 means the print failure was deferred to the exit flush (rc={returncode}); the "
+        "child ran block-buffered and this test cannot bind the publish-before-print order"
+    )
 
     # ACCEPTANCE CONTROL: the same child with a WORKING stdout succeeds and publishes, so the
-    # nonzero above is caused by the closed pipe rather than by anything else being broken.
+    # nonzero above is caused by the closed pipe rather than by anything else being broken. Same
+    # `-u`, so the control differs from the case in exactly one thing: whether stdout is readable.
     ok_dir = tmp_path / "ok"
     ok = subprocess.run(
-        [sys.executable, *module.build_handoff_argv(data_dir=str(ok_dir), dry_run=False)],
+        [sys.executable, "-u", *module.build_handoff_argv(data_dir=str(ok_dir), dry_run=False)],
         input=payload, text=True, capture_output=True, check=False,
     )
     assert ok.returncode == 0, f"baseline child failed: {ok.stderr!r}"
@@ -2277,6 +2338,293 @@ def test_main_PRINTS_A_DIFFERENT_SENTENCE_after_the_handoff_than_before_it():
     assert "MAY ALREADY EXIST" not in before.err, (
         "a pre-handoff refusal must NOT warn about an existing trial; nothing was published"
     )
+
+
+class _Teardown:
+    """A connection context whose `__aexit__` does something OTHER than pass the failure along.
+
+    Both modes are non-statement exits — the population a census over the STATEMENTS of `_run` is
+    blind to, which is how the eighth instance of this lane's class survived a fix that enumerated
+    every statement in the region.
+
+    `mode="raises"` reproduces the REPLACEMENT Python performs when teardown fails while an
+    exception is already propagating: the new exception becomes the active one and the original
+    survives only in `__context__`. `mode="suppresses"` reproduces the other one — an `__aexit__`
+    that returns True, after which no exception propagates at all and the code after the `async
+    with` runs with nothing assigned. `mode="passes"` is the ordinary teardown, for the cases where
+    the failure being studied is somewhere else.
+    """
+
+    MODES = ("raises", "suppresses", "passes")
+
+    def __init__(self, frames, mode):
+        assert mode in self.MODES, f"unknown teardown mode {mode!r}"
+        self._frames = frames
+        self._mode = mode
+        self.calls = 0
+        self.saw = None
+
+    async def __aenter__(self):
+        return _ScriptedConn(list(self._frames))
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.calls += 1
+        self.saw = exc_type
+        if self._mode == "raises":
+            raise RuntimeError("connection teardown also failed")
+        return self._mode == "suppresses"
+
+
+#: A frame the channel check refuses, so the handoff is never reached: a PRE-handoff failure.
+_REFUSED_FRAME = '{"code":"0","data":[]}'
+
+
+def _main_over(module, *, ctx, dry_run, handoff):
+    """Run `main` over one injected connection and handoff, restoring the module attribute after."""
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    if dry_run:
+        argv.append("--dry-run")
+    original = module._subprocess_handoff
+    module._subprocess_handoff = handoff
+    try:
+        return _capture_main_stderr(module, argv, lambda: ctx)
+    finally:
+        module._subprocess_handoff = original
+
+
+def _chain_types(error):
+    """Every exception reachable from `error` by either chain link, as a set of types."""
+    seen, pending, types = set(), [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        types.add(type(current))
+        pending.extend(link for link in (current.__cause__, current.__context__) if link is not None)
+    return types
+
+
+def test_a_FAILING_TEARDOWN_cannot_REPLACE_the_post_handoff_instruction():
+    """CODEX R3 MAJOR-1 — the eighth instance of the class, and the first that arrives BETWEEN
+    statements.
+
+    `exhibit_one_signal` raises `PostHandoffError` after the child has started, so no summary is
+    returned. If the connection's `__aexit__` then ALSO raises, Python REPLACES the active
+    `PostHandoffError` with the teardown exception. At the arbitration point `summary is None`, so
+    the replacement was re-raised unwrapped and `main` printed an ordinary PRE-handoff refusal —
+    inviting the REST fallback for a signal whose child may already have published. The
+    post-handoff fact was still in `error.__context__`; the code consulted `summary` and the outer
+    type, neither of which survives the replacement.
+
+    THE PREVIOUS FIX ENUMERATED STATEMENTS, AND THAT WAS THE WRONG POPULATION. `__aexit__`,
+    `finally` and generator close run BETWEEN statements and are invisible to a census over them —
+    and `__aexit__` is precisely where an exception is REPLACED rather than passed along.
+
+    THE FAMILY, not a single acceptance case: an acceptance control proves only that the predicate
+    CAN fire. The three rows that must NOT warn are what prove it SEPARATES — the dry-run rows in
+    particular, where publication was impossible and the ordinary refusal is the true one.
+
+    NO SOCKET: the connection is injected and the handoff is a function; nothing is spawned.
+    """
+    module = _ws_exhibition_module()
+    started = []
+
+    def _starts_then_raises(_argv, _stdin):
+        started.append(_argv)
+        raise BrokenPipeError("child stdin failed after spawn")
+
+    def _starts_then_succeeds(_argv, _stdin):
+        started.append(_argv)
+        return 0
+
+    def _never_reached(_argv, _stdin):
+        started.append(_argv)
+        raise AssertionError("a pre-handoff refusal must never reach the handoff")
+
+    push = [_ws_push(H22_WS)]
+    cases = (
+        ("post-handoff failure", push, False, _starts_then_raises),
+        ("pre-handoff failure", [_REFUSED_FRAME], False, _never_reached),
+        ("dry-run handoff failure", push, True, _starts_then_raises),
+        ("dry-run handoff success", push, True, _starts_then_succeeds),
+    )
+
+    rows = {}
+    for label, frames, dry_run, handoff in cases:
+        ctx = _Teardown(frames, "raises")
+        before = len(started)
+        result = _main_over(module, ctx=ctx, dry_run=dry_run, handoff=handoff)
+        rows[label] = (
+            result.status,
+            result.err.startswith("refused AFTER handoff:"),
+            module.INDETERMINATE_WARNING in result.err,
+        )
+        assert ctx.calls == 1, f"{label}: the reproduction requires the failing teardown to have run"
+        if label != "pre-handoff failure":
+            assert len(started) == before + 1, f"{label}: the handoff must actually have begun"
+
+    # THE TABLE. Only the first row may carry the instruction; the other three are what make it
+    # information rather than noise.
+    assert rows == {
+        "post-handoff failure": (1, True, True),
+        "pre-handoff failure": (1, False, False),
+        "dry-run handoff failure": (1, False, False),
+        "dry-run handoff success": (1, False, False),
+    }, rows
+
+
+async def test_the_replacing_teardown_keeps_BOTH_causes_and_the_teardown_detail():
+    """The other half of MAJOR-1: preserving the phase must not cost the diagnosis.
+
+    What `main` prints is the TEARDOWN failure, because that is what actually stopped the run; what
+    the operator is TOLD is the post-handoff instruction, because that is what governs their next
+    action. Both are required, and the original post-handoff cause has to remain reachable or a
+    later reader cannot tell which window the run died in.
+    """
+    module = _ws_exhibition_module()
+    args = module.build_parser().parse_args(
+        ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+    )
+
+    def _starts_then_raises(_argv, _stdin):
+        raise BrokenPipeError("child stdin failed after spawn")
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = _starts_then_raises
+    try:
+        with pytest.raises(module.PostHandoffError) as excinfo:
+            await module._run(args, connect_factory=lambda _url: _Teardown([_ws_push(H22_WS)], "raises"))
+    finally:
+        module._subprocess_handoff = original
+
+    assert "teardown also failed" in str(excinfo.value), "the teardown cause must stay diagnosable"
+    types = _chain_types(excinfo.value)
+    assert module.PostHandoffError in types
+    assert BrokenPipeError in types, "the ORIGINAL post-handoff cause was lost from the chain"
+    assert RuntimeError in types
+
+
+def test_a_SUPPRESSING_teardown_is_classified_by_PHASE_and_not_by_what_was_assigned():
+    """The sibling of MAJOR-1 found by sweeping the PATHS rather than the lines.
+
+    An `__aexit__` that returns True makes the failure vanish: nothing propagates, `summary` was
+    never assigned, and execution simply continues past the `async with`. That is the same class as
+    the replacement — control left the block without any statement of ours running — so it is
+    classified the same way: by the recorded phase, not by what happens to be bound.
+
+    Both halves, because the phase is only informative if it can say NO: a swallowed PRE-handoff
+    failure published nothing and must keep the ordinary refusal.
+    """
+    module = _ws_exhibition_module()
+
+    def _starts_then_raises(_argv, _stdin):
+        raise BrokenPipeError("child stdin failed after spawn")
+
+    def _never_reached(_argv, _stdin):
+        raise AssertionError("a pre-handoff refusal must never reach the handoff")
+
+    after = _main_over(
+        module, ctx=_Teardown([_ws_push(H22_WS)], "suppresses"), dry_run=False, handoff=_starts_then_raises
+    )
+    before = _main_over(
+        module, ctx=_Teardown([_REFUSED_FRAME], "suppresses"), dry_run=False, handoff=_never_reached
+    )
+
+    assert after.status == 1
+    assert after.err.startswith("refused AFTER handoff:"), f"got {after.err!r}"
+    assert module.INDETERMINATE_WARNING in after.err
+
+    assert before.status == 1
+    assert before.err.startswith("refused: "), f"got {before.err!r}"
+    assert module.INDETERMINATE_WARNING not in before.err
+    assert "AFTER handoff" not in before.err
+
+
+def test_a_failure_in_the_EVENT_LOOP_teardown_still_reaches_the_operator_as_post_handoff(monkeypatch):
+    """The one replacement no local of `_run` can record, so `main` carries the backstop.
+
+    `asyncio.run` has a `finally` of its own — it cancels pending tasks, shuts async generators
+    down and closes the loop. Anything raised there REPLACES a propagating `PostHandoffError`
+    exactly as a failing `__aexit__` does, except that it happens ABOVE `_run`, where the phase flag
+    is already out of scope. The fact still exists in the chain, so `main` looks there.
+
+    The fake below is the real `asyncio.run` with a raising `finally` wrapped around it, which is
+    the actual mechanism rather than a hand-built chain: `_run` really executes, really raises
+    `PostHandoffError`, and the teardown really replaces it.
+    """
+    module = _ws_exhibition_module()
+    real_run = asyncio.run
+    used = []
+
+    def _run_then_fail_in_teardown(coro):
+        used.append(coro)
+        try:
+            return real_run(coro)
+        finally:
+            raise RuntimeError("event loop shutdown failed")
+
+    def _starts_then_raises(_argv, _stdin):
+        raise BrokenPipeError("child stdin failed after spawn")
+
+    def _never_reached(_argv, _stdin):
+        raise AssertionError("a pre-handoff refusal must never reach the handoff")
+
+    monkeypatch.setattr(asyncio, "run", _run_then_fail_in_teardown)
+    after = _main_over(
+        module, ctx=_Teardown([_ws_push(H22_WS)], "passes"), dry_run=False, handoff=_starts_then_raises
+    )
+    before = _main_over(module, ctx=_Teardown([_REFUSED_FRAME], "passes"), dry_run=False, handoff=_never_reached)
+
+    assert len(used) == 2, "the reproduction is only valid if the failing teardown actually ran"
+    assert after.status == 1
+    assert after.err.startswith("refused AFTER handoff:"), f"got {after.err!r}"
+    assert module.INDETERMINATE_WARNING in after.err
+    assert "event loop shutdown failed" in after.err, "the failure that stopped the run must stay visible"
+
+    # DISCRIMINATION: the same loop-teardown failure over a PRE-handoff refusal is an ordinary one.
+    assert before.status == 1
+    assert before.err.startswith("refused: "), f"got {before.err!r}"
+    assert module.INDETERMINATE_WARNING not in before.err
+
+
+def test_the_post_handoff_chain_walk_is_COMPLETE_over_both_links():
+    """The backstop above is only as good as the walk, so the walk is measured, not assumed.
+
+    `raise X from Y` sets `__cause__`; raising while another exception is being handled sets
+    `__context__`. Both occur in the chains this module produces, so a walk over one link is a
+    census over half the population — the exact error the statement enumeration made. Cycles are
+    reachable through `__context__`, and a walk that hangs is worse than one that misses.
+    """
+    module = _ws_exhibition_module()
+    walk = module._post_handoff_in_chain
+    post = module.PostHandoffError(BrokenPipeError("child stdin failed after spawn"))
+
+    assert walk(post) is post, "the exception itself counts"
+
+    via_cause = RuntimeError("teardown")
+    via_cause.__cause__ = post
+    assert walk(via_cause) is post, "the __cause__ link is not walked"
+
+    via_context = RuntimeError("teardown")
+    via_context.__context__ = post
+    assert walk(via_context) is post, "the __context__ link is not walked"
+
+    deep = RuntimeError("loop shutdown")
+    deep.__context__ = via_cause
+    assert walk(deep) is post, "the walk stops before the end of the chain"
+
+    # DISCRIMINATION: a chain with no post-handoff failure in it must not be classified as one, or
+    # every refusal becomes a maybe-published warning and the warning stops meaning anything.
+    plain = ValueError("could not connect at all")
+    plain.__context__ = OSError("dns")
+    assert walk(plain) is None
+
+    # ...and a cycle terminates rather than hanging the suite.
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__context__ = b
+    b.__context__ = a
+    assert walk(a) is None
 
 
 async def test_a_failure_AFTER_the_handoff_says_so_because_the_operator_acts_differently():
