@@ -38,8 +38,30 @@ reader can see how much of the season was actually measured.
 **The rank key is TOTAL.** avg Brier asc -> capped markout desc -> active count desc -> ``agent_id``.
 The final key is what makes it total, and it is not decoration: without it two agents equal on the
 first three keys are ordered by whatever the sort happened to see first, and the published
-leaderboard reorders between two runs over identical data. Qualified rows are placed ahead of
-unqualified ones so that row 0 is the season's actual leader — see :func:`_rank_key`.
+leaderboard reorders between two runs over identical data.
+
+**DECLARED DEVIATION FROM THE FROZEN RULE — the rank key carries a FIFTH, LEADING term.**
+Frozen plan line 633 states the ordering as those four terms and does NOT restrict it to qualified
+rows. :func:`_rank_key` nonetheless sorts on ``(not qualified, <the frozen four>)``, placing every
+qualified row ahead of every unqualified one. This is a deliberate departure, declared here at the
+top of the module rather than left inside a private function, because a reader comparing this
+scorer against the frozen text will otherwise find a term the text does not mention and have no way
+to tell whether it was intended.
+
+*Why it stays.* The qualification gate exists to say that an unqualified agent's score is not a
+result. Applying the frozen key alone at the point of DISPLAY undoes that. Measured on this
+repository's own 44-trial fixture: ``selective_calibrator`` — 0 active decisions, UNQUALIFIED —
+scores a 0.2055 Brier, ahead of two QUALIFIED agents at 0.3905 and 0.9318, so the pure frozen
+ordering renders an unmeasured agent above measured ones. The gate would be enforced in the
+``qualified`` column and contradicted by the row order on the same page.
+
+*What the deviation does NOT do.* It must not reorder anything WITHIN the qualified set, where the
+frozen four terms remain the whole rule. Both halves are pinned by
+``test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_directions``: that the
+partition is present and does observable work, and that the frozen ordering is untouched inside the
+qualified set. Under the frozen thresholds the two orderings COINCIDE on qualified rows, so a test
+that filters to qualified rows — which the plan's own mandated test does — cannot tell them apart,
+and the term would otherwise be unpinned in BOTH directions.
 
 **Markouts are capped PER EVENT.** The cap bounds what a single lucky trial can contribute; applying
 it to the average instead would let one uncapped outlier carry a whole season and then be trimmed
@@ -190,6 +212,16 @@ class DiagnosticAgent:
     Diagnostics can only ADD rows. They cannot shadow a frozen roster member, cannot duplicate each
     other, and are always flagged ``is_control=True``, because ``is_control=False`` is a positive
     claim that a row is one of the three frozen contestants.
+
+    KNOWN GAP, stated rather than implied: a CALLABLE passed as ``probabilities`` is REJECTED but
+    not NAMED. Measured, both shapes raise: a callable as the whole vector gives ``TypeError:
+    object of type 'function' has no len()``, and one hidden inside the tuple gives ``TypeError:
+    '<=' not supported between instances of 'float' and 'function'``. Rejection is therefore total,
+    but neither message identifies the offending ``agent_id``, which every other refusal in
+    :func:`_validate_diagnostics` does. Deliberately left as-is for now rather than overlooked: the
+    only constructor of :class:`PackWithDiagnostics` is test code — ``pack.load_pack`` returns a
+    plain :class:`~veridex.signal_trials.pack.SealedPack` — so this improves a message on a path
+    production cannot reach.
 
     Attributes:
         agent_id: The row's id. Must not collide with a roster member or another diagnostic.

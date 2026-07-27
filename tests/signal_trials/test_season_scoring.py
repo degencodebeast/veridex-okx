@@ -9,7 +9,15 @@ and both are recorded here rather than left to be discovered:
 
 * the block's two ``import`` lines are hoisted into the module import block at the top of the file
   (ruff ``E402`` refuses a module-level import below other statements) and the two imported NAMES
-  are alphabetized there (ruff ``I001``). The names and the module are unchanged;
+  are alphabetized there (ruff ``I001``). **The scoring import also carries FOUR NAMES BEYOND the
+  plan's two** — ``AgentSeasonRow``, ``DiagnosticAgent``, ``PackWithDiagnostics`` and
+  ``SeasonResult`` — because Region B's pins and the fixtures need them; the plan's own
+  ``score_season`` and ``assert_no_clv_fields`` are unchanged and are still imported from the same
+  module. Stated because it is otherwise accurate-but-invisible: a reader told only that "the names
+  are alphabetized" would reasonably infer the statement is the plan's two and nothing else.
+  The extension is what licenses the reordering. **Reordering never licenses itself** — the
+  alphabetisation is permitted here only because the statement was already being extended for a
+  reason independent of ruff, and it would not be permitted on a statement left otherwise untouched;
 * the file carries ``# ruff: noqa: E701, SIM300``. Both codes are triggered ONLY by the plan's own
   text — ``E701`` by the single-line ``with pytest.raises(...): ...`` in ``test_clv_field_guard``
   and ``SIM300`` by ``assert FROZEN_ROSTER <= ids`` — and a per-line ``# noqa`` would have edited
@@ -42,9 +50,11 @@ internally-derived climatology feed against an expectation the scorer had no han
 
 from __future__ import annotations
 
-# Suppressed for Region A ONLY; see the module docstring. E701 is the plan's single-line
-# `with pytest.raises(ValueError): ...`; SIM300 is its `assert FROZEN_ROSTER <= ids`. Neither code
-# occurs in Region B, so this hides nothing of this implementer's own.
+# Needed BECAUSE OF Region A; FILE-SCOPED in effect. E701 is the plan's single-line
+# `with pytest.raises(ValueError): ...`; SIM300 is its `assert FROZEN_ROSTER <= ids`. As measured
+# when this note was written, neither code occurs in Region B — but that is a POINT-IN-TIME
+# MEASUREMENT, NOT A BOUND, and the directive below applies to the whole file either way. See the
+# longer note on the mypy directive: the same scope-versus-measurement distinction applies here.
 # ruff: noqa: E701, SIM300
 #
 # Likewise for mypy, and for the same reason. Region A compares the two NULLABLE metrics directly —
@@ -54,8 +64,40 @@ from __future__ import annotations
 # None`, and both assertions run only over qualified rows. That invariant was NOT holding when this
 # file was written: mypy's complaint is what exposed it, and `_score_agent`'s `scored > 0` conjunct
 # plus `test_an_all_unscored_season_reports_no_score_rather_than_a_zero` are the fix and its pin.
-# Measured before suppressing: these two codes are reported at lines 341 and 346 ONLY, both inside
-# Region A, so nothing of Region B's is hidden.
+# THE SITES, CORRECTED. The two codes arise at `assert briers == sorted(briers)` (type-var) and at
+# `assert ranked[0].capped_avg_markout_bps >= ranked[1].capped_avg_markout_bps` (operator), both
+# inside Region A, over `AgentSeasonRow.avg_brier: float | None` and `capped_avg_markout_bps:
+# int | None` (scoring.py). An earlier version of this note cited lines 341 and 346, which was
+# wrong and had already drifted: line numbers move whenever anything above them is edited. The
+# assertions are named here instead, because a NAME survives an edit and a line number does not.
+#
+# READ THIS BEFORE TRUSTING THE PARAGRAPH ABOVE. The directive below is FILE-SCOPED: it suppresses
+# both codes everywhere in this module, including Region B, because ruff and mypy have no
+# region-scoped form, and a per-line suppression comment (`noqa` / `type: ignore`, spelled without
+# the leading hash here so ruff does not try to parse this sentence as a directive) would have
+# EDITED the plan's mandated lines.
+# The claim that "neither code occurs in Region B" is a POINT-IN-TIME MEASUREMENT
+# taken when this note was written, NOT A BOUND: a future Region B addition that trips either code
+# will be silently suppressed and no gate will say so. Scope and measurement are different things,
+# and this comment is the only thing distinguishing them. The residual is a program-level limitation
+# (no region-scoped suppression), not something this file can close.
+#
+# THAT WARNING WAS FALSIFIED BY THE VERY COMMIT THAT WROTE IT, WHICH IS WHY IT IS KEPT VERBATIM
+# ABOVE RATHER THAN SOFTENED. The same commit added the F2 pin, whose
+# `assert witness.avg_brier < other.avg_brier` tripped `operator` in REGION B over an unnarrowed
+# `other.avg_brier` -- and the file-scoped directive swallowed it in silence, exactly as predicted,
+# one commit after the prediction. The warned-of future arrived inside the warning.
+# FIXED, not merely noted: `assert other.avg_brier is not None` now precedes the comparison, which
+# asserts the real invariant (a qualified row has a Brier) and narrows the type as a side effect.
+# RE-MEASURED after the fix, by stripping this directive from a `git archive` export and running
+# the type checker over it: the only remaining diagnostics are the two Region A sites named above.
+# So "nothing of Region B is hidden" is a TRUE statement again -- true because it was CHECKED, not
+# because it was claimed. Anyone adding to Region B should re-run that check, not trust this note.
+#
+# (This paragraph is deliberately NOT wrapped so that any line begins with the type checker's own
+# directive prefix. An earlier wrap put that prefix at the start of a line, and the tool parsed
+# this PROSE as a configuration comment and raised a real error. Same class as the ruff `noqa`
+# case above: a tool's directive syntax appearing inside a sentence about that directive.)
 # mypy: disable-error-code="type-var, operator"
 import inspect
 from dataclasses import dataclass, replace
@@ -759,6 +801,72 @@ def test_rank_order_is_exactly_the_designed_order(full_pack_qualified):
     # Unqualified rows sort AFTER every qualified one, so rows[0] is the actual season leader.
     qualified_flags = [row.qualified for row in season.rows]
     assert qualified_flags == sorted(qualified_flags, reverse=True)
+
+
+def _frozen_rank_key(row):
+    """The frozen plan's FOUR-term key, line 633, with no qualification partition.
+
+    Written out here INDEPENDENTLY of ``scoring._rank_key`` on purpose. A pin that imported the
+    production key would be comparing the implementation against itself and would hold whatever the
+    implementation happened to do; this is the plan's rule, transcribed from the plan.
+    """
+    brier_key = (1, 0.0) if row.avg_brier is None else (0, row.avg_brier)
+    markout_key = (1, 0.0) if row.capped_avg_markout_bps is None else (0, -row.capped_avg_markout_bps)
+    return (brier_key, markout_key, -row.active_decisions, row.agent_id)
+
+
+def test_the_qualification_partition_is_a_declared_deviation_pinned_in_both_directions(full_pack_qualified):
+    """PIN (F2): the leading ``not qualified`` term is PRESENT, and has NOT displaced the frozen order.
+
+    ``_rank_key`` sorts on ``(not qualified, <the frozen four>)``. The leading term is a declared
+    deviation from frozen plan line 633 — see the DECLARED DEVIATION section of ``scoring``'s module
+    docstring for why it stays. It was previously unpinned in BOTH directions, and this closes both.
+
+    **Why nothing else could close them.** Under the frozen thresholds the shipped ordering and the
+    pure frozen ordering COINCIDE on the qualified subsequence, and every existing rank test —
+    including the plan's own mandated ``test_rank_key_is_brier_then_capped_markout`` — filters to
+    qualified rows before looking. So no existing test can see the term at all: not that it is
+    there, and not that it has left the frozen order intact behind it.
+    """
+    season = score_season(full_pack_qualified)
+    shipped = [row.agent_id for row in season.rows]
+
+    # --- DIRECTION 1: the frozen four-term ordering is UNTOUCHED within the qualified set. ---
+    qualified = [row for row in season.rows if row.qualified]
+    assert len(qualified) >= 3, "a qualified set examined must be non-empty to mean anything"
+    assert [row.agent_id for row in qualified] == [
+        row.agent_id for row in sorted(qualified, key=_frozen_rank_key)
+    ], "the partition term must not reorder anything INSIDE the qualified set"
+
+    # --- DIRECTION 2: the partition term is PRESENT and does OBSERVABLE work. ---
+    # The witness: an UNQUALIFIED row whose Brier beats two QUALIFIED rows. Under the pure frozen
+    # key it outranks them; under the shipped key it must sit behind them.
+    rows = {row.agent_id: row for row in season.rows}
+    witness = rows["selective_calibrator"]
+    assert witness.qualified is False
+    assert witness.active_decisions == 0, "unqualified because it never took a directional decision"
+    assert witness.avg_brier is not None
+
+    outranked = ["crowding_fader", "always_fade"]
+    for agent_id in outranked:
+        other = rows[agent_id]
+        assert other.qualified is True
+        # A QUALIFIED ROW ALWAYS HAS A BRIER. Asserted rather than assumed: it is the invariant
+        # `_score_agent`'s `scored > 0` conjunct exists to hold, and the rank key depends on it.
+        # It also narrows `float | None` to `float`, which is what keeps the comparison below from
+        # tripping `operator` in REGION B — where the file-scoped directive would have swallowed it
+        # silently. A pin first, a type narrowing second.
+        assert other.avg_brier is not None
+        # NON-VACUOUS: the witness genuinely has the better score, so being placed behind it is a
+        # decision the partition made and not an accident of the Brier ordering agreeing anyway.
+        assert witness.avg_brier < other.avg_brier
+        assert shipped.index("selective_calibrator") > shipped.index(agent_id)
+
+    # And stated as the difference between the two orderings, so the term's effect is exhibited
+    # rather than inferred: they must AGREE on the qualified rows and DISAGREE over the whole set.
+    frozen_order = [row.agent_id for row in sorted(season.rows, key=_frozen_rank_key)]
+    assert shipped != frozen_order, "the partition term must be observable somewhere"
+    assert [a for a in shipped if rows[a].qualified] == [a for a in frozen_order if rows[a].qualified]
 
 
 def test_markout_breaks_a_brier_tie_before_active_count(full_pack_qualified_with_brier_ties):
