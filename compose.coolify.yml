@@ -63,8 +63,23 @@ services:
       # should be deleted when it does.
       OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
       OKX_SECRET: ${OKX_SECRET_KEY:-}
-      X402_FACILITATOR_URL: ${X402_FACILITATOR_URL:-}
-      X402_PAY_TO_ADDRESS: ${X402_PAY_TO_ADDRESS:-}
+      # --- the SERVED money path. FAIL-CLOSED, and that is a correction. ---
+      # A first cut wired X402_FACILITATOR_URL and X402_PAY_TO_ADDRESS. NEITHER NAME IS CONSUMED
+      # ANYWHERE — they were invented rather than measured, and the names production actually reads
+      # were absent. Found by the Gate A reviewer. The authoritative list is the 17 keys the
+      # signal-trials path reads; there is no facilitator variable at all, because the facilitator is
+      # BUILT from the OKX credentials by _build_okx_facilitator(), not configured by URL.
+      #
+      # These use `:?` where the OKX credentials above use `:-`, and the difference is deliberate:
+      # run_preflight is an OPERATOR COMMAND with a tested MissingCredentialError path, while this is
+      # the SERVED MONEY PATH, which payments.py:240,245 makes RAISE under APP_ENV=production. The
+      # app fails closed either way; a `:?` moves that failure to compose render, where the message
+      # names the variable instead of surfacing as a startup traceback.
+      X402_ENABLED: ${X402_ENABLED:?X402_ENABLED is required (payments.py raises when APP_ENV is production and x402 is disabled)}
+      PAY_TO_ADDRESS: ${PAY_TO_ADDRESS:?PAY_TO_ADDRESS is required (a valid payee; payments.py rejects a malformed one in production)}
+      # `:-` here on purpose: payments.py:236 falls back to DEFAULT_COMMIT_PRICE, so an unset value
+      # is a real default rather than a missing configuration.
+      SIGNAL_TRIALS_COMMIT_PRICE: ${SIGNAL_TRIALS_COMMIT_PRICE:-}
       # Seed-pack catalog the /readyz ReplayPack check + demo/backtest surfaces resolve. The leaf dir
       # name IS the pack_id, so the demo_pack_real leaf catalogs as pack_id="demo_pack_real" — the id the
       # F1 Official-Replay-League seed's phase-1 assert_pack requires (kept in sync with Dockerfile.api).
