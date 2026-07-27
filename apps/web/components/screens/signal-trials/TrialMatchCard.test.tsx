@@ -152,6 +152,17 @@ const ALL_EIGHT: Record<string, W.SignalTrialsCheckStatusWire> = {
   bar_version: 'pending', law_version: 'pending', evidence_equality: 'pending', outcome_source: 'pending',
 };
 
+// EIGHT `pass` — the ONLY input that can produce a forbidden aggregate badge.
+//
+// The design forbids the aggregate badge BY NAME, but a badge gated on `checks.every(pass)` is
+// invisible to every other fixture in this file: `ALL_EIGHT` above is four pass + four pending,
+// and every other verify fixture derives from it. A pure absence assertion over those inputs is
+// unfalsifiable — the forbidden branch is never reachable, so the guard cannot fail no matter what
+// the card does. Built off the frozen constant rather than spelled out, so it cannot drift from
+// the eight keys the card actually renders (CF-5).
+const ALL_PASS: Record<string, W.SignalTrialsCheckStatusWire> =
+  Object.fromEntries(SIGNAL_TRIALS_CHECK_KEYS.map((c) => [c.key, 'pass' as const]));
+
 function verifyWire(
   receiptId: string,
   checks: Record<string, W.SignalTrialsCheckStatusWire> = ALL_EIGHT,
@@ -488,8 +499,36 @@ describe('H5.3 Fair-Play checks', () => {
 
   it('publishes NO aggregate verified badge — one pending check is never absorbed into a summary', async () => {
     await participants();
-    expect(screen.queryByText(/^\s*verified\s*$/i)).toBeNull();
+    expect(screen.queryAllByText(/^\s*verified\s*$/i)).toHaveLength(0);
     expect(document.body.textContent).not.toMatch(/all checks pass(ed)?/i);
+  });
+
+  // THE CASE THAT CAN ACTUALLY PRODUCE THE FORBIDDEN THING. The test above cannot: with four
+  // `pending` verdicts in the fixture, an all-pass-gated badge never renders, so its negatives
+  // hold against a card that publishes one. This render serves EIGHT `pass` verdicts, which is the
+  // single input under which such a badge would appear — and it is the input the whole file was
+  // missing. Verified by mutation: inserting an all-pass-gated `VERIFIED` label into
+  // `FairPlayChecks` leaves the test above green and kills this one.
+  it('publishes NO aggregate badge even when ALL EIGHT checks pass — the only case that could', async () => {
+    const panel = await participants({
+      verify: (url) => {
+        const id = decodeURIComponent(url.split('/signal-trials/receipts/')[1]?.split('/')[0] ?? '');
+        return jsonResponse(verifyWire(id, ALL_PASS));
+      },
+    });
+    // ACCEPTANCE CONTROL (C52). Without this the negatives below could pass because the fixture
+    // silently failed to be all-pass, which is the same unfalsifiable guard in a new costume.
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    expect(within(group).getAllByTestId('check-row').map((r) => r.getAttribute('data-status')))
+      .toEqual(Array(SIGNAL_TRIALS_CHECK_KEYS.length).fill('pass'));
+    // Each of the eight still reports independently — that is what the absence of a summary means.
+    expect(within(group).getAllByTestId('check-row')).toHaveLength(8);
+    // THE FORBIDDEN THING. `queryAll` rather than `query`: with four all-pass participants a card
+    // that published a badge would render several, and `getByText`-style ambiguity must not be
+    // what fails this test.
+    expect(screen.queryAllByText(/^\s*verified\s*$/i)).toHaveLength(0);
+    expect(document.body.textContent).not.toMatch(/all checks pass(ed)?/i);
+    expect(document.body.textContent).not.toMatch(/\b8\s*\/\s*8\b|\ball (eight|8) (checks )?pass/i);
   });
 });
 
@@ -669,3 +708,13 @@ describe('H5.3 /trials/[trialId] route page', () => {
 //    the copy asserts nothing about which. The test pins the silence, not the cause.
 // 4. It exercises the checks through `verifyReceipt` per participant. It cannot detect a backend
 //    that serves the eight keys with correct names but wrong SEMANTICS; these are relay tests.
+// 5. SOME NEGATIVES HERE ARE LEXICAL REGRESSION GUARDS, NOT DISCRIMINATION CONTROLS, and the
+//    difference is worth naming. The forbidden-language list, `\bqualified\b`, `connect wallet`,
+//    `corrupt` / `this trial's data`, and `nobody` assert the absence of strings that appear
+//    NOWHERE in the card today, so no fixture can make them fail — they guard a future edit that
+//    types one of those words, which is their whole job. What separates them from the
+//    aggregate-badge gap is that the badge was a STRUCTURE gated on a data condition (all eight
+//    `pass`) that no fixture produced; that condition is now served by `ALL_PASS` above. Where a
+//    lexical negative pairs with a claim the card really makes, it carries an acceptance control:
+//    the language guard requires the frozen markout label present in all four settlement states,
+//    and the Q1 negatives pair with the positive "says nothing about this trial".
