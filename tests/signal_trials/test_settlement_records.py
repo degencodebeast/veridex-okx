@@ -67,6 +67,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from veridex.api import signal_trials_router
 from veridex.api.signal_trials_router import register_signal_trials_routes
 from veridex.api.signal_trials_schemas import (
     AgentRecordResponse,
@@ -92,8 +93,9 @@ from veridex.signal_trials.live import (
     unscored_boundary_ms,
     unsettled_commit,
 )
-from veridex.signal_trials.okx_client import BAR_MS, Candle, CandleSeries
+from veridex.signal_trials.okx_client import BAR_MS, HISTORICAL_CANDLES_PATH, Candle, CandleSeries
 from veridex.signal_trials.preflight import FROZEN_HORIZON_MS
+from veridex.signal_trials.published import write_season, write_state
 from veridex.signal_trials.receipts import (
     _FINALIZED_DIRNAME,
     _OUTCOMES_DIRNAME,
@@ -111,7 +113,7 @@ from veridex.signal_trials.receipts import (
     TrialOutcome,
     verify_receipt,
 )
-from veridex.signal_trials.spot_markout import SpotMarkoutError
+from veridex.signal_trials.spot_markout import SpotMarkoutError, spot_markout
 
 #: The wall clock every fixture freezes on. A fixed epoch rather than ``time.time()`` so a
 #: boundary verdict is reproducible and a failure is not a function of when it ran.
@@ -147,6 +149,15 @@ COST_BPS = 25
 FOLLOW_BPS = GROSS_BPS - COST_BPS
 FADE_BPS = -GROSS_BPS - COST_BPS
 
+#: The chain the fixture signal is SEALED on, and the endpoint a settlement is recorded as fetched
+#: from. Named constants rather than inline literals because ``outcome_source`` compares the
+#: recorded chain against the evidence's: a test that spelled one of them twice could agree with a
+#: broken derivation by construction, and the cross-chain tests below need the mismatch to be the
+#: one thing that differs.
+CHAIN_INDEX = "196"
+OTHER_CHAIN_INDEX = "501"
+SOURCE_ENDPOINT = f"https://web3.okx.com{HISTORICAL_CANDLES_PATH}"
+
 _ABSENT = object()
 
 
@@ -161,7 +172,7 @@ def _sig(**overrides: Any) -> CanonicalSignal:
     """
     fields_: dict[str, Any] = {
         "t0_ms": T0,
-        "chain_index": "196",
+        "chain_index": CHAIN_INDEX,
         "token_address": "0x" + "1" * 40,
         "symbol": "TKN",
         "name": "Token",
@@ -200,6 +211,20 @@ def _trial(*, trial_id: str = TRIAL_ID, bar: str = "1m", **sig_overrides: Any) -
     """
     base = open_live_trial(_sig(**sig_overrides), now_ms=T0, trial_id=trial_id)
     return _BarredTrial(**{field.name: getattr(base, field.name) for field in fields(base)}, bar=bar)
+
+
+def _settle(trial: LiveTrial, series: CandleSeries, **kwargs: Any) -> SettledTrial:
+    """:func:`settle_trial` with this fixture's SEALED chain and a well-formed source endpoint.
+
+    A helper rather than eleven repetitions of the same two keywords, and it is safe to hide them
+    HERE because nothing in this file's coverage of them depends on the default: the settlement
+    source is exercised by tests that call :func:`settle_trial` directly with explicit values, and
+    by the operator-script tests that drive the real caller. What this helper must never become is
+    the only place those keywords appear.
+    """
+    kwargs.setdefault("chain_index", CHAIN_INDEX)
+    kwargs.setdefault("source_endpoint", SOURCE_ENDPOINT)
+    return settle_trial(trial, series, **kwargs)
 
 
 def _candle(*, ts_open_ms: int, close: float = FUTURE, confirmed: bool = True) -> Candle:
@@ -284,7 +309,7 @@ def _settled_outcome_from(series: CandleSeries, *, trial_id: str = TRIAL_ID) -> 
     settled in the helper so a test that depends on a settled outcome cannot silently receive a
     pending one and pass for the wrong reason.
     """
-    settled = settle_trial(_trial(trial_id=trial_id), series, now_ms=T + FROZEN_HORIZON_MS)
+    settled = _settle(_trial(trial_id=trial_id), series, now_ms=T + FROZEN_HORIZON_MS)
     assert settled.outcome.status == "settled", "the settled-outcome helper did not produce a settled outcome"
     return settled
 
@@ -505,7 +530,7 @@ def store_with_mixed(store: _TamperableStore) -> _TamperableStore:
     store.record_outcome(TRIAL_ID, _settled_outcome_from(_series(), trial_id=TRIAL_ID))
     store.record_outcome(
         OTHER_TRIAL_ID,
-        settle_trial(unscored_trial, _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS),
+        _settle(unscored_trial, _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS),
     )
     return store
 
@@ -1004,7 +1029,7 @@ def test_a_pending_outcome_may_be_SUPERSEDED_by_its_settled_self(
     store: _TamperableStore, series_1m: CandleSeries
 ) -> None:
     """``pending`` is not terminal: the settler's whole job is to replace it once a candle exists."""
-    store.record_outcome(TRIAL_ID, settle_trial(_trial(), _empty_series(), now_ms=T0 + 60_000))
+    store.record_outcome(TRIAL_ID, _settle(_trial(), _empty_series(), now_ms=T0 + 60_000))
     assert (before := store.outcome(TRIAL_ID)) is not None and before.status == "pending"
     store.record_outcome(TRIAL_ID, _settled_outcome_from(series_1m))
     assert (after := store.outcome(TRIAL_ID)) is not None and after.status == "settled"
@@ -1022,7 +1047,7 @@ def test_a_TERMINAL_outcome_cannot_be_rewritten(store: _TamperableStore, termina
     with pytest.raises(ValueError, match="already settled"):
         store.record_outcome(TRIAL_ID, _settled_outcome_from(_series(close=terminal_close * 1.5)))
     with pytest.raises(ValueError, match="already settled"):
-        store.record_outcome(TRIAL_ID, settle_trial(_trial(), _empty_series(), now_ms=T0 + 60_000))
+        store.record_outcome(TRIAL_ID, _settle(_trial(), _empty_series(), now_ms=T0 + 60_000))
 
 
 def test_an_UNSCORED_outcome_is_terminal_too(store: _TamperableStore) -> None:
@@ -1031,7 +1056,7 @@ def test_an_UNSCORED_outcome_is_terminal_too(store: _TamperableStore) -> None:
     A window that reopened would let a late-arriving candle rewrite a trial agents already saw
     reported as unscored — which is exactly the "never interpolate" rule applied to time.
     """
-    store.record_outcome(TRIAL_ID, settle_trial(_trial(), _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS))
+    store.record_outcome(TRIAL_ID, _settle(_trial(), _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS))
     with pytest.raises(ValueError, match="already settled"):
         store.record_outcome(TRIAL_ID, _settled_outcome_from(_series()))
 
@@ -1090,7 +1115,7 @@ def test_the_outcome_checks_are_pending_while_the_OUTCOME_ITSELF_is_pending(
     ``fail`` would tell a receipt holder their receipt does not verify because the market has not
     moved on.
     """
-    store.record_outcome(committed_receipt.trial_id, settle_trial(_trial(), _empty_series(), now_ms=T0 + 60_000))
+    store.record_outcome(committed_receipt.trial_id, _settle(_trial(), _empty_series(), now_ms=T0 + 60_000))
     assert _verdict(committed_receipt.receipt_id, store) == _unsettled()
 
 
@@ -1107,7 +1132,7 @@ def test_the_outcome_checks_are_pending_for_an_UNSCORED_trial_and_the_STATUS_say
     UNSCORED trial has been shown to be wrong.
     """
     store.record_outcome(
-        committed_receipt.trial_id, settle_trial(_trial(), _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS)
+        committed_receipt.trial_id, _settle(_trial(), _empty_series(), now_ms=T + 60_000 + FETCH_GRACE_MS)
     )
     assert _verdict(committed_receipt.receipt_id, store) == _unsettled()
     outcome = store.outcome(committed_receipt.trial_id)
@@ -1181,6 +1206,260 @@ def test_rewriting_the_sealed_EVIDENCE_fails_evidence_equality(
     """
     store.tamper(settled_receipt.receipt_id, field="outcome.evidence", value={**_sig().model_dump(), "holders": 1})
     assert _verdict(settled_receipt.receipt_id, store) == _clean(evidence_equality="fail")
+
+
+# ==================================================================================================
+# CODEX CRITICAL — a SCORE-CHANGING tamper must not verify.
+#
+# Before this block, the four outcome checks verified the bar label and width, the law-version
+# string, the evidence payload and hash, and the close-time arithmetic — and NEVER re-derived the
+# outcome that law governs. `entry`, `follow_markout_bps`, `fade_markout_bps` and
+# `follow_profitable` occurred ZERO times in the check construction. Flipping `follow_profitable`
+# alone moved a published `avg_brier` from 0.03999999999999998 to 0.6400000000000001 with ALL EIGHT
+# CHECKS PASSING: a public receipt saying every Fair-Play check passed over a materially rewritten
+# score. That is the product's central claim being false, so these tests assert BOTH halves — the
+# check result, and that the forged score cannot remain verified.
+# ==================================================================================================
+
+
+#: The score-bearing fields, each with a forged value and the published number it moves. Every one
+#: is a primary input to ``settle_commit``/``build_agent_record``, so none of these is a cosmetic
+#: rewrite of a displayed field: each changes what an agent's record asserts.
+_SCORE_BEARING_TAMPERS: list[tuple[str, Any]] = [
+    # The verdict itself. A FOLLOW committer at p=0.8 goes from a near-perfect Brier to a terrible
+    # one, and the FADE committer at p=0.3 goes the other way, off one boolean.
+    ("follow_profitable", False),
+    # The sealed entry price. Re-derives against the evidence's ``trigger_price``, so a forged entry
+    # is caught even though it moves no average on its own — it is the basis every markout is from.
+    ("entry", 0.0100),
+    # The two legs. Each is the chosen markout for whichever stance took it, and the capped average
+    # is computed from exactly these.
+    ("follow_markout_bps", FOLLOW_BPS + 4_000),
+    ("fade_markout_bps", FADE_BPS + 4_800),
+]
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"), _SCORE_BEARING_TAMPERS, ids=[field for field, _ in _SCORE_BEARING_TAMPERS]
+)
+def test_a_forged_SCORE_BEARING_field_fails_outcome_source(
+    settled_receipt: CommitRecord, store: _TamperableStore, field: str, forged: Any
+) -> None:
+    """Each score-bearing field, forged on its own, is CAUGHT — and the other seven checks still answer.
+
+    One mutant per field rather than one compound tamper, because a check that re-derived only the
+    verdict would pass three of these and a check that re-derived only the legs would pass two. The
+    whole eight-key verdict is asserted so the row states both what broke and that nothing else did:
+    a fix that collapsed the report to eight ``fail``s would satisfy "the tamper was caught" while
+    destroying the attribution H4.2 spent four rounds establishing.
+    """
+    store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=forged)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_a_forged_verdict_CANNOT_remain_verified_while_the_published_score_moves(
+    store: _TamperableStore, series_1m: CandleSeries
+) -> None:
+    """The CRITICAL finding end to end: the score moves, and the checks say so.
+
+    Two payers take OPPOSITE legs on one trial, so flipping ``follow_profitable`` moves BOTH agent
+    records — in opposite directions — and the assertion is not about one payer's arithmetic. The
+    forged-score half is asserted first and independently: without it, a test could pass because the
+    tamper changed nothing, and "the checks caught a tamper that had no effect" is not the property
+    this benchmark rests on.
+    """
+    follow = _commit(store, _trial(), staging_id="s_follow", p=0.8, payer=PAYER)
+    _commit(store, _trial(), staging_id="s_fade", p=0.3, payer=OTHER_PAYER)
+    store.record_outcome(TRIAL_ID, _settled_outcome_from(series_1m))
+
+    intact = (build_agent_record(PAYER, store).avg_brier, build_agent_record(OTHER_PAYER, store).avg_brier)
+    assert _verdict(follow.receipt_id, store) == _clean(), "the intact receipt must verify before anything is forged"
+
+    store.tamper(follow.receipt_id, field="outcome.follow_profitable", value=False)
+    forged = (build_agent_record(PAYER, store).avg_brier, build_agent_record(OTHER_PAYER, store).avg_brier)
+
+    # THE FORGERY IS REAL: both published records moved, and in opposite directions.
+    assert forged[0] == pytest.approx((0.8 - 0) ** 2) and intact[0] == pytest.approx((0.8 - 1) ** 2)
+    assert forged[1] == pytest.approx((0.3 - 0) ** 2) and intact[1] == pytest.approx((0.3 - 1) ** 2)
+    # AND IT IS CAUGHT. This is the assertion the product's central claim is.
+    assert _verdict(follow.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_the_markout_legs_are_RECOMPUTED_rather_than_compared_to_each_other(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """DISCRIMINATION against a check that only asserted the law's internal symmetry.
+
+    ``follow + fade == -2 * cost_bps`` holds for the honest row and is tempting to check, but it is
+    satisfied by INFINITELY many forged pairs — here both legs are shifted by the same amount in
+    opposite directions, so the symmetry is preserved exactly while both published markouts are
+    wrong. Only recomputing from ``(entry, future, cost_bps)`` rejects it.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.follow_markout_bps", value=FOLLOW_BPS + 1_000)
+    store.tamper(settled_receipt.receipt_id, field="outcome.fade_markout_bps", value=FADE_BPS - 1_000)
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    assert row["follow_markout_bps"] + row["fade_markout_bps"] == -2 * COST_BPS, "the symmetry must still hold"
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_the_entry_is_bound_to_the_SEALED_EVIDENCE_and_not_to_itself(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """Moving the evidence's ``trigger_price`` to MATCH a forged entry does not rescue the row.
+
+    The direction that matters. A forger who noticed the entry was checked would try to move the
+    other side of the comparison — and the evidence is hash-sealed, so ``evidence_equality``
+    reports that, while ``outcome_source`` reports that the markouts no longer re-derive from the
+    new price. Two findings, which is the honest report: two artifacts were altered.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.entry", value=0.0100)
+    store.tamper(
+        settled_receipt.receipt_id, field="outcome.evidence", value={**_sig().model_dump(), "trigger_price": 0.0100}
+    )
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(evidence_equality="fail", outcome_source="fail")
+
+
+@pytest.mark.parametrize("forged", [1, "true", None], ids=["int-one", "string", "null"])
+def test_the_verdict_must_be_a_BOOLEAN_and_not_merely_truthy(
+    settled_receipt: CommitRecord, store: _TamperableStore, forged: Any
+) -> None:
+    """``follow_profitable`` is compared with ``is``, so a truthy stand-in is a ``fail``.
+
+    ``1 == True`` in Python, so an ``==`` comparison would wave the first row through — and the
+    integer ``1`` is a row the writer could never have produced. The stored artifact and the value
+    the law returns have to be the same thing, not merely equal.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.follow_profitable", value=forged)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_a_price_stored_as_a_STRING_does_not_re_derive(settled_receipt: CommitRecord, store: _TamperableStore) -> None:
+    """The coercion boundary. ``float("0.0125")`` succeeds; the check must still refuse it.
+
+    A verifier that coerced could not tell a price stored as a number from one stored as text, and
+    the two are different artifacts. Same reasoning ``_exact_int`` already applies to the stamps.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.entry", value=str(ENTRY))
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_a_SELF_CONSISTENT_forgery_off_a_different_entry_is_still_caught(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """The tamper that ONLY the evidence binding can catch, and the reason that binding exists.
+
+    Every other entry tamper in this file is caught by the leg recomputation as a side effect —
+    change ``entry`` alone and the stored legs stop matching. So a check that recomputed the legs
+    and never compared ``entry`` to the evidence would pass all of them, which a mutation run
+    proved: deleting the binding left the suite green.
+
+    This is the row that discriminates. The entry is rewritten AND both legs and the verdict are
+    recomputed from the new entry, so the row is internally perfect and every relation among its
+    own fields holds. It fails only because ``entry`` is anchored to the hash-sealed
+    ``trigger_price``, which the forger did not touch.
+
+    It is also exactly the forgery the ``future`` limit above CANNOT catch, and the contrast is the
+    point: ``entry`` has an independent record and ``future`` does not, so one is closed and the
+    other is documented.
+    """
+    forged_entry = 0.0100
+    markout = spot_markout(forged_entry, FUTURE, COST_BPS)
+    for field, value in (
+        ("entry", forged_entry),
+        ("follow_markout_bps", markout.follow_markout_bps),
+        ("fade_markout_bps", markout.fade_markout_bps),
+        ("follow_profitable", markout.follow_profitable),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    # The forgery is INTERNALLY CONSISTENT: recomputing from its own entry reproduces its own legs.
+    recomputed = spot_markout(row["entry"], row["future"], row["cost_bps"])
+    assert (recomputed.follow_markout_bps, recomputed.fade_markout_bps) == (
+        row["follow_markout_bps"],
+        row["fade_markout_bps"],
+    )
+    # And it is still caught, because the entry is not its own authority.
+    assert row["entry"] != row["evidence"]["trigger_price"]
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_the_LIMIT_of_the_law_re_derivation_is_pinned_rather_than_implied(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """``future`` has no independent record, so a SELF-CONSISTENT rewrite still re-derives. Stated.
+
+    This test asserts a GAP, deliberately, because an unstated gap is the thing that gets
+    over-claimed. The settlement candle's close price is not attested by any second artifact on
+    disk, so an adversary who rewrites ``future`` AND recomputes both legs and the verdict from it
+    produces a row that re-derives perfectly — and ``outcome_source`` passes.
+
+    What IS closed is the cheap forgery: changing a result without changing its inputs, which is
+    every row in the table above. Closing this one needs a signed candle from the venue, which §7
+    does not provide. If a later change makes this row fail, the gap has been closed and this test
+    should be REPLACED by one asserting that — not deleted quietly.
+    """
+    forged_future = 0.0140
+    markout = spot_markout(ENTRY, forged_future, COST_BPS)
+    for field, value in (
+        ("future", forged_future),
+        ("follow_markout_bps", markout.follow_markout_bps),
+        ("fade_markout_bps", markout.fade_markout_bps),
+        ("follow_profitable", markout.follow_profitable),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(), (
+        "a self-consistent rewrite of the unattested close price is the DOCUMENTED limit of this check"
+    )
+
+
+def test_the_recorded_SETTLEMENT_SOURCE_is_verified_against_the_sealed_evidence(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """§7's persisted source is checked, not merely stored.
+
+    A settlement fetched from the wrong chain is refused at write time by the operator script, but
+    a row already on disk is past every write-time gate — only this comparison can report it. The
+    sealed evidence names the chain the signal was observed on, which is what makes the recorded
+    chain checkable at all rather than a self-consistent copy.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.chain_index", value=OTHER_CHAIN_INDEX)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+@pytest.mark.parametrize(
+    "forged",
+    ["https://web3.okx.com/api/v6/dex/market/candles", "", None, 196],
+    ids=["different-endpoint", "empty", "null", "not-a-string"],
+)
+def test_a_settlement_from_an_UNRECOGNIZED_endpoint_does_not_verify(
+    settled_receipt: CommitRecord, store: _TamperableStore, forged: Any
+) -> None:
+    """The recorded endpoint must be the one candles path this build settles from.
+
+    ``candles`` and ``historical-candles`` are different OKX endpoints serving different data, and
+    the first row is the realistic confusion. The host half is NOT constrained — nothing on disk can
+    attest it — so this is the same kind of claim ``bar_version`` makes: a value this law could have
+    produced.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.source_endpoint", value=forged)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_an_intact_settlement_recorded_through_the_REAL_settler_verifies_clean(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """ACCEPTANCE CONTROL for every discriminating row above.
+
+    Each test in this block asserts a ``fail``, and a check hard-wired to ``fail`` would satisfy all
+    of them. This is the row that makes them mean something: the same fixture, untampered, verifying
+    eight ``pass`` — and the outcome was produced by ``settle_trial`` rather than hand-built, so the
+    writer and the verifier are being held to each other rather than to a fixture that agreed with
+    one of them by construction.
+    """
+    assert _verdict(settled_receipt.receipt_id, store) == _clean()
 
 
 @pytest.mark.parametrize(
@@ -1311,6 +1590,10 @@ def test_the_stored_outcome_row_covers_the_outcome_and_its_provenance() -> None:
     assert set(OUTCOME_PROVENANCE_FIELDS) == {
         "bar",
         "bar_ms",
+        # §7's persisted SOURCE. Absent until H4.3's remediation, which is how a settlement fetched
+        # from the wrong chain could be recorded with nothing on disk able to notice.
+        "chain_index",
+        "source_endpoint",
         "t0_ms",
         "horizon_ms",
         "cost_bps",
@@ -1437,7 +1720,7 @@ async def test_the_trial_route_serves_a_RECORDED_non_settled_outcome_with_every_
     pass just as happily against a route that had collapsed the two labels into one.
     """
     trial = _trial()
-    store.record_outcome(TRIAL_ID, settle_trial(trial, _empty_series(), now_ms=now_ms))
+    store.record_outcome(TRIAL_ID, _settle(trial, _empty_series(), now_ms=now_ms))
     async with _client(_app(store=store, live_trials=_OneTrialRepo(trial))) as client:
         response = await client.get(f"/signal-trials/trials/{TRIAL_ID}")
     assert response.status_code == 200
@@ -1532,6 +1815,143 @@ async def test_the_verify_route_still_404s_for_a_pending_staging_id(store: _Tamp
     assert response.status_code == 404 and response.json() == {"error": "receipt_not_found"}
 
 
+# ==================================================================================================
+# CODEX MAJOR — the 500 H4.2 spent four rounds removing, reintroduced by H4.3's receipt envelope.
+#
+# `_commit_receipt_response` caught bounded row failures only through `store.outcome()`;
+# `settle_commit()` and `CommitReceiptResponse(...)` sat OUTSIDE the guard. So a row the verifier
+# evaluated perfectly well — eight attributable verdicts ready to publish — crashed while the newly
+# embedded receipt was rendered, and the route answered 500. That is the exact tampering-versus-
+# outage conflation the route's docstring says it exists to refuse.
+#
+# The `NaN` row is the one that proves a guard around the two reads was never going to be enough:
+# pydantic ACCEPTS a non-finite float, and the failure lands in the JSON renderer AFTER the handler
+# has returned, where no `try` in this module can reach it. It is refused at the store read instead.
+# ==================================================================================================
+
+
+@pytest.mark.parametrize(
+    ("field", "forged", "failing"),
+    [
+        # Non-finite probabilities. `json.loads` accepts all three literals and `float()` builds
+        # them happily; the response renderer is RFC-compliant and will not emit them.
+        ("p_follow_profitable", float("nan"), ("body_hash",)),
+        ("p_follow_profitable", float("inf"), ("body_hash",)),
+        ("p_follow_profitable", float("-inf"), ("body_hash",)),
+        # Wrong-SHAPED nullable and string fields. These pass through `_record_from` uncoerced by
+        # design — `null` is a tamper signal the model is meant to serve — so the model is the first
+        # thing that sees them, and it raises.
+        ("commit_deadline_ms", "not-an-int", ("manifest", "deadline_respected")),
+        ("commit_deadline_ms", [1, 2, 3], ("manifest", "deadline_respected")),
+        ("trial_mode", [1, 2, 3], ("manifest", "live_mode")),
+        ("committed_at_ms", {"nested": 1}, ("manifest", "deadline_respected")),
+    ],
+    ids=["nan", "inf", "-inf", "deadline-string", "deadline-list", "mode-list", "committed-object"],
+)
+async def test_a_tampered_finalized_ROW_is_a_200_with_a_null_receipt_and_never_a_500(
+    settled_receipt: CommitRecord, store: _TamperableStore, field: str, forged: Any, failing: tuple[str, ...]
+) -> None:
+    """Every one of these was a 500 before the guard was widened. Each is now a published verdict.
+
+    The failing checks are asserted BY NAME rather than merely "some check failed": the point of
+    answering 200 is that the eight verdicts are worth publishing, so a response carrying eight
+    passes and a null receipt would be a worse lie than the 500 it replaced.
+    """
+    store.tamper(settled_receipt.receipt_id, field=field, value=forged)
+    async with _client(_app(store=store), raise_app_exceptions=False) as client:
+        response = await client.get(f"/signal-trials/receipts/{settled_receipt.receipt_id}/verify")
+
+    assert response.status_code == 200, "a tampered row must be a finding, not an outage"
+    body = response.json()
+    assert body["receipt"] is None
+    assert body["checks"] == _clean(**dict.fromkeys(failing, "fail"))
+
+
+async def test_an_outcome_that_claims_SETTLED_with_no_verdict_is_a_200_and_not_a_500(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """The ``settle_commit()`` half of the widened boundary, which the row tampers above never reach.
+
+    A settled outcome carrying no ``follow_profitable`` makes ``settle_commit`` raise rather than
+    invent an outcome indicator — correct, and it was escaping to the client as a 500. The receipt
+    is null and ``outcome_source`` reports the missing verdict, which is the finding.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.follow_profitable", value=None)
+    async with _client(_app(store=store), raise_app_exceptions=False) as client:
+        response = await client.get(f"/signal-trials/receipts/{settled_receipt.receipt_id}/verify")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["receipt"] is None
+    assert body["checks"] == _clean(outcome_source="fail")
+
+
+async def test_an_OSError_from_the_disk_is_STILL_a_500_and_not_an_honest_looking_verdict(
+    settled_receipt: CommitRecord, store: _TamperableStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DISCRIMINATION CONTROL for every row above, and the constraint that bounds the fix.
+
+    Widening WHAT is guarded must not widen WHAT IS CAUGHT. A fix that normalized every failure to
+    ``receipt: null`` would satisfy all seven rows above while laundering an outage into a
+    verdict — telling a receipt holder their receipt is fine when the service could not read it.
+    That is strictly worse than the bug being fixed, so the same fault must still be a 500.
+
+    Injected at ``Path.read_text`` rather than by ``chmod``, so it is a real ``OSError`` from the
+    read and does not depend on the test running as a non-root user.
+    """
+    real_read_text = Path.read_text
+
+    def exploding_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.suffix == ".json" and _FINALIZED_DIRNAME in self.parts:
+            raise OSError("simulated unreadable disk")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", exploding_read_text)
+    async with _client(_app(store=store), raise_app_exceptions=False) as client:
+        response = await client.get(f"/signal-trials/receipts/{settled_receipt.receipt_id}/verify")
+    assert response.status_code == 500, "an infrastructure fault must not be reported as a receipt verdict"
+
+
+async def test_an_OSError_from_INSIDE_the_widened_region_is_still_a_500(
+    settled_receipt: CommitRecord, store: _TamperableStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control that actually measures the guard's BREADTH, and the one the disk test cannot.
+
+    A fault injected at the disk reaches ``verify_receipt`` first — which absorbs only
+    ``ValueError`` — so the 500 above is produced BEFORE the receipt renderer is ever called. That
+    makes it a fine test of the verifier and a vacuous one of this guard: widening the catch here
+    to ``except Exception`` leaves it green, which a mutation run confirmed.
+
+    So the fault is injected where ONLY the widened region runs. ``settle_commit`` is inside the
+    guard now and was outside it before, and an ``OSError`` from there is the service being broken.
+    If this ever returns 200 with a null receipt, the guard has started laundering outages into
+    honest-looking verdicts — the failure mode that is strictly worse than the bug it replaced.
+    """
+
+    def exploding_settle_commit(record: Any, outcome: Any) -> Any:
+        raise OSError("simulated infrastructure fault from inside the guarded region")
+
+    monkeypatch.setattr(signal_trials_router, "settle_commit", exploding_settle_commit)
+    async with _client(_app(store=store), raise_app_exceptions=False) as client:
+        response = await client.get(f"/signal-trials/receipts/{settled_receipt.receipt_id}/verify")
+    assert response.status_code == 500, "the widened guard swallowed an infrastructure fault"
+
+
+def test_a_non_finite_probability_is_refused_where_every_caller_reads_a_corrupt_row(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """The store read is where ``NaN`` becomes a ``ValueError``, and the route only inherits that.
+
+    Asserted at the store rather than only through the endpoint because the endpoint cannot
+    distinguish "the row was refused" from "the model rejected it", and the refusal has to be at
+    the boundary every caller already treats as corruption — otherwise the next consumer of
+    ``record()`` reintroduces the same crash somewhere this test is not watching.
+    """
+    store.tamper(settled_receipt.receipt_id, field="p_follow_profitable", value=float("nan"))
+    with pytest.raises(ValueError, match="non-finite"):
+        store.record(settled_receipt.receipt_id)
+
+
 # ------------------------------------------------------------------------------ law provenance
 
 
@@ -1565,7 +1985,7 @@ def test_an_unsettled_provenance_records_no_settlement_candle() -> None:
     A zero here would be re-derived by ``outcome_source`` as a close at ``bar_ms``, i.e. 1970, and
     the check would report a tamper on an honestly unsettled trial.
     """
-    settled = settle_trial(_trial(), _empty_series(), now_ms=T0 + 60_000)
+    settled = _settle(_trial(), _empty_series(), now_ms=T0 + 60_000)
     assert settled.outcome.status == "pending"
     assert settled.provenance.settlement_ts_open_ms is None
     assert settled.provenance.bar_ms == 60_000
@@ -1757,6 +2177,27 @@ class _StubMarketClient:
         return self._series
 
 
+def _publish_selection(root: Path, *, chain_index: str = CHAIN_INDEX, bar: str = "1m") -> None:
+    """Publish the season document naming the matrix-selected ``(chain x bar)`` for ``root``.
+
+    Every ``main()`` test needs one, because the script now REFUSES to record a terminal outcome
+    under a bar no published artifact authorizes. That refusal is the point of the gate, so the
+    prerequisite is spelled here rather than hidden in a fixture: a test that wants the run to
+    proceed has to say which selection it is proceeding under.
+    """
+    write_season(
+        root,
+        {
+            "season_id": "season_h43",
+            "season_status": "exploratory",
+            "combo": {"chain_index": chain_index, "bar": bar},
+            "sample_size": 1,
+            "rows": [],
+        },
+    )
+    write_state(root, "exploratory", {})
+
+
 def _set_sentinel_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Credentials that are self-evidently not credentials, and are greppable if one ever escapes."""
     monkeypatch.setenv("OKX_API_KEY", "SENTINEL-KEY-DO-NOT-LEAK")
@@ -1828,6 +2269,7 @@ def test_the_coverage_gate_is_WIRED_into_the_write_path(
     data_dir = tmp_path
     trial = _trial()
     LiveTrialRepository(data_dir / settle_operator.LIVE_SUBDIR).publish(trial)
+    _publish_selection(data_dir)
     _set_sentinel_credentials(monkeypatch)
 
     client = _StubMarketClient(series_factory())
@@ -1872,6 +2314,7 @@ def test_main_REDACTS_credentials_out_of_the_failure_report(
     string carrying two of the three credential values — so this asserts against the real hazard and
     not against a string that merely happens to contain the sentinel.
     """
+    _publish_selection(tmp_path)
     _set_sentinel_credentials(monkeypatch)
 
     async def exploding_settle_all(trials: Any, store: Any, creds: Any, args: Any, *, now_ms: int) -> Any:
@@ -1907,7 +2350,12 @@ def test_main_ABORTS_with_a_status_a_shell_cannot_read_as_a_settled_season(
     tell a missing variable from a failed run. The mutant that returns ``0`` here is not a cosmetic
     one: exit 0 is exactly what a shell running ``settle.py && publish.py`` reads as a settled
     season, so the softened script publishes a season it never settled.
+
+    The selection is published first so this reaches the CREDENTIAL abort rather than the earlier
+    selection abort. Both exit ``2`` — they are the same class of fault, a bad invocation caught
+    before any request — and this test is about the credential one, so it has to get past the other.
     """
+    _publish_selection(tmp_path)
     exit_code = settle_operator.main(
         ["--data-dir", str(tmp_path), "--chain-index", "196", "--bar", "1m", "--now-ms", str(T)]
     )
@@ -1945,8 +2393,8 @@ def test_only_trials_PAST_their_horizon_and_NOT_already_terminal_are_settled(
     not_yet = replace(_trial(trial_id="trial_not_yet"), t0_ms=now_ms - FROZEN_HORIZON_MS + 1)
 
     store.record_outcome("trial_settled", _settled_outcome_from(_series(), trial_id="trial_settled"))
-    store.record_outcome("trial_unscored", settle_trial(unscored_already, _empty_series(), now_ms=now_ms))
-    store.record_outcome("trial_pending", settle_trial(still_pending, _empty_series(), now_ms=T0 + 60_000))
+    store.record_outcome("trial_unscored", _settle(unscored_already, _empty_series(), now_ms=now_ms))
+    store.record_outcome("trial_pending", _settle(still_pending, _empty_series(), now_ms=T0 + 60_000))
     pending_payload = store.outcome_payload("trial_pending")
     assert pending_payload is not None and pending_payload["status"] == "pending", "the control row is not pending"
 
@@ -1993,3 +2441,245 @@ def test_the_published_check_names_match_the_frozen_tuples(
     # Without this the test pins two declarations to each other and neither to a response, which is
     # the shape of pin that stays green while the thing it is about drifts.
     assert listed == tuple(_verdict(committed_receipt.receipt_id, store))
+
+
+# ==================================================================================================
+# CODEX MAJOR — the operator could settle against the wrong chain or bar and every check passed.
+#
+# `settle_live_trials.py` fetched with the operator-supplied `--chain-index` without deriving or
+# validating it against `trial.sig.chain_index`, and `bar_version` only ever asked whether the
+# recorded (label, width) formed ONE ALLOWED PAIR — never whether it was the MATRIX-SELECTED pair.
+# Codex sealed a trial on chain 196, ran with `--chain-index 501`, and got a settled outcome with
+# all four outcome checks PASS. The candles are real, the law applies cleanly, and the settlement
+# is of a completely different token's market.
+#
+# GATE A applies to every test below: no live endpoint is reachable. See the block above.
+# ==================================================================================================
+
+
+def _settle_run(
+    settle_operator: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    data_dir: Path,
+    *,
+    trial: LiveTrial,
+    chain_index: str,
+    bar: str,
+    publish: bool = True,
+    season_chain: str = CHAIN_INDEX,
+    season_bar: str = "1m",
+) -> tuple[int, _StubMarketClient]:
+    """Publish ``trial``, run the operator once, and return its exit status and the fetch log.
+
+    The client is returned rather than asserted on here because "what was fetched" is the whole
+    question in this block: a refusal that happened AFTER the fetch is a different and much weaker
+    property than one that happened before it.
+    """
+    LiveTrialRepository(data_dir / settle_operator.LIVE_SUBDIR).publish(trial)
+    if publish:
+        _publish_selection(data_dir, chain_index=season_chain, bar=season_bar)
+    _set_sentinel_credentials(monkeypatch)
+    client = _StubMarketClient(_series(bar=bar, bar_ms=BAR_MS[bar]))
+    monkeypatch.setattr(settle_operator, "OKXMarketClient", lambda transport, creds: client)
+    exit_code = settle_operator.main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "--chain-index",
+            chain_index,
+            "--bar",
+            bar,
+            "--now-ms",
+            str(T + FROZEN_HORIZON_MS),
+        ]
+    )
+    return exit_code, client
+
+
+@pytest.mark.parametrize(
+    ("chain_index", "bar", "named"),
+    [
+        (OTHER_CHAIN_INDEX, "1m", "--chain-index"),
+        (CHAIN_INDEX, "1H", "--bar"),
+    ],
+    ids=["cross-chain", "wrong-selected-bar"],
+)
+def test_a_run_that_does_not_match_the_PUBLISHED_SELECTION_is_refused_before_any_fetch(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    chain_index: str,
+    bar: str,
+    named: str,
+) -> None:
+    """Both of Codex's reproductions, refused — and refused BEFORE the network, not after.
+
+    The season is published naming ``(196, 1m)``; each row invokes the settler against something
+    else. Before this gate both rows produced a settled outcome with all four outcome checks
+    passing, which is a false all-pass report over a settlement of the wrong market.
+
+    ``client.calls == []`` is the load-bearing assertion. A gate that refused only at the write
+    would still have made the request, and on a real endpoint that is a rate-limited call against
+    the wrong chain; more importantly, a refusal after the fact leaves the wrong series in memory
+    for any later edit to record.
+    """
+    exit_code, client = _settle_run(
+        settle_operator, monkeypatch, tmp_path, trial=_trial(), chain_index=chain_index, bar=bar
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2, "a mismatched selection must not be readable as a settled season"
+    assert client.calls == [], "the run reached the network before checking its own selection"
+    assert captured.out == "", "an aborted run must print no summary a shell could read as success"
+    assert "aborted before any request" in captured.err
+    assert named in captured.err, f"the abort did not name which flag disagreed: {captured.err}"
+    assert ReceiptStore(tmp_path).outcome(TRIAL_ID) is None, "a refused run wrote a terminal outcome"
+
+
+def test_a_run_with_NO_PUBLISHED_SEASON_refuses_rather_than_settling_unchecked(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAIL CLOSED. With nothing naming the selected bar there is nothing to check ``--bar`` against.
+
+    The alternative — proceed when no season is published — leaves the wrong-bar hole open in
+    exactly the state where it is least visible, and what it produces is a TERMINAL outcome
+    published to the agents who paid to commit and never revisited. Same reasoning as
+    ``series_covers_settlement``: when the run cannot be shown to have answered the question, it
+    records nothing.
+
+    This is a real operational prerequisite and not a technicality: the preflight publishes the
+    season, so an operator who has run the preflight has one.
+    """
+    exit_code, client = _settle_run(
+        settle_operator, monkeypatch, tmp_path, trial=_trial(), chain_index=CHAIN_INDEX, bar="1m", publish=False
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert client.calls == []
+    assert "no season is published" in captured.err
+    assert ReceiptStore(tmp_path).outcome(TRIAL_ID) is None
+
+
+def test_a_trial_sealed_on_ANOTHER_CHAIN_is_skipped_and_the_run_continues(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The PER-TRIAL gate, which the run-level one cannot cover.
+
+    Here the operator's flags match the published season exactly — the run-level gate passes — and
+    the TRIAL is the thing that belongs to another chain. Fetching it would return a different
+    token's market for a trial that names this one.
+
+    The run continues and exits 0, which is deliberate and is the same claim ``coverage_gap``
+    makes: exit status describes the RUN, and a run that applied its gates and declined to write
+    did its job. The refusal is reported in ``trials[].status`` where a driver can read it, and it
+    names BOTH chains so an operator can tell a wrong flag from an off-season trial.
+    """
+    off_season = _trial(trial_id="trial_offseason", chain_index=OTHER_CHAIN_INDEX)
+    exit_code, client = _settle_run(
+        settle_operator, monkeypatch, tmp_path, trial=off_season, chain_index=CHAIN_INDEX, bar="1m"
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert client.calls == [], "an off-season trial must not be fetched at all"
+    summary = json.loads(captured.out)
+    (row,) = summary["trials"]
+    assert row["status"] == "chain_mismatch" and row["recorded"] is False
+    assert row["sealed_chain_index"] == OTHER_CHAIN_INDEX and row["run_chain_index"] == CHAIN_INDEX
+    assert ReceiptStore(tmp_path).outcome("trial_offseason") is None
+
+
+def test_a_matching_run_FETCHES_THE_SEALED_CHAIN_and_persists_its_source(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ACCEPTANCE CONTROL, and the positive half of §7's persisted provenance.
+
+    Every test above asserts a refusal, and a settler that refused everything would satisfy all of
+    them. This is the row that makes them discriminating: the same harness, a matching selection,
+    and a settlement that is actually recorded.
+
+    It then asserts what was WRITTEN, which is the part the verifier depends on. The recorded chain
+    is the sealed one and the recorded endpoint is the candles path — so ``outcome_source`` has
+    something real to compare against rather than a field that was never populated.
+    """
+    exit_code, client = _settle_run(
+        settle_operator, monkeypatch, tmp_path, trial=_trial(), chain_index=CHAIN_INDEX, bar="1m"
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert client.calls == [(CHAIN_INDEX, _trial().sig.token_address, "1m")]
+    summary = json.loads(captured.out)
+    assert summary["season_selection"] == {"chain_index": CHAIN_INDEX, "bar": "1m"}
+    (row,) = summary["trials"]
+    assert row["status"] == "settled" and row["recorded"] is True
+
+    stored = ReceiptStore(tmp_path).outcome_payload(TRIAL_ID)
+    assert stored is not None
+    assert stored["chain_index"] == CHAIN_INDEX
+    assert stored["source_endpoint"].endswith(HISTORICAL_CANDLES_PATH)
+
+
+def test_the_persisted_chain_is_what_was_FETCHED_and_not_a_copy_of_the_evidence(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property that makes ``outcome_source``'s chain comparison able to catch anything.
+
+    If the settler recorded ``trial.sig.chain_index`` regardless of what it fetched, the recorded
+    chain would agree with the sealed evidence BY CONSTRUCTION and the verifier's comparison would
+    pass for every settlement, including one pulled from the wrong chain. So this drives the real
+    caller and asserts the recorded value equals the value the client was CALLED with — two
+    independently observed facts, not one value compared to itself.
+    """
+    _, client = _settle_run(settle_operator, monkeypatch, tmp_path, trial=_trial(), chain_index=CHAIN_INDEX, bar="1m")
+    fetched_chain = client.calls[0][0]
+    stored = ReceiptStore(tmp_path).outcome_payload(TRIAL_ID)
+    assert stored is not None and stored["chain_index"] == fetched_chain
+
+
+def test_settle_trial_records_the_chain_it_was_TOLD_and_never_the_evidence_s(store: _TamperableStore) -> None:
+    """The single property that makes ``outcome_source``'s chain comparison capable of catching anything.
+
+    ``settle_trial`` has the trial in hand, so recording ``trial.sig.chain_index`` would be the
+    obvious shortcut — and it would make the recorded chain agree with the sealed evidence BY
+    CONSTRUCTION, for every settlement, including one fetched from the wrong chain. The verifier's
+    comparison would then be a value against a copy of itself, which passes for anything.
+
+    The caller's tests cannot see this, and a mutation run proved it: the operator script refuses a
+    mismatch before it fetches, so at ITS call site the two values are always equal and swapping
+    them changes nothing. This asserts the contract where it lives, by passing a chain the trial
+    does NOT name and requiring the parameter to win.
+    """
+    trial = _trial()
+    assert trial.sig.chain_index == CHAIN_INDEX, "the fixture must not already carry the chain under test"
+    settled = settle_trial(
+        trial,
+        _series(),
+        now_ms=T + FROZEN_HORIZON_MS,
+        chain_index=OTHER_CHAIN_INDEX,
+        source_endpoint=SOURCE_ENDPOINT,
+    )
+    assert settled.provenance.chain_index == OTHER_CHAIN_INDEX
+
+    # AND the verifier reports it, which is the consequence that matters: a settlement recorded as
+    # fetched from a chain the evidence does not name does not verify.
+    receipt = _commit(store, trial, staging_id="s_wrongchain")
+    store.record_outcome(TRIAL_ID, settled)
+    assert _verdict(receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_settle_trial_REFUSES_to_record_a_settlement_that_states_no_source() -> None:
+    """The recording contract, pinned at the function rather than only through its caller.
+
+    ``chain_index`` and ``source_endpoint`` are required keywords for the same reason ``series``
+    is: a settlement whose source is unknown cannot be verified and must not be written. A default
+    would let a caller record an unexamined claim about its own fetch by saying nothing, and the
+    only test that would notice is one that reads the recorded value — which is a test about the
+    caller, not about the contract.
+    """
+    with pytest.raises(TypeError, match="chain_index"):
+        settle_trial(_trial(), _series(), now_ms=T + FROZEN_HORIZON_MS)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="source_endpoint"):
+        settle_trial(_trial(), _series(), now_ms=T + FROZEN_HORIZON_MS, chain_index=CHAIN_INDEX)  # type: ignore[call-arg]

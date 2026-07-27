@@ -167,7 +167,7 @@ class CommitReceiptResponse(BaseModel):
 
     ``brier`` and ``chosen_markout_bps`` are ``None`` unless ``status == "settled"``.
 
-    ``status`` COLLAPSES two states that :class:`TrialResponse` three models up is careful to keep
+    ``status`` COLLAPSES two states that :class:`TrialResponse` is careful to keep
     apart, and the collapse is stated here because that model teaches the reader to expect the
     distinction. A commitment against a trial with NO outcome recorded at all reads ``"pending"``,
     identically to one against a recorded ``pending`` outcome — both carry ``brier`` and

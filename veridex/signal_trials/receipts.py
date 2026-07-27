@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -69,7 +70,8 @@ from pydantic import BaseModel
 
 from veridex.chain.anchor import run_manifest_hash
 from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, visible_at_decision
-from veridex.signal_trials.okx_client import BAR_MS
+from veridex.signal_trials.okx_client import BAR_MS, HISTORICAL_CANDLES_PATH
+from veridex.signal_trials.spot_markout import spot_markout
 
 #: The slot states, as runtime values. ``SlotState`` is erased at runtime, so membership tests
 #: need this alongside it.
@@ -152,8 +154,23 @@ VERIFY_COMMIT_CHECKS: Final[tuple[str, ...]] = ("body_hash", "manifest", "deadli
 #:     resolved ``trial_id`` was rewritten is ``manifest``'s finding, not this one's. ``manifest``
 #:     binds the resolved trial id, so the join IS covered; it is covered somewhere else.
 #: ``outcome_source``
-#:     ``close_ts`` re-derives from the recorded candle: ``ts_open + bar_ms``, landing in §7's
-#:     half-open window ``[T, T + bar)``, with ``observation_lag`` equal to the distance from ``T``.
+#:     **The only check that re-derives what the law OUTPUT, and the reason it carries three
+#:     obligations rather than one.** The other three verify the law's METADATA — which bar, which
+#:     law version, which evidence — and a receipt can satisfy all of them while stating a result
+#:     the law never produced. So this one re-derives the RESULT:
+#:
+#:     * the close boundary: ``close_ts == ts_open + bar_ms``, landing in §7's half-open window
+#:       ``[T, T + bar)``, with ``observation_lag`` equal to the distance from ``T``;
+#:     * the law's outputs: ``entry`` is the sealed evidence's ``trigger_price``, both markout legs
+#:       and ``follow_profitable`` recompute from ``(entry, future, cost_bps)`` through the SAME
+#:       :func:`~veridex.signal_trials.spot_markout.spot_markout` the settler ran; and
+#:     * the fetch's source: the recorded ``chain_index`` is the chain the sealed evidence names,
+#:       and ``source_endpoint`` is the one candles endpoint this build settles from.
+#:
+#:     Three obligations under one name is a COST, and it is paid deliberately: the eight-key map
+#:     is frozen, so a ninth name is not available, and the alternative — leaving the law's outputs
+#:     unchecked — is what let a forged ``follow_profitable`` verify with all eight checks passing.
+#:     A reader of a ``fail`` here must consult the row to learn which of the three moved.
 VERIFY_OUTCOME_CHECKS: Final[tuple[str, ...]] = ("bar_version", "law_version", "evidence_equality", "outcome_source")
 
 #: A single check's verdict. THREE values, and the third is not a hedge.
@@ -205,6 +222,8 @@ OUTCOME_FIELDS: Final[tuple[str, ...]] = (
 OUTCOME_PROVENANCE_FIELDS: Final[tuple[str, ...]] = (
     "bar",
     "bar_ms",
+    "chain_index",
+    "source_endpoint",
     "t0_ms",
     "horizon_ms",
     "cost_bps",
@@ -336,10 +355,28 @@ class OutcomeProvenance:
     ``evidence`` is the trial's frozen decision-time payload, carried verbatim so
     ``evidence_equality`` can re-hash it. Storing only the hash would leave the check comparing a
     digest against itself, which passes for any payload at all.
+
+    ``chain_index`` and ``source_endpoint`` are §7's persisted SOURCE: which chain the settlement
+    candles were fetched for, and from which endpoint. They record WHAT THE FETCH ACTUALLY USED and
+    are therefore supplied by the caller that performed it — never re-derived here from
+    ``evidence``, which is the whole point. A ``chain_index`` copied off the sealed evidence at
+    write time would agree with it by construction, so ``outcome_source``'s chain comparison could
+    only ever catch a later tamper and never a settlement fetched from the wrong chain. This is the
+    same reasoning :func:`~veridex.signal_trials.live.settle_trial` already applies to re-selecting
+    the settlement candle rather than back-deriving its open time.
+
+    **What ``source_endpoint`` can and cannot be verified against, stated rather than implied.** Its
+    PATH half is checkable — this build settles from exactly one candles endpoint, and
+    ``outcome_source`` requires the recorded value to end with it. Its HOST half is not: no stored
+    artifact independently knows which host is legitimate, so the host is recorded and PUBLISHED
+    rather than re-derived. A reader can see which endpoint served a settlement; a verifier cannot
+    attest that it was the right one.
     """
 
     bar: str
     bar_ms: int
+    chain_index: str
+    source_endpoint: str
     t0_ms: int
     horizon_ms: int
     cost_bps: int
@@ -540,6 +577,30 @@ def _exact_int(value: Any) -> int | None:
     return value if type(value) is int else None
 
 
+def _finite_probability(value: Any) -> float:
+    """Return ``value`` as a finite ``float``, refusing the non-finite.
+
+    ``float()`` alone is not enough at a trust boundary that reads untrusted rows. ``NaN`` and the
+    infinities are legal Python floats and ``json.loads`` produces them from the bare ``NaN``,
+    ``Infinity`` and ``-Infinity`` literals, so a tampered row parses, coerces and Brier-scores as
+    if it carried a real commitment. It then reaches the JSON RESPONSE renderer, which is
+    RFC-compliant and refuses to emit it — a failure that happens after every handler has returned
+    and therefore cannot be turned into an honest verdict by anything downstream.
+
+    Raises:
+        ValueError: ``value`` is not a number at all, or is not finite. ``ValueError`` rather than a
+            type of its own because every caller already reads a ``ValueError`` from this module as
+            "this stored row is corrupt", which is exactly what a non-finite probability is.
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(
+            f"stored commit carries a non-finite p_follow_profitable ({number!r}); a probability "
+            "that is not a number is a corrupt row, not a commitment"
+        )
+    return number
+
+
 def _epoch_ms(value: Any) -> int | None:
     """Return ``value`` when it is usable as an epoch-millisecond stamp, else ``None``.
 
@@ -681,13 +742,34 @@ def _evidence_reproduces(evidence: object, sealed: object) -> bool:
         return False
 
 
-def _outcome_source_reproduces(row: dict[str, Any]) -> bool:
+def _exact_float(value: Any) -> float | None:
+    """Return ``value`` as a ``float`` when it is a stored JSON NUMBER, else ``None``.
+
+    The float twin of :func:`_exact_int`, and it refuses the same things for the same reason: a
+    price stored as the STRING ``"0.0125"`` is a different artifact from one stored as a number,
+    and coercing it would let a re-derivation succeed over a row the writer could not have
+    produced. ``bool`` is excluded explicitly because it is an ``int`` subclass, so ``True`` would
+    otherwise read as the price ``1.0``.
+
+    An integer too large to be a float — a tampered row can carry one — raises ``OverflowError``
+    rather than returning, so it is absorbed here: a value this reader cannot represent has not
+    been shown to re-derive anything.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        return None
+
+
+def _close_boundary_reproduces(row: dict[str, Any]) -> bool:
     """Return whether the stored close boundary re-derives from the stored settlement candle.
 
     Three relations, all of §7, and each catches something the others do not:
 
     * ``close_ts == ts_open + bar_ms`` — OKX's ``ts`` is the candle OPEN, so the close is one bar
-      later. This is the re-derivation the check is named for.
+      later.
     * ``observation_lag == close_ts - (t0 + horizon)`` — the displayed lag is not an independent
       number; it is the distance from the settlement target, and a lag that disagreed with the
       close would understate how late a settlement was.
@@ -706,6 +788,109 @@ def _outcome_source_reproduces(row: dict[str, Any]) -> bool:
     if close_ts is None or ts_open is None or lag is None or bar_ms is None or t0_ms is None or horizon_ms is None:
         return False
     return close_ts == ts_open + bar_ms and lag == close_ts - (t0_ms + horizon_ms) and 0 <= lag < bar_ms
+
+
+def _law_outputs_reproduce(row: dict[str, Any]) -> bool:
+    """Return whether the row's SCORE-BEARING fields re-derive from independently recorded inputs.
+
+    **This is the check the whole benchmark's central claim rests on**, and it exists because every
+    other check verified the law's inputs and metadata while leaving its OUTPUT unexamined. A
+    receipt could report all eight Fair-Play checks passing while ``follow_profitable`` had been
+    flipped, moving a published Brier from 0.04 to 0.64 — the displayed score and the agent record
+    materially rewritten, the proof surface reporting nothing.
+
+    Two derivations, and the SEPARATION of their sources is what makes either mean anything:
+
+    * ``entry`` is compared to the sealed evidence's ``trigger_price``. §7 makes the trigger price
+      the entry, and the evidence is bound by its own hash under ``evidence_equality`` — so this
+      ties the outcome's starting price to an artifact frozen at ``t0``, not to a stored copy of
+      itself.
+    * ``follow_markout_bps``, ``fade_markout_bps`` and ``follow_profitable`` are recomputed by
+      running :func:`~veridex.signal_trials.spot_markout.spot_markout` over
+      ``(entry, future, cost_bps)`` — the SAME function the settler ran, so the law has one
+      implementation here as everywhere else, and a rounding rule that changed would move both
+      sides together rather than reporting a false tamper.
+
+    ``follow_profitable`` is compared with ``is`` rather than ``==``, so a row carrying the integer
+    ``1`` where the writer stored ``true`` is a ``fail``: the two are equal in Python and are not
+    the same artifact.
+
+    **The boundary this check does NOT reach, stated rather than implied.** ``future`` is the only
+    law input with no independent record — the settlement candle's close price is not attested by
+    anything else on disk — so an adversary who rewrites ``future`` AND recomputes both legs and
+    the verdict consistently produces a self-consistent row that re-derives perfectly. What is
+    closed is the far commoner and far cheaper forgery: changing a RESULT without changing its
+    inputs. Attesting ``future`` itself would need a signed candle from the venue, which §7 does not
+    provide and this function cannot invent. ``settlement_ts_open_ms`` and the close boundary do pin
+    WHICH candle was claimed, so the surviving forgery has to restate an entire coherent settlement
+    rather than nudge one number.
+
+    Total by construction, in the same sense as :func:`_evidence_reproduces`: every way the
+    re-derivation can fail over untrusted parsed JSON is ``False``. ``ValueError`` covers a
+    non-positive or ``NaN`` price refused by the law's own guard, ``OverflowError`` an infinite one
+    reaching ``round()``, and ``TypeError`` a value the arithmetic cannot take at all.
+    """
+    evidence = row.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    entry = _exact_float(row.get("entry"))
+    trigger_price = _exact_float(evidence.get("trigger_price"))
+    future = _exact_float(row.get("future"))
+    cost_bps = _exact_int(row.get("cost_bps"))
+    if entry is None or trigger_price is None or future is None or cost_bps is None:
+        return False
+    if entry != trigger_price:
+        return False
+    try:
+        markout = spot_markout(entry, future, cost_bps)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return (
+        _exact_int(row.get("follow_markout_bps")) == markout.follow_markout_bps
+        and _exact_int(row.get("fade_markout_bps")) == markout.fade_markout_bps
+        and row.get("follow_profitable") is markout.follow_profitable
+    )
+
+
+def _settlement_source_binds(row: dict[str, Any]) -> bool:
+    """Return whether the recorded fetch source belongs to the trial the outcome is filed under.
+
+    §7 requires the settlement's source to be persisted, and persisting it is only half the job:
+    an operator who ran the settler with the wrong ``--chain-index`` fetched a DIFFERENT token's
+    market and settled this trial against it, and every other check passes on the result. The
+    sealed evidence names the chain the signal was observed on, so the recorded chain has an
+    independent artifact to be compared against.
+
+    ``source_endpoint`` is required to END WITH the one candles path this build settles from. The
+    host half is deliberately not constrained — see :class:`OutcomeProvenance` for why nothing on
+    disk can attest it — so this is the same kind of statement as ``bar_version``'s: the value is
+    one this law could have produced, rather than one re-derived from a second source.
+
+    Both halves are type-checked before they are compared. Two absent keys would otherwise both
+    read ``None`` and compare equal, which is a pass for a row that recorded no source at all.
+    """
+    evidence = row.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    chain_index = row.get("chain_index")
+    source_endpoint = row.get("source_endpoint")
+    return (
+        isinstance(chain_index, str)
+        and chain_index == evidence.get("chain_index")
+        and isinstance(source_endpoint, str)
+        and source_endpoint.endswith(HISTORICAL_CANDLES_PATH)
+    )
+
+
+def _outcome_source_reproduces(row: dict[str, Any]) -> bool:
+    """Return whether the settled outcome re-derives from everything recorded beside it.
+
+    The conjunction of the three obligations :data:`VERIFY_OUTCOME_CHECKS` documents for
+    ``outcome_source``: the close boundary, the law's outputs, and the fetch's source. Spelled as
+    three named predicates rather than one expression so each can be read, tested and mutated on
+    its own, and so a reader can see that all three have to hold.
+    """
+    return _close_boundary_reproduces(row) and _law_outputs_reproduce(row) and _settlement_source_binds(row)
 
 
 def _slot_key(payer: str, trial_id: str) -> str:
@@ -1147,12 +1332,22 @@ class ReceiptStore:
     # ------------------------------------------------------------------ finalized reads
 
     def _record_from(self, payload: dict[str, Any]) -> CommitRecord:
-        """Build a :class:`CommitRecord` from a stored finalized payload."""
+        """Build a :class:`CommitRecord` from a stored finalized payload.
+
+        Raises:
+            ValueError: A field this record must carry is missing, or its probability is not a
+                FINITE number. The finiteness clause is not decoration: Python's JSON decoder
+                accepts the bare ``NaN`` literal, ``float("nan")`` succeeds, and the value then
+                travels all the way to the response renderer — which refuses to emit it and turns a
+                tampered row into a 500 from OUTSIDE any handler's reach. Refusing it here makes it
+                what it is, a corrupt row, at the boundary where every caller already treats a
+                corrupt row as a ``ValueError``.
+        """
         return CommitRecord(
             receipt_id=str(payload["receipt_id"]),
             trial_id=str(payload["trial_id"]),
             payer=str(payload["payer"]),
-            p_follow_profitable=float(payload["p_follow_profitable"]),
+            p_follow_profitable=_finite_probability(payload["p_follow_profitable"]),
             methodology_version=payload.get("methodology_version"),
             body_hash=str(payload.get("body_hash")),
             payment_tx_hash=str(payload.get("payment_tx_hash")),

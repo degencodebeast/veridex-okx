@@ -550,6 +550,8 @@ def settle_trial(
     series: CandleSeries,
     *,
     now_ms: int,
+    chain_index: str,
+    source_endpoint: str,
     cost_bps: int = DECLARED_COST_BPS,
 ) -> SettledTrial:
     """Settle ``trial`` and record WHAT IT WAS DERIVED FROM alongside the result.
@@ -567,11 +569,27 @@ def settle_trial(
     settled under; a settlement whose bar provenance is unknown cannot be verified and must not be
     written. Scoring can proceed without a series and record nothing — recording cannot.
 
+    ``chain_index`` and ``source_endpoint`` are REQUIRED for exactly the same reason, and are
+    parameters rather than values read off ``trial``. They state WHAT THE FETCH USED, which is the
+    only thing that makes them worth persisting: a chain copied from ``trial.sig.chain_index`` here
+    would match the sealed evidence whatever series was actually fetched, so
+    ``outcome_source``'s chain comparison would be true by construction and a settlement pulled
+    from the wrong chain would verify perfectly. The caller that made the request is the only party
+    that knows what it asked for, so the caller states it. Deliberately not defaulted: a default
+    would let a caller record an unexamined claim about its own fetch by saying nothing.
+
     Args:
         trial: The trial to settle.
         series: The fetched candles WITH their bar provenance. An empty series is the honest
             "we looked and found nothing" and still carries the bar.
         now_ms: The clock.
+        chain_index: The chain the settlement candles were FETCHED FOR. The caller is responsible
+            for having refused a fetch that did not match the trial's sealed chain; this records
+            what happened, and ``outcome_source`` is what compares it to the sealed evidence.
+        source_endpoint: The endpoint the candles were fetched from. Its path half is verified
+            against the one candles endpoint this build settles from; its host half is recorded and
+            published rather than re-derived. See
+            :class:`~veridex.signal_trials.receipts.OutcomeProvenance`.
         cost_bps: The modeled cost; §8.2's official 25 by default.
 
     Returns:
@@ -591,6 +609,8 @@ def settle_trial(
         provenance=OutcomeProvenance(
             bar=series.bar,
             bar_ms=series.bar_ms,
+            chain_index=chain_index,
+            source_endpoint=source_endpoint,
             t0_ms=trial.t0_ms,
             horizon_ms=FROZEN_HORIZON_MS,
             cost_bps=cost_bps,

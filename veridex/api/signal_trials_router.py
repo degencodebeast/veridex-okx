@@ -134,31 +134,50 @@ def _commit_receipt_response(receipt_id: str, store: ReceiptStore) -> CommitRece
     ``store.outcome`` is inside the same guard on purpose: a corrupt OUTCOME row also leaves this
     receipt unrenderable, and the four outcome checks beside it already report that corruption as
     ``fail``.
+
+    **The guard spans the JOIN and the MODEL, and not only the two reads**, which is the correction
+    to a version that stopped at ``store.outcome``. Everything after a read is still derived from
+    the same untrusted row and fails on the same class of input:
+
+    * :func:`~veridex.signal_trials.live.settle_commit` raises ``ValueError`` on an outcome that
+      claims ``settled`` while carrying no verdict — a tamper the four outcome checks report as
+      ``fail``, and one that reached this function as an exception instead.
+    * ``CommitReceiptResponse(...)`` raises pydantic's ``ValidationError`` (a ``ValueError``) on a
+      row whose nullable or string fields are the wrong SHAPE. Those pass through
+      :meth:`~veridex.signal_trials.receipts.ReceiptStore._record_from` uncoerced by design —
+      ``null`` there is a tamper signal the model is meant to serve — so the model is the first
+      thing that sees a ``commit_deadline_ms`` stored as a list.
+
+    Leaving either outside meant a receipt whose verify report had eight perfectly good verdicts to
+    publish was answered with a 500, which is precisely the outage-versus-tamper conflation this
+    route exists to refuse. The boundary is still the SAME three exception types, so the
+    ``OSError`` discrimination is unchanged: widening WHAT is guarded is not widening WHAT IS
+    CAUGHT, and an infrastructure fault anywhere in here still reaches the client as a 500.
     """
     try:
         record = store.record(receipt_id)
         if record is None:
             return None
         outcome = store.outcome(record.trial_id)
+        settlement = unsettled_commit(record) if outcome is None else settle_commit(record, outcome)
+        return CommitReceiptResponse(
+            receipt_id=record.receipt_id,
+            trial_id=record.trial_id,
+            payer=record.payer,
+            p_follow_profitable=record.p_follow_profitable,
+            methodology_version=record.methodology_version,
+            action=settlement.action,
+            status=settlement.status,
+            brier=settlement.brier,
+            chosen_markout_bps=settlement.chosen_markout_bps,
+            committed_at_ms=record.committed_at_ms,
+            commit_deadline_ms=record.commit_deadline_ms,
+            trial_mode=record.trial_mode,
+            body_hash=record.body_hash,
+            payment_tx_hash=record.payment_tx_hash,
+        )
     except (ValueError, TypeError, RecursionError):
         return None
-    settlement = unsettled_commit(record) if outcome is None else settle_commit(record, outcome)
-    return CommitReceiptResponse(
-        receipt_id=record.receipt_id,
-        trial_id=record.trial_id,
-        payer=record.payer,
-        p_follow_profitable=record.p_follow_profitable,
-        methodology_version=record.methodology_version,
-        action=settlement.action,
-        status=settlement.status,
-        brier=settlement.brier,
-        chosen_markout_bps=settlement.chosen_markout_bps,
-        committed_at_ms=record.committed_at_ms,
-        commit_deadline_ms=record.commit_deadline_ms,
-        trial_mode=record.trial_mode,
-        body_hash=record.body_hash,
-        payment_tx_hash=record.payment_tx_hash,
-    )
 
 
 def register_signal_trials_routes(

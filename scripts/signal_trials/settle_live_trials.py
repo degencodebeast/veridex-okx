@@ -24,6 +24,25 @@ when the fetched series demonstrably SPANS the settlement window. If it does not
 coverage gap and records nothing, leaving the trial to a later invocation. A settled trial needs no
 such gate — the eligible candle is its own proof that the window was covered.
 
+**The second thing it must never do is settle a trial against a source the trial did not name.**
+``--chain-index`` and ``--bar`` are operator claims, and an outcome settled from the wrong chain or
+the wrong bar is not a wrong-looking artifact: the candles are real, the law applies cleanly, the
+bar label and width form a legal pair, and every Fair-Play check passes over a settlement of a
+different market. Two gates close that, and they are checked against two DIFFERENT authorities so
+neither can be satisfied by the run's own claims:
+
+* :func:`selected_combo` reads the PUBLISHED SEASON, which is the only artifact recording which
+  ``(chain x bar)`` the matrix picked, and :func:`assert_run_matches_selection` aborts before any
+  request if this run disagrees. With no season published there is no authority, and the run
+  refuses rather than proceeding unchecked.
+* Per trial, the chain is DERIVED from the trial's sealed evidence and the operator's value is only
+  an assertion checked against it — see :func:`_settle_all`.
+
+What was fetched is then PERSISTED with the settlement (§7) as ``chain_index`` and
+``source_endpoint``, so ``outcome_source`` can re-derive the chain against the sealed evidence long
+after this process exits. Recording what the fetch used rather than what the trial says is what
+makes that check able to catch a wrong-chain settlement at all.
+
 **Credentials.** The three OKX variables are read from the environment, held only inside
 :class:`~veridex.signal_trials.okx_client.OKXCredentials` (which redacts its own ``repr``), and
 every failure message is passed through :func:`redact` before it is printed. Nothing here logs, and
@@ -60,8 +79,15 @@ from veridex.signal_trials.live import (
     settle_commit,
     settle_trial,
 )
-from veridex.signal_trials.okx_client import BAR_MS, CandleSeries, OKXCredentials, OKXMarketClient
+from veridex.signal_trials.okx_client import (
+    BAR_MS,
+    HISTORICAL_CANDLES_PATH,
+    CandleSeries,
+    OKXCredentials,
+    OKXMarketClient,
+)
 from veridex.signal_trials.preflight import FROZEN_HORIZON_MS
+from veridex.signal_trials.published import read_season
 from veridex.signal_trials.receipts import TERMINAL_STATUSES, ReceiptStore
 
 #: Where the live-trial repository lives under the data dir. Must match ``open_live_trial.py`` and
@@ -82,6 +108,14 @@ DEFAULT_CANDLE_LIMIT = 100
 
 class MissingCredentialError(RuntimeError):
     """A required OKX credential is absent from the environment."""
+
+
+class SelectionError(RuntimeError):
+    """The run's ``(chain x bar)`` is not the one the published season was built under.
+
+    Its own type rather than a bare ``RuntimeError`` so ``main`` can abort on it BEFORE any request
+    and distinguish it from a failure during the run, which is a different fact fixed differently.
+    """
 
 
 class HttpxTransport:
@@ -177,6 +211,67 @@ def series_covers_settlement(series: CandleSeries, *, t0_ms: int, horizon_ms: in
     return min(closes) <= settlement_target_ms and max(closes) >= settlement_target_ms + series.bar_ms
 
 
+def selected_combo(data_dir: Path) -> dict[str, str]:
+    """Return the ``(chain_index, bar)`` the published season was built under.
+
+    §7 fixes ONE bar per season and the preflight's matrix picks ONE chain to go with it. The
+    published season document is the only artifact in this data directory that records which pair
+    won, which makes it the authority a settlement run has to agree with — and the whole reason
+    this function exists is that ``--bar`` and ``--chain-index`` are otherwise pure operator claims
+    that nothing checks. Settling a 1m season's trial on ``--bar 1H`` fetches hourly candles,
+    applies the close-boundary law to a completely different candle, and produces a settled outcome
+    whose bar label and width form a perfectly legal pair — so every Fair-Play check passes over a
+    settlement the season never authorized.
+
+    Raises:
+        SelectionError: No season is published, or the published one names no usable combo. This is
+            FAIL CLOSED and it is the point: with nothing naming the selected bar there is nothing
+            to check ``--bar`` against, and a run that proceeded anyway would write a TERMINAL
+            outcome — published to the agents who paid to commit, never revisited — under a bar no
+            artifact authorizes. The same reasoning as :func:`series_covers_settlement`: when the
+            fetch cannot be shown to have answered the question, record nothing. Publish the season
+            (the preflight does it) and re-run.
+        ValueError: The published artifacts are unreadable or contradict each other. Raised by
+            :func:`~veridex.signal_trials.published.read_season` and deliberately not softened
+            here — a corrupt season is not an absent one.
+    """
+    season = read_season(data_dir)
+    if season is None:
+        raise SelectionError(
+            "no season is published in this data directory, so nothing names the selected "
+            "(chain x bar); refusing to record a terminal outcome under an unauthorized bar"
+        )
+    combo = season.get("combo")
+    chain_index = combo.get("chain_index") if isinstance(combo, dict) else None
+    bar = combo.get("bar") if isinstance(combo, dict) else None
+    if not isinstance(chain_index, str) or not isinstance(bar, str):
+        raise SelectionError(
+            "the published season carries no usable combo; refusing to settle against a selection it does not name"
+        )
+    return {"chain_index": chain_index, "bar": bar}
+
+
+def assert_run_matches_selection(args: argparse.Namespace, selection: Mapping[str, str]) -> None:
+    """Refuse a run whose ``(chain x bar)`` is not the published season's.
+
+    Checked BEFORE the credentials are read and long before any request, so a mismatched
+    invocation costs one file read and writes nothing.
+
+    Raises:
+        SelectionError: ``--chain-index`` or ``--bar`` disagrees with the published selection. Both
+            are reported together rather than one at a time — an operator who got one wrong
+            usually got both wrong, and two runs to learn two facts is two chances to settle
+            something in between.
+    """
+    wrong = [
+        f"--{name.replace('_', '-')} {getattr(args, name)!r} (season selected {selection[name]!r})"
+        for name in ("chain_index", "bar")
+        if getattr(args, name) != selection[name]
+    ]
+    if wrong:
+        raise SelectionError("this run does not match the published season selection: " + "; ".join(wrong))
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(
@@ -229,14 +324,57 @@ async def _settle_all(
     *,
     now_ms: int,
 ) -> list[dict[str, Any]]:
-    """Fetch, settle and record each eligible trial. The only network path in this script."""
+    """Fetch, settle and record each eligible trial. The only network path in this script.
+
+    **The chain is DERIVED from the trial, never taken from the command line**, and the operator's
+    ``--chain-index`` is an assertion this loop checks rather than a value it obeys. A trial's
+    sealed evidence names the chain its signal was observed on; fetching any other chain returns a
+    different token's market, and the close-boundary law settles happily against it.
+
+    The refusal and the derived fetch are two edits rather than one, and that is the honest
+    statement of what the second buys. GIVEN the refusal, the two expressions are equal at this
+    call site and swapping them changes nothing observable — a mutation run confirms that mutant
+    survives. What it buys is that DELETING THE REFUSAL ALONE still cannot redirect the fetch: both
+    lines have to change before a wrong chain reaches the network. Same shape as
+    :func:`~veridex.signal_trials.live.settle_trial` re-selecting the candle instead of
+    back-deriving it.
+
+    A refused trial is skipped and the run continues. One off-season trial in the live directory —
+    published under an earlier chain, say — must not stop the trials that ARE settleable from being
+    settled, and its refusal is reported in its own summary row.
+    """
     results: list[dict[str, Any]] = []
+    source_endpoint = f"{creds.base_url}{HISTORICAL_CANDLES_PATH}"
     async with httpx.AsyncClient(base_url=creds.base_url, timeout=REQUEST_TIMEOUT_SECONDS) as http:
         client = OKXMarketClient(HttpxTransport(http), creds)
         for trial in trials:
-            series = await client.get_candles(args.chain_index, trial.sig.token_address, args.bar, limit=args.limit)
-            results.append(_record_one(trial, series, store, args, now_ms=now_ms))
+            if trial.sig.chain_index != args.chain_index:
+                results.append(_chain_mismatch(trial, args))
+                continue
+            series = await client.get_candles(
+                trial.sig.chain_index, trial.sig.token_address, args.bar, limit=args.limit
+            )
+            results.append(_record_one(trial, series, store, args, now_ms=now_ms, source_endpoint=source_endpoint))
     return results
+
+
+def _chain_mismatch(trial: LiveTrial, args: argparse.Namespace) -> dict[str, Any]:
+    """The summary row for a trial whose sealed chain is not the one this run settles.
+
+    Nothing was fetched and nothing was written, and the row says which two values disagreed so an
+    operator can tell a wrong ``--chain-index`` from a trial that belongs to another season.
+    """
+    return {
+        "trial_id": trial.trial_id,
+        "status": "chain_mismatch",
+        "sealed_chain_index": trial.sig.chain_index,
+        "run_chain_index": args.chain_index,
+        "candles_fetched": 0,
+        "observation_lag_ms": None,
+        "follow_markout_bps": None,
+        "recorded": False,
+        "settlements_recorded": 0,
+    }
 
 
 def _record_one(
@@ -246,14 +384,27 @@ def _record_one(
     args: argparse.Namespace,
     *,
     now_ms: int,
+    source_endpoint: str,
 ) -> dict[str, Any]:
     """Apply the law to one fetched series, record what it produced, and summarize the result.
 
     The coverage gate sits between the law and the WRITE, not before the law: the law is what tells
     us whether a candle was found, and a found candle needs no coverage proof. Only the refusal
     path — the one that would publish a terminal UNSCORED — has to justify itself.
+
+    ``chain_index`` recorded into the provenance is the trial's SEALED one, which is also the one
+    :func:`_settle_all` fetched — the caller refuses any trial where those two differ, so recording
+    either is recording what happened. It is spelled as the sealed value because that is the fact
+    the verifier re-derives against.
     """
-    settled = settle_trial(trial, series, now_ms=now_ms, cost_bps=args.cost_bps)
+    settled = settle_trial(
+        trial,
+        series,
+        now_ms=now_ms,
+        chain_index=trial.sig.chain_index,
+        source_endpoint=source_endpoint,
+        cost_bps=args.cost_bps,
+    )
     outcome = settled.outcome
     summary: dict[str, Any] = {
         "trial_id": trial.trial_id,
@@ -289,24 +440,36 @@ def _record_one(
 def main(argv: Sequence[str] | None = None) -> int:
     """Settle the eligible trials and print a JSON summary. Returns a process exit status.
 
-    Exit codes are distinguishable because they are fixed differently: ``2`` is a missing
-    credential (an operator sets three variables), ``1`` is a failure during the run (the reason
-    reaches stderr, redacted). Neither writes anything to stdout, so a shell driving this cannot
-    mistake an ABORTED or a FAILED run for a settled season.
+    Exit codes are distinguishable because they are fixed differently: ``2`` is a bad INVOCATION,
+    caught before any request — a missing credential (an operator sets three variables) or a
+    ``(chain x bar)`` that is not the published season's (an operator fixes the flags, or publishes
+    the season) — and ``1`` is a failure during the run (the reason reaches stderr, redacted).
+    Neither writes anything to stdout, so a shell driving this cannot mistake an ABORTED or a
+    FAILED run for a settled season.
 
-    A COVERAGE GAP is the third refusal in this file's vocabulary and it deliberately exits ``0``,
-    which is worth stating because the other two do not. Exit status here is a claim about the RUN,
-    and a run that fetched, applied the law and correctly declined to write is a run that did its
-    job; a later invocation settles the trial. The consequence is the part a driver has to know:
+    The two PER-TRIAL refusals — a COVERAGE GAP and a CHAIN MISMATCH — deliberately exit ``0``,
+    which is worth stating because the aborts do not. Exit status here is a claim about the RUN,
+    and a run that applied its gates and correctly declined to write is a run that did its job; a
+    later invocation settles what remains. The consequence is the part a driver has to know:
     ``&&`` cannot separate a fully-settled season from a partially-settled one, so a shell that
-    must not publish a partial season reads ``trials[].status`` for ``coverage_gap`` rather than
-    the exit code.
+    must not publish a partial season reads ``trials[].status`` for ``coverage_gap`` and
+    ``chain_mismatch`` rather than the exit code.
     """
     args = _parse_args(argv)
     now_ms = int(time.time() * 1000) if args.now_ms is None else args.now_ms
     data_dir = Path(args.data_dir)
     store = ReceiptStore(data_dir)
     repository = LiveTrialRepository(data_dir / LIVE_SUBDIR)
+
+    # Before the credentials, because this needs no network and no secret: an invocation that does
+    # not match the published season is wrong whether or not the environment is set up, and the
+    # operator should learn that from one file read rather than after three variables are exported.
+    try:
+        selection = selected_combo(data_dir)
+        assert_run_matches_selection(args, selection)
+    except (SelectionError, ValueError) as error:
+        print(f"aborted before any request: {error}", file=sys.stderr)
+        return 2
 
     try:
         creds = credentials_from_env(os.environ)
@@ -329,6 +492,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "now_ms": now_ms,
                 "bar": args.bar,
+                # The selection this run was CHECKED against, so the summary states its own
+                # authority rather than leaving a reader to trust that one was consulted.
+                "season_selection": dict(selection),
                 "dry_run": args.dry_run,
                 "eligible": len(eligible),
                 "trials": results,
