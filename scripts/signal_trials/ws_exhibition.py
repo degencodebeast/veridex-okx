@@ -320,7 +320,7 @@ def _default_connect(ws_url: str) -> Any:
     return websockets.connect(ws_url, open_timeout=OPEN_TIMEOUT_S, close_timeout=CLOSE_TIMEOUT_S)
 
 
-async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory = _default_connect) -> int:
+async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | None = None) -> int:
     """Connect, exhibit once, print the summary.
 
     ``connect_factory`` is INJECTED for the same reason ``handoff`` is, and the omission was a real
@@ -328,12 +328,23 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory = _d
     ``import websockets``, the only way to intercept it was global ``sys.modules`` state — so
     "no real socket is opened" rested on every future test remembering to patch it, with no
     structural backstop, and three decision points here were disclosed as unbindable when they were
-    merely un-injected. ``scripts/smoke_public_ws.py`` already ships this seam
-    (``connect_factory: ConnectFactory = _default_connect``); H2.5 simply had not picked it up.
+    merely un-injected. ``scripts/smoke_public_ws.py`` already ships this seam; H2.5 had not
+    picked it up.
+
+    **Resolved at CALL time, and this is the THIRD seam in this file to need that correction.**
+    ``connect_factory: ConnectFactory = _default_connect`` in the signature freezes the function
+    object at import, so rebinding ``module._default_connect`` is silently ignored — and unlike the
+    other two, what escapes is not a stale value but the REAL LIBRARY: a genuine resolver call
+    (``gaierror``), from the seam whose whole purpose is that nothing reaches a socket.
+
+    The inconsistency was the trap, more than the individual defect. Two seams here taught that
+    module-attribute rebinding is the idiom that works; a third silently did not, and it was the
+    one that reaches the network. One rule for all three is worth more than a frozen default.
     """
+    connect = _default_connect if connect_factory is None else connect_factory
     summary: ExhibitionSummary | None = None
     try:
-        async with connect_factory(args.ws_url) as connection:
+        async with connect(args.ws_url) as connection:
             summary = await exhibit_one_signal(
                 _WebsocketsTransport(connection),
                 args.chain_index,
@@ -356,8 +367,14 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory = _d
     return exit_status(summary)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | None = None) -> int:
     """Run one exhibition. Refusals go to stderr and exit non-zero.
+
+    ``connect_factory`` is passed straight through to ``_run``. Without it ``main`` had NO connect
+    seam at all, so its two returns were reachable only by faking ``sys.modules`` — the exact
+    dependency the seam was introduced to remove. A test name in this file certified that removal
+    while two tests in the same file still needed the fake, and needed it precisely BECAUSE ``main``
+    had no seam. A name asserting a file-wide absence its own file refutes is worse than no name.
 
     **The catch is deliberately broad, and the narrow version was measurably wrong.** This
     previously caught ``(OSError, ValueError, OKXClientError)``, a tuple written by reasoning about
@@ -379,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
     try:
-        return asyncio.run(_run(args))
+        return asyncio.run(_run(args, connect_factory=connect_factory))
     except PostHandoffError as error:
         # A DIFFERENT SENTENCE, because the operator's correct next action is different. "refused"
         # invites the documented REST fallback; after the handoff has fired that fallback would

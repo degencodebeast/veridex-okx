@@ -1,7 +1,9 @@
 import ast
 import asyncio
+import contextlib
 import functools
 import inspect
+import io
 import json
 import math
 import sys
@@ -1749,7 +1751,7 @@ async def test_a_TimeoutError_from_the_transport_reaches_the_operator_as_a_clean
     )
 
 
-async def test_run_takes_an_INJECTED_connect_factory_so_no_test_needs_sys_modules():
+async def test_run_and_main_BOTH_take_an_injected_connect_factory():
     """MINOR-Q3. The connection is injected, like the handoff already was.
 
     While `_run` resolved `websockets` by a function-local import, the ONLY interception point was
@@ -1760,11 +1762,29 @@ async def test_run_takes_an_INJECTED_connect_factory_so_no_test_needs_sys_module
 
     `Handoff` was the counter-example proving the point: everything above the injected handoff was
     unit-tested, and `connect` simply had not been given the same treatment.
+
+    RENAMED. This was `..._so_no_test_needs_sys_modules`, which was FALSE IN ITS OWN FILE: two
+    tests below still patch `sys.modules`, and they do so deliberately — they are the only things
+    that bind `_default_connect` ITSELF, the one function the seam bypasses. A name asserting a
+    file-wide absence that its own file refutes is worse than no name, because it tells the next
+    reader the pattern is gone when it is load-bearing. The name now says what is measured: BOTH
+    entry points take the factory.
     """
     module = _ws_exhibition_module()
 
+    # BOTH entry points, because `main` previously had none — so its two returns were reachable
+    # only through the module table, which is exactly what the seam was introduced to end.
     assert "connect_factory" in inspect.signature(module._run).parameters
-    assert module._run.__kwdefaults__["connect_factory"] is module._default_connect
+    assert "connect_factory" in inspect.signature(module.main).parameters
+
+    # Resolved at CALL time, not frozen as a def-time default. The signature default must be None;
+    # a frozen `_default_connect` here is the defect this seam had and the other two had before it.
+    assert module._run.__kwdefaults__["connect_factory"] is None
+    assert module.main.__kwdefaults__["connect_factory"] is None
+
+    # ...and the production path still reaches the real factory when nothing is injected, which is
+    # what makes `None` a resolution rather than a hole.
+    assert module._default_connect is not None
 
     calls = []
 
@@ -1816,6 +1836,86 @@ class _ScriptedConn:
 
     async def close(self):
         pass
+
+
+class _MainResult:
+    """What one `main` invocation returned and wrote, so assertions can name both."""
+
+    def __init__(self, status: int, err: str) -> None:
+        self.status = status
+        self.err = err
+
+
+def _capture_main_stderr(module, argv, ctx_factory) -> "_MainResult":
+    """Run `main` with an INJECTED connect factory and capture its stderr.
+
+    Uses the `connect_factory=` seam rather than `sys.modules`, which is the point of FINDING 2:
+    while `main` had no seam, its returns were reachable only by faking the module table, and the
+    test that certified the seam's existence was contradicted by two tests in its own file.
+    No socket: `ctx_factory` builds an async context manager that never connects.
+    """
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        status = module.main(argv, connect_factory=lambda _url: ctx_factory())
+    return _MainResult(status, buffer.getvalue())
+
+
+def test_main_PRINTS_A_DIFFERENT_SENTENCE_after_the_handoff_than_before_it():
+    """THE SENTENCE AN OPERATOR READS — which is the entire deliverable of MINOR-Q5.
+
+    `PostHandoffError` exists because "a single word in a stderr line is the difference". The type
+    was bound at three sites; the SENTENCE was bound nowhere. SPEC deleted `main`'s whole
+    `except PostHandoffError` branch and got 805 passed, zero failures, identical to baseline — so
+    a post-handoff failure would have fallen through to the ordinary `refused:` line and told the
+    operator to open a REST-sourced trial over a signal that may already have one.
+
+    It survived because exit status is 1 on BOTH paths and the exception type is unchanged, and
+    every assertion in the neighbourhood was on type or status — the two things the mutant
+    preserves. The operator-facing string is the only part of this feature a human ever sees, and
+    it was the only part nothing measured.
+
+    BOTH HALVES ARE HERE, and the pair is what makes it a discrimination rather than a spelling
+    check: a post-handoff failure must say so, and a PRE-handoff failure must NOT.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+
+    class _TeardownBoom:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            raise RuntimeError("connection teardown failed after the child was spawned")
+
+    class _ConnectBoom:
+        async def __aenter__(self):
+            raise RuntimeError("could not connect at all")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    original = module._subprocess_handoff
+    module._subprocess_handoff = lambda _argv, _stdin: 0
+    try:
+        after = _capture_main_stderr(module, argv, _TeardownBoom)
+        before = _capture_main_stderr(module, argv, _ConnectBoom)
+    finally:
+        module._subprocess_handoff = original
+
+    # AFTER the handoff: the operator must be told a trial may already exist.
+    assert after.status == 1
+    assert after.err.startswith("refused AFTER handoff:"), f"got {after.err!r}"
+    assert "MAY ALREADY EXIST" in after.err
+    assert "check the data dir" in after.err, "the line must say what to DO, not merely that it is different"
+
+    # BEFORE the handoff: the ordinary line, which invites the documented REST fallback. If this
+    # also said "AFTER handoff" the new sentence would be noise rather than information.
+    assert before.status == 1
+    assert before.err.startswith("refused: "), f"got {before.err!r}"
+    assert "AFTER handoff" not in before.err
+    assert "MAY ALREADY EXIST" not in before.err, (
+        "a pre-handoff refusal must NOT warn about an existing trial; nothing was published"
+    )
 
 
 async def test_a_failure_AFTER_the_handoff_says_so_because_the_operator_acts_differently():
