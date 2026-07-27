@@ -377,6 +377,42 @@ _OUTCOMES_ALL_PROFITABLE: tuple[int, ...] = (1,) * 44
 
 
 @pytest.fixture
+def pack_signal_join_observable() -> _OraclePack:
+    """44 trials carrying an agent whose probabilities VARY BY POSITION, so a JOIN error is visible.
+
+    **This fixture exists because every other fixture is PERMUTATION-INVARIANT, and that hid a real
+    hole.** Everywhere else in this module the agents emit a CONSTANT probability — the frozen
+    contestants because their signal inputs are held constant, the controls by definition. With a
+    constant ``p``, an agent's Brier is ``mean((p - o)**2)`` over the outcome MULTISET, so it depends
+    only on HOW MANY outcomes were 1 and not at all on WHICH TRIAL each belonged to. Every
+    aggregate-based assertion in this module is therefore blind to a signal/outcome JOIN error.
+
+    Measured, on the unmodified head: transposing the settled markouts of positions 1 and 7 — which
+    carry OPPOSITE declared outcomes — while leaving the signals in place attaches each outcome to
+    the WRONG signal and preserves the total hit count. The whole suite stayed green, 823 passed.
+
+    ``join_witness`` breaks that invariance by construction: its probability at each position is
+    derived FROM THE DECLARED ORACLE AT THAT POSITION (1.0 where the trial was built to settle
+    profitable, 0.0 where it was not). Its Brier is therefore exactly 0.0 if and only if the
+    scorer's derived outcome at EVERY position equals the oracle's at that same position. Move any
+    outcome to a different trial and the witness becomes confidently wrong at both ends, so the
+    Brier leaves 0 immediately. It is not "two observable positions" — every position is observable.
+
+    Note this is still an ORACLE comparison, not a self-check: the probabilities come from the
+    hand-written oracle, and the outcomes come from the scorer deriving them out of settlement. The
+    two paths remain independent, exactly as ``test_the_outcome_oracle_is_INDEPENDENT_of_the_scorer
+    _derivation_path`` requires.
+    """
+    witness = tuple(1.0 if outcome == 1 else 0.0 for outcome in _OUTCOMES_QUALIFIED)
+    return _build_pack(
+        "season-join",
+        "qualified",
+        _OUTCOMES_QUALIFIED,
+        diagnostic_agents=(DiagnosticAgent(agent_id="join_witness", probabilities=witness),),
+    )
+
+
+@pytest.fixture
 def pack_tied_on_brier_and_markout() -> _OraclePack:
     """44 trials where two qualified agents tie on Brier AND markout, differing ONLY on active count.
 
@@ -521,21 +557,69 @@ def test_fixture_contestant_probabilities_are_as_designed(full_pack_qualified):
     assert 0.40 < _EXPECTED_SELECTIVE_CALIBRATOR_P < 0.60
 
 
-def test_scorer_derived_outcomes_match_the_declared_oracle(full_pack_qualified):
-    """PIN: the scorer's OWN outcome derivation equals the fixture's declared oracle, for all 44.
+def test_scorer_derived_outcome_COUNTS_match_the_declared_oracle(full_pack_qualified):
+    """PIN: the scorer derives the right NUMBER of profitable and unprofitable trials.
 
-    Region A's climatology test only pins the first ten outcomes (through ``probes[10]``). A
-    divergence at trial 11 or later would be invisible to it. ``always_follow`` emits p=1.0 on
-    every trial, so its Brier is exactly the miss rate — which makes it a total readout of the
-    scorer's derived outcome vector against the oracle.
+    Region A's climatology test only pins the first ten outcomes (through ``probes[10]``); a
+    divergence in the COUNT at trial 11 or later would be invisible to it. ``always_follow`` emits
+    p=1.0 on every trial so its Brier is exactly the miss rate, and ``always_fade`` mirrors it.
+
+    **THIS TEST IS PERMUTATION-INVARIANT AND DOES NOT PIN THE PER-TRIAL JOIN. Stated because an
+    earlier version of this docstring claimed it did.** It called the pair a "total readout" that
+    "pins every trial". It does not: both agents emit a CONSTANT probability, so each Brier is a
+    function of the outcome MULTISET alone. Any permutation of the same outcomes across trials
+    leaves both values identical. Measured on the unmodified head — transposing the settled
+    markouts of positions 1 and 7, which carry opposite declared outcomes, left the entire suite
+    green at 823 passed.
+
+    The per-trial join is pinned by
+    ``test_each_outcome_is_joined_to_ITS_OWN_signal_not_merely_counted``, which needs an agent whose
+    probabilities vary by position to see it at all. What THIS test pins is narrower and still
+    worth having: the counts, which that test would also catch but which this states directly.
     """
     season = score_season(full_pack_qualified)
     always_follow = next(r for r in season.rows if r.agent_id == "always_follow")
     misses = len(_OUTCOMES_QUALIFIED) - sum(_OUTCOMES_QUALIFIED)
     assert always_follow.avg_brier == pytest.approx(misses / len(_OUTCOMES_QUALIFIED))
-    # And the mirror: always_fade's Brier is exactly the HIT rate. Both together pin every trial.
+    # The mirror: always_fade's Brier is exactly the HIT rate. Both together pin the two COUNTS.
     always_fade = next(r for r in season.rows if r.agent_id == "always_fade")
     assert always_fade.avg_brier == pytest.approx(sum(_OUTCOMES_QUALIFIED) / len(_OUTCOMES_QUALIFIED))
+
+
+def test_each_outcome_is_joined_to_ITS_OWN_signal_not_merely_counted(pack_signal_join_observable):
+    """PIN (MAJOR-1): every derived outcome belongs to the trial it was derived FROM.
+
+    **The trust statement.** A signal/outcome join error is not a test-quality nit: real signals do
+    not emit the fixture's constant probabilities, so attaching an outcome to the wrong signal
+    changes Brier scores and therefore rankings — silently, with every aggregate assertion still
+    green. Ordering and association are different properties. M11 ("score in file order instead of
+    chronologically") pins ORDERING; nothing pinned ASSOCIATION until this.
+
+    ``join_witness``'s probability at each position comes from the DECLARED ORACLE at that position,
+    so its Brier is 0.0 exactly when the scorer's derived outcome matches the oracle AT EVERY
+    POSITION — and leaves 0 the moment any outcome moves to a different trial, because the witness
+    is then confidently wrong at both ends of the move.
+    """
+    season = score_season(pack_signal_join_observable)
+    witness = next(row for row in season.rows if row.agent_id == "join_witness")
+
+    # NON-VACUOUS: the witness must actually have been scored over the whole season.
+    assert witness.avg_brier is not None
+    assert season.sample_size == len(_OUTCOMES_QUALIFIED) == 44
+    assert witness.active_decisions == 44, "the witness commits on every trial; nothing is abstained"
+
+    # THE JOIN. Exactly zero — not approximately — because every per-trial error is (1-1)**2 or
+    # (0-0)**2, both exactly 0.0, so the sum is exact regardless of summation order.
+    assert witness.avg_brier == 0.0, (
+        "a non-zero Brier here means at least one derived outcome is attached to a different trial "
+        "than the one it was derived from"
+    )
+
+    # DISCRIMINATION, stated as arithmetic rather than run as a mutation: transposing any two
+    # positions with OPPOSITE outcomes makes the witness wrong at both, so its Brier becomes
+    # 2/44 — a value this assertion rejects. Positions 1 and 7 are such a pair in this oracle.
+    assert _OUTCOMES_QUALIFIED[1] != _OUTCOMES_QUALIFIED[7], "the fixture must contain such a pair"
+    assert 2 / len(_OUTCOMES_QUALIFIED) != 0.0
 
 
 # --- B2. The C52 DISCRIMINATION control Region A is missing.
@@ -812,7 +896,10 @@ def test_climatology_feed_is_guarded_at_the_call_boundary(full_pack_qualified, m
     seen: list[tuple[int, int, int]] = []
     import veridex.signal_trials.scoring as scoring_module
 
-    original = scoring_module.assert_not_full_pack
+    # Bound from its DEFINING module: `scoring` imports this name but does not re-export it,
+    # and `mypy --strict` refuses an implicit re-export. Same object either way — the
+    # monkeypatch target below is still `scoring_module`, which is what the scorer calls.
+    from veridex.signal_trials.controls import assert_not_full_pack as original
 
     def _recording(prior_len: int, pack_len: int, trial_index: int) -> None:
         seen.append((prior_len, pack_len, trial_index))
@@ -901,7 +988,12 @@ def _frozen_rank_key(row):
 
 @pytest.mark.parametrize(
     "fixture_name",
-    ["full_pack_qualified", "full_pack_qualified_with_brier_ties", "pack_tied_on_brier_and_markout"],
+    [
+        "full_pack_qualified",
+        "full_pack_qualified_with_brier_ties",
+        "pack_tied_on_brier_and_markout",
+        "pack_signal_join_observable",
+    ],
 )
 def test_the_frozen_four_term_ordering_holds_within_the_qualified_set(fixture_name, request):
     """PIN (F2(b)): the emitted qualified order EQUALS the frozen four-term order — RECOMPUTED.
@@ -1111,7 +1203,7 @@ def test_display_bands_are_inclusive_at_both_bounds(full_pack_qualified_with_bri
     assert inside_rows["just_inside_fade"].active_decisions == 0
 
 
-def test_rank_key_parameter_order_is_pinned():
+def test_score_season_signature_is_pinned():
     """PIN: ``score_season``'s signature — parameter NAMES, ORDER and defaults — is frozen.
 
     Recorded because every call in this suite is by keyword, which leaves parameter ORDER unpinned
@@ -1242,7 +1334,7 @@ def test_the_clv_guard_is_invoked_from_the_RANK_KEY_itself(full_pack_qualified, 
     calls: list[str] = []
     original = scoring_module.assert_no_clv_fields
 
-    def _counting(row: dict) -> None:
+    def _counting(row: dict[str, Any]) -> None:
         calls.append(str(row.get("agent_id")))
         original(row)
 
