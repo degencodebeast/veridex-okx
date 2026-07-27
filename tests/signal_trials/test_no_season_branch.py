@@ -26,8 +26,10 @@ Two controls run alongside the refusals:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
+import subprocess
 import sys
 from importlib import util as importlib_util
 from pathlib import Path
@@ -874,3 +876,275 @@ async def test_the_same_token_cooldown_decides_which_trials_are_sealed(tmp_path:
     assert c_offsets == [0], f"expected the EARLIEST of the cluster to survive, got {c_offsets}"
     # ACCEPTANCE — a different token inside the same window is untouched.
     assert [trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenB"] == [inside_ms]
+
+
+# --- the Gate B operator command ------------------------------------------------------------------
+#
+# The frozen command is
+#     fetch_and_seal.py --from-preflight preflight_result.json --out $SIGNAL_TRIALS_DATA_DIR/packs/
+# and before these vectors existed it PARSED NOTHING, fetched nothing, wrote nothing and exited 0.
+# An operator at Gate B would have read success from a command that had done nothing at all.
+#
+# NO REAL OR REALISTIC CREDENTIAL APPEARS HERE. The three below are sentinels, and the redaction
+# vector asserts the sentinel's ABSENCE from rendered output rather than asserting that some real
+# value was hidden.
+
+_SENTINEL_ENV = {
+    "OKX_API_KEY": "SENTINEL-APIKEY-ZZZZ0001",
+    "OKX_SECRET_KEY": "SENTINEL-SECRET-ZZZZ0002",
+    "OKX_PASSPHRASE": "SENTINEL-PASSPHRASE-ZZZZ0003",
+}
+
+
+def _factory_yielding(client: Any) -> Any:
+    """A ``SourceFactory`` that hands ``main`` an already-built recording fake."""
+
+    @contextlib.asynccontextmanager
+    async def factory(_credentials: Any) -> Any:
+        yield client
+
+    return factory
+
+
+def _set_sentinel_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _SENTINEL_ENV.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_the_frozen_operator_command_parses() -> None:
+    """``--from-preflight`` and ``--out`` are the frozen surface, and both are required.
+
+    The bare parse is worth pinning on its own: the defect this closes was not a wrong argument
+    surface, it was NO argument surface — the script accepted anything and exited 0.
+    """
+    module = _fetch_and_seal_module()
+    args = module.build_arg_parser().parse_args(["--from-preflight", "preflight_result.json", "--out", "/data/packs"])
+    assert args.from_preflight == Path("preflight_result.json")
+    assert args.out == Path("/data/packs")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param([], id="neither"),
+        pytest.param(["--out", "/data/packs"], id="missing-from-preflight"),
+        pytest.param(["--from-preflight", "p.json"], id="missing-out"),
+    ],
+)
+def test_each_frozen_argument_is_required_individually(argv: list[str]) -> None:
+    """EACH argument is required, not merely one of them.
+
+    Asserted per-argument because the obvious form is weaker than it reads: with only ``[]`` as the
+    vector, making ``--from-preflight`` optional still errors — ``--out`` is missing too — so the
+    test passes while half the frozen surface has quietly become optional. An operator would then
+    get an exit-0 run against a default they never named. A mutation drill found this in exactly
+    that state; the parametrization is what closes it.
+    """
+    module = _fetch_and_seal_module()
+    with pytest.raises(SystemExit) as exit_info:
+        module.build_arg_parser().parse_args(argv)
+    assert exit_info.value.code != 0
+
+
+def test_out_must_name_the_packs_directory(tmp_path: Path) -> None:
+    """``--out`` names ``packs/``; the data dir is its PARENT, which is where state is published."""
+    module = _fetch_and_seal_module()
+    assert module.data_dir_from_out(tmp_path / "packs") == tmp_path
+    with pytest.raises(ValueError, match="must name the 'packs' directory"):
+        module.data_dir_from_out(tmp_path / "somewhere-else")
+
+
+def test_the_operator_command_refuses_a_non_frozen_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A differently-shaped ``--out`` exits NON-ZERO and fetches nothing.
+
+    Refused before credentials are even read, so this vector needs none.
+    """
+    module = _fetch_and_seal_module()
+    client = RecordingClient()
+    code = module.main(
+        ["--from-preflight", str(tmp_path / "p.json"), "--out", str(tmp_path / "not-packs")],
+        source_factory=_factory_yielding(client),
+    )
+    assert code == 3
+    assert client.calls == []
+
+
+def test_the_operator_command_aborts_without_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing credentials abort NON-ZERO, naming the VARIABLES and never a value."""
+    module = _fetch_and_seal_module()
+    for name in _SENTINEL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    preflight_path = tmp_path / "preflight_result.json"
+    _write_no_season(preflight_path)
+    client = RecordingClient()
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(tmp_path / "data" / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert code == 2
+    assert client.calls == []
+
+
+def test_the_operator_command_seals_a_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sealable artifact reaches the injected client and WRITES A PACK, exit 0.
+
+    The acceptance half of the whole entry point: without it every refusal vector below is satisfied
+    by a command that refuses unconditionally.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert code == 0
+    assert [call for call in client.calls if call[0] == "list_signals"] != []
+    packs = sorted((data_dir / "packs").iterdir())
+    assert len(packs) == 1
+    pack = load_pack(read_pack_ref(packs[0]))
+    assert len(pack.trials) == 3
+    assert pack.meta.combo == ComboSelection(CHAIN, BAR, "qualified")
+
+
+@pytest.mark.parametrize("writer", ["no_season", "failed", "non_frozen_bar"])
+def test_the_operator_command_fetches_nothing_on_a_non_sealable_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    """Every non-sealable verdict still fetches NOTHING through the operator command.
+
+    ASSERTED AS THE CALL COUNT. A command that fetched and then failed would satisfy a bare
+    exit-code check, which is the same reason the guard's own vectors assert the count.
+
+    This also answers whether adding an entry point made any existing refusal unreachable: it did
+    not. ``main`` delegates to ``run_fetch_and_seal``, so all three verdict shapes — an observation
+    (``no_season``), a failure (``failed``), and a corrupted combo (a non-frozen bar) — still reach
+    their branches and still publish their state, now with an exit code an operator can read.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    if writer == "no_season":
+        _write_no_season(preflight_path)
+        expected_state = "no_season"
+    elif writer == "failed":
+        write_preflight_failure("sentinel reason: probe did not complete", preflight_path)
+        expected_state = "not_built"
+    else:
+        _write_qualified(preflight_path)
+        artifact = json.loads(preflight_path.read_text(encoding="utf-8"))
+        artifact["bar"] = "5m"
+        preflight_path.write_text(json.dumps(artifact), encoding="utf-8")
+        expected_state = "not_built"
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert client.calls == []
+    assert code == 0, "an honest non-sealable verdict is a completed run, not a failure"
+    assert _state_of(data_dir) == expected_state
+    assert not (data_dir / "packs").exists()
+
+
+def test_a_failure_message_is_redacted_before_it_is_printed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A credential appearing in an exception NEVER reaches the operator's terminal.
+
+    The sentinel is placed where a real credential would be — inside the raised message — and its
+    ABSENCE from rendered output is what is asserted. The DISCRIMINATION half is the second sentinel:
+    a non-credential marker in the same message must survive, so this cannot pass against a redactor
+    that blanks everything, or against a test whose capture is simply empty.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+
+    class _Exploding(RecordingClient):
+        async def list_signals(self, f: SignalFilters, cursor: str | None = None) -> SignalPage:
+            raise RuntimeError(
+                f"upstream rejected key={_SENTINEL_ENV['OKX_API_KEY']} "
+                f"secret={_SENTINEL_ENV['OKX_SECRET_KEY']} "
+                f"pass={_SENTINEL_ENV['OKX_PASSPHRASE']} marker=SENTINEL-NONCREDENTIAL-ZZZZ0009"
+            )
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(_Exploding()),
+    )
+    rendered = capsys.readouterr()
+    combined = rendered.out + rendered.err
+
+    assert code == 1
+    for secret in _SENTINEL_ENV.values():
+        assert secret not in combined, f"a credential reached the operator's terminal: {secret}"
+    # DISCRIMINATION — the message was rendered, and only the credentials were removed.
+    assert "SENTINEL-NONCREDENTIAL-ZZZZ0009" in combined
+    assert "RuntimeError" in combined
+
+
+def test_the_frozen_command_is_a_real_command_in_a_subprocess() -> None:
+    """Run the operator command as an OPERATOR runs it, in its own interpreter.
+
+    The `main(argv)` vectors above all import the module first, which is exactly what the broken
+    revision did NOT do wrong — it imported fine. What it got wrong was being invoked as a command:
+    ``python scripts/signal_trials/fetch_and_seal.py --help`` exited 0 having printed nothing. Only
+    a subprocess reproduces that, because it is the only thing that exercises ``__main__``, the
+    ``sys.path`` a script actually gets, and the exit code a shell actually sees.
+
+    SCOPED DELIBERATELY TO PATHS THAT RETURN BEFORE ANY CREDENTIAL OR TRANSPORT WORK. Gate A is
+    operator-only and this command is precisely the thing that would touch it, so no vector here
+    supplies credentials or reaches the client factory.
+    """
+    script = Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "fetch_and_seal.py"
+    root = script.parents[2]
+
+    helped = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--help"], capture_output=True, text=True, cwd=root, timeout=60
+    )
+    assert helped.returncode == 0
+    assert "--from-preflight" in helped.stdout
+    assert "--out" in helped.stdout
+
+    # No arguments is an ERROR. This is the assertion the broken revision would have failed: it
+    # exited 0 on every invocation, including this one.
+    bare = subprocess.run(  # noqa: S603
+        [sys.executable, str(script)], capture_output=True, text=True, cwd=root, timeout=60
+    )
+    assert bare.returncode != 0
+    assert "--from-preflight" in bare.stderr
+
+    # A non-frozen --out is refused before credentials are read, so this needs none.
+    refused = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--from-preflight", "x.json", "--out", "/tmp/not-packs"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        timeout=60,
+    )
+    assert refused.returncode == 3
+    assert "packs" in refused.stderr
+
+    # And from a DIFFERENT working directory, because a script's sys.path[0] is its own directory
+    # and the run_preflight seam is imported by anchoring on __file__ rather than on the cwd.
+    elsewhere = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--from-preflight", "x.json", "--out", "/tmp/not-packs"],
+        capture_output=True,
+        text=True,
+        cwd=script.parent,
+        timeout=60,
+    )
+    assert elsewhere.returncode == 3, f"the command must work from any cwd: {elsewhere.stderr}"

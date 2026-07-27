@@ -30,12 +30,26 @@ distinction: ``not_built`` means the scorer never ran, ``no_season`` means it ra
 it would assert "we looked and there was nothing" about a look that never happened. Those record
 ``not_built``.
 
-**No operator entry point here, deliberately.** ``run_fetch_and_seal`` takes its client by injection
-— the same seam ``preflight.run_matrix_probe`` uses, and what makes it impossible for a test to
-reach the network without constructing a transport on purpose. The credentialed CLI is NOT rebuilt
-in this file: it would fork ``run_preflight.py``'s Gate-A credential reading and redaction into a
-second place, and the polarity-attesting endpoint binding (``FrozenSignalListSource``) that makes a
-client usable at all lives in that file, which this task does not own.
+**The operator entry point is the frozen Gate B command**, and it BINDS to ``run_preflight.py``'s
+seam rather than reimplementing it::
+
+    fetch_and_seal.py --from-preflight preflight_result.json --out $SIGNAL_TRIALS_DATA_DIR/packs/
+
+``credentials_from_env``, ``redact``, ``HttpxTransport`` and ``FrozenSignalListSource`` are all
+PUBLIC names in ``run_preflight.py`` and are imported, never copied. That matters twice over: Gate A
+credential policy stays in exactly one place, and ``FrozenSignalListSource`` is the only party that
+may attest the frozen endpoint's polarity — a second, locally-built binding would inherit that
+attestation without having earned it.
+
+An earlier revision of this module shipped with NO entry point and said so in this docstring. The
+consequence was worse than the omission: the frozen command PARSED NOTHING, fetched nothing, wrote
+nothing, and exited 0, so an operator at Gate B would read success from a command that had done
+nothing at all. A missing entry point that errored would have been safe; one that silently succeeds
+is the failure mode this lane exists to prevent.
+
+``run_fetch_and_seal`` itself still takes its client BY INJECTION — the same seam
+``preflight.run_matrix_probe`` uses. Only :func:`main` constructs a transport, and only from
+credentials it read at that moment, so nothing in the orchestration path can reach the network.
 
 **The frozen eligibility rules are IMPORTED, not restated.** The trials sealed into a pack have to
 be the same population the matrix counted; two implementations of §5.1's filters or §8.6's cooldown
@@ -46,9 +60,14 @@ under them — see the note at the import site.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import dataclasses
 import json
-from collections.abc import Mapping
+import os
+import sys
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -109,6 +128,13 @@ FROZEN_BARS: frozenset[str] = frozenset(bar for _chain, bar in COMBO_ORDER)
 #: these are the whole remainder of the ``SeasonStatus`` domain — a value outside it is a corrupted
 #: or hand-edited artifact and fails closed rather than reaching the seal.
 SEALABLE_SEASON_STATUSES: frozenset[str] = frozenset({"qualified", "exploratory"})
+
+#: How :func:`main` obtains a client. Typed as a factory returning an async context manager so the
+#: live transport can be closed deterministically, and so a test can substitute a recording fake
+#: without a network stack. The credentials object is whatever ``run_preflight.credentials_from_env``
+#: returns; it is typed ``Any`` because naming it would mean importing from ``okx_client``, which
+#: this task does not open.
+SourceFactory = Callable[[Any], AbstractAsyncContextManager[MarketClient]]
 
 
 @dataclass(frozen=True)
@@ -398,3 +424,154 @@ def frozen_bar_ms(bar: str) -> int:
     if bar not in FROZEN_BAR_MS:
         raise ValueError(f"bar {bar!r} is not a frozen width; expected one of {sorted(FROZEN_BAR_MS)}")
     return FROZEN_BAR_MS[bar]
+
+
+# --- the operator entry point (Gate B) ------------------------------------------------------------
+
+
+def run_preflight_seam() -> Any:
+    """Import ``run_preflight.py`` — the reviewed Gate A credential and transport seam.
+
+    By path anchor rather than a plain import: ``scripts/signal_trials/`` has no ``__init__.py``
+    (this task does not own one), and when this file is executed AS A SCRIPT Python puts its own
+    directory on ``sys.path`` rather than the repository root, so ``import scripts.…`` fails from
+    every working directory. Anchoring on ``__file__`` makes the import independent of both the
+    invocation directory and the way the module was started.
+
+    Everything transport- and credential-shaped is taken from this module and nothing is copied
+    out of it. ``FrozenSignalListSource`` in particular is the ONLY party entitled to attest the
+    frozen endpoint's polarity — ``preflight.run_matrix_probe`` fails closed without that
+    attestation, and a locally-built binding would inherit the guarantee without having earned it.
+    """
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import scripts.signal_trials.run_preflight as seam
+
+    return seam
+
+
+@asynccontextmanager
+async def live_source(credentials: Any) -> AsyncIterator[MarketClient]:
+    """The production client, assembled exactly as ``run_preflight._probe`` assembles it.
+
+    The ONLY path in this module that constructs a transport. It is a factory rather than inline
+    construction so a test can substitute a recording fake and drive :func:`main` end to end without
+    a network stack — the same injection discipline ``run_fetch_and_seal`` already relies on.
+
+    **Stated precisely, because the zero-transport claim next door is about CALLS:** this opens an
+    ``httpx.AsyncClient`` before ``run_fetch_and_seal`` decides anything, so a non-sealable artifact
+    does construct a client. Constructing one performs NO network I/O — httpx connects lazily, on
+    the first request — and a non-sealable artifact never issues one. The claim is that nothing is
+    FETCHED, and it is exact; it is not a claim that nothing is allocated.
+    """
+    seam = run_preflight_seam()
+    import httpx
+
+    async with httpx.AsyncClient(base_url=credentials.base_url, timeout=seam.REQUEST_TIMEOUT_SECONDS) as http:
+        yield seam.FrozenSignalListSource(seam.OKXMarketClient(seam.HttpxTransport(http), credentials))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The frozen Gate B argument surface, and nothing beyond it."""
+    parser = argparse.ArgumentParser(
+        prog="fetch_and_seal",
+        description="Read the preflight verdict, fetch the season's data, and seal the pack.",
+    )
+    parser.add_argument(
+        "--from-preflight",
+        dest="from_preflight",
+        type=Path,
+        required=True,
+        help="path to the authoritative preflight_result.json",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help=f"the packs directory, i.e. $SIGNAL_TRIALS_DATA_DIR/{PACKS_DIRNAME}/",
+    )
+    return parser
+
+
+def data_dir_from_out(out: Path) -> Path:
+    """Derive the signal-trials data directory from the frozen ``--out``.
+
+    The frozen command names ``$SIGNAL_TRIALS_DATA_DIR/packs/``, while everything else this pipeline
+    writes — the published state above all — belongs beside that directory rather than inside it. So
+    the data dir is ``--out``'s PARENT, and ``--out`` must actually name a ``packs`` directory.
+
+    Refusing a differently-shaped ``--out`` rather than guessing follows ``run_preflight``'s
+    treatment of a non-frozen policy flag: a run under a layout the frozen command does not describe
+    would publish its state somewhere no reader looks, which is indistinguishable downstream from
+    never having run.
+
+    Raises:
+        ValueError: ``out`` does not name a ``packs`` directory.
+    """
+    resolved = Path(out)
+    if resolved.name != PACKS_DIRNAME:
+        raise ValueError(
+            f"--out must name the {PACKS_DIRNAME!r} directory, as the frozen command does "
+            f"(--out $SIGNAL_TRIALS_DATA_DIR/{PACKS_DIRNAME}/); got {str(out)!r}"
+        )
+    return resolved.parent
+
+
+def main(argv: Sequence[str] | None = None, *, source_factory: SourceFactory | None = None) -> int:
+    """The Gate B operator command.
+
+    Exit codes mirror ``run_preflight.main`` so an operator reads the two the same way:
+
+    * ``0`` — the run completed. A sealed pack AND an honest non-sealable verdict are both
+      completions: the artifact said no season, this said so too, and that is a result rather than
+      a failure.
+    * ``1`` — the fetch or the seal failed. Every message is redacted before it is printed.
+    * ``2`` — credentials are missing or blank. Named variables only, never values.
+    * ``3`` — ``--out`` is not the frozen shape.
+
+    ``source_factory`` exists so tests can drive this function against a recording fake. It defaults
+    to :func:`live_source`, so the default behaviour of the operator command is the live one.
+    """
+    args = build_arg_parser().parse_args(argv)
+    factory = source_factory or live_source
+    seam = run_preflight_seam()
+
+    try:
+        data_dir = data_dir_from_out(args.out)
+    except ValueError as error:
+        print(f"fetch_and_seal REFUSED: {error}", file=sys.stderr)
+        return 3
+
+    try:
+        credentials = seam.credentials_from_env(os.environ)
+    except seam.MissingCredentialError as error:
+        # `credentials_from_env` lists variable NAMES only, never values, so this is safe to print
+        # before any secret is in scope to redact against — which is also why it cannot be redacted.
+        print(f"fetch_and_seal ABORTED: {error}", file=sys.stderr)
+        return 2
+
+    secrets = [credentials.api_key, credentials.secret_key, credentials.passphrase]
+
+    async def _drive() -> Path | None:
+        async with factory(credentials) as source:
+            return await run_fetch_and_seal(Path(args.from_preflight), source, data_dir)
+
+    try:
+        sealed = asyncio.run(_drive())
+    except Exception as error:  # noqa: BLE001 - every failure must be reported, not only known ones
+        print(f"fetch_and_seal FAILED: {seam.redact(f'{type(error).__name__}: {error}', secrets)}", file=sys.stderr)
+        return 1
+
+    if sealed is None:
+        state = published.read_state(data_dir)["state"]
+        print(f"no pack sealed; published state is {state!r}")
+        print(f"state written under {data_dir / published.PUBLISHED_DIRNAME}")
+        return 0
+
+    print(f"pack sealed at {sealed}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
