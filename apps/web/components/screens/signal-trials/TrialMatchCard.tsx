@@ -388,26 +388,52 @@ function TrialHead({ trial }: { trial: TrialCard }) {
           checks below, which is why this copy is correct in all four verdict states at once. */}
       <div className={styles.rail}>
         <p className={styles.panelLabel}>SHARED EVIDENCE RAIL</p>
-        <p className={styles.panelSub}>ONE SNAPSHOT · ONE DEADLINE · ONE LAW · ONE OUTCOME</p>
+        {/* THE OUTCOME LABEL IS A DIRECT READ of one source-of-truth field, and the distinction
+            matters: `trial.outcome === null` says the endpoint computed nothing at all, which is a
+            state this component already renders six panels down as "No outcome record exists for
+            this trial". A fixed "ONE … OUTCOME" here put both sentences on the same page.
+
+            This branch is NOT the aggregate anti-pattern. It reads ONE served field and reports
+            it; it does not synthesise a judgement from eight verdicts, and it is invariant to every
+            one of them. The all-eight-pass pin in the test file is what holds that line, and it is
+            untouched.
+
+            Note `pending` and `UNSCORED` are RECORDS — `outcome !== null` — so they read
+            ONE OUTCOME RECORD. Only the null case is an absence. */}
+        <p className={styles.panelSub} data-testid="rail-summary">
+          ONE SNAPSHOT · ONE DEADLINE · ONE LAW ·{' '}
+          {trial.outcome === null ? 'NO OUTCOME RECORD' : 'ONE OUTCOME RECORD'}
+        </p>
         <div className={styles.hashChip}>
           <span className={styles.hashLabel}>⬢ SEALED EVIDENCE</span>
           {/* The hash renders in full. A truncation the card invented is a value the backend never
-              served, and this chip is the record every commitment is scored against. */}
+              served, and this chip is the evidence record the trial was published under. */}
           <code className={styles.hash} data-testid="trial-evidence-hash">{trial.evidenceHash}</code>
           {/* Was "IDENTICAL FOR EVERY AGENT" — a claim about what each receipt is bound to, which
               is `manifest`'s finding and not this chip's. This states the record instead. */}
           <span className={styles.hashLabel}>ONE RECORD · ONE HASH</span>
         </div>
         <p className={styles.footNote}>
-          This trial has one sealed evidence payload, one commit deadline and one settlement law,
-          and they are what every commitment below is scored against. That is the structure of the
-          record, not a finding about any receipt.
+          This trial has one sealed evidence payload, one commit deadline and one settlement rule.
+          That is the structure of the record, not a finding about any receipt.
         </p>
+        {/* Was "…and they are what every commitment below is scored against." Two things were
+            wrong with it. The participant set deliberately carries `pending` and `UNSCORED`
+            commitments whose Brier and chosen markout are null — and `UNSCORED` means no score
+            will EVER be produced — so "every commitment is scored" is false on the standard
+            fixture. And the commit deadline is a VALIDITY predicate, not a scoring input: missing
+            it rejects a commitment rather than moving its number. Split accordingly: binding and
+            timing are the checks' business, scoring is the settled outcome's. */}
         <p className={styles.footNote}>
           Whether a given commitment actually re-derives against this record — that its body
           re-hashes, that it binds the trial it names, and that it arrived before the deadline — is
           not asserted here. The Fair-Play checks below report it per receipt, one independent
           verdict at a time.
+        </p>
+        <p className={styles.footNote}>
+          A score exists only where a settled outcome does: Brier and chosen markout are derived
+          from the settled outcome under the recorded law. A pending commitment has none yet, and an
+          UNSCORED one never will.
         </p>
         <p className={styles.footNote}>
           t0 {trial.t0Ms} · one commit deadline {trial.commitDeadlineMs}

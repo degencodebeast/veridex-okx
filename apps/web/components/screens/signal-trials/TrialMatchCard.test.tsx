@@ -660,6 +660,96 @@ describe('H5.3 the card never asserts a fairness claim its own checks have not e
 });
 
 // ---------------------------------------------------------------------------
+// GROUP E3 — the rail's own copy must be true in every state the card supports
+// ---------------------------------------------------------------------------
+// THE SECOND-ORDER DEFECT THIS GROUP EXISTS FOR, and it is worth stating because the group above
+// did not catch it. GROUP E2 removed four false claims and verified they were GONE. Nobody
+// verified that the sentences REPLACING them were true in every state — so the rail shipped
+// "ONE … OUTCOME" while `outcome: null` renders "No outcome record exists for this trial" six
+// panels down, and "what every commitment below is scored against" while the standard fixture
+// carries a `pending` row and an `UNSCORED` row that have no score and, for UNSCORED, never will.
+//
+// All 44 tests passed with that contradiction on screen, because E2's predicates only ever asked
+// about the RETIRED phrases. The lesson, applied here: walk the states the component actually
+// supports and write the predicates from the walk, not from the sentences.
+//
+// THE STATES WALKED BELOW: outcome null / pending / settled / UNSCORED, crossed with a participant
+// fixture that carries settled, pending AND UNSCORED receipts simultaneously.
+//
+// The outcome label is a DIRECT READ of `trial.outcome === null` — one source-of-truth field, not
+// a judgement synthesised from eight verdicts. That is what keeps it clear of the aggregate
+// anti-pattern that GROUP E2's all-pass test pins; that test is untouched and still passes.
+const FALSE_SCOPE_CLAIMS: RegExp[] = [
+  /scored against/i,
+  /every commitment below is scored/i,
+  /\bone outcome\b(?! record)/i,
+];
+
+describe('H5.3 rail copy is true in every outcome state the card supports', () => {
+  it('outcome: null — the rail says NO OUTCOME RECORD, never "one outcome"', async () => {
+    await card({ trial: () => jsonResponse(trial(null)) });
+    const rail = screen.getByTestId('rail-summary');
+    expect(rail).toHaveTextContent('NO OUTCOME RECORD');
+    expect(rail.textContent).not.toMatch(/one outcome/i);
+    // The contradiction this test exists to forbid: the same page asserting both.
+    expect(screen.getByTestId('settlement-panel')).toHaveAttribute('data-status', 'none');
+    expect(document.body.textContent).toMatch(/no outcome record exists for this trial/i);
+  });
+
+  it('settled — the rail says ONE OUTCOME RECORD', async () => {
+    await card();
+    const rail = screen.getByTestId('rail-summary');
+    expect(rail).toHaveTextContent('ONE OUTCOME RECORD');
+    expect(rail.textContent).not.toMatch(/no outcome record/i);
+  });
+
+  // A recorded `pending` or `UNSCORED` outcome IS an outcome record — `outcome !== null`. Only the
+  // absent key/`null` case is "no record". These two pin that the label reads the field and does
+  // not smuggle in a judgement about whether the record is useful yet.
+  it('pending — an outcome record EXISTS even though nothing is settled', async () => {
+    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('pending'))) });
+    const rail = screen.getByTestId('rail-summary');
+    expect(rail).toHaveTextContent('ONE OUTCOME RECORD');
+    expect(rail.textContent).not.toMatch(/no outcome record/i);
+  });
+
+  it('UNSCORED — an outcome record EXISTS and is terminal', async () => {
+    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('UNSCORED'))) });
+    const rail = screen.getByTestId('rail-summary');
+    expect(rail).toHaveTextContent('ONE OUTCOME RECORD');
+    expect(rail.textContent).not.toMatch(/no outcome record/i);
+  });
+
+  it('never claims every commitment is scored — the fixture carries pending and UNSCORED rows', async () => {
+    const panel = await participants();
+    // ACCEPTANCE CONTROL: the fixture really does contain unscored commitments, or the negatives
+    // below are vacuous. rcpt_3 is pending and rcpt_4 is UNSCORED, both with null brier.
+    const rows = within(panel).getAllByTestId('participant-row');
+    expect(within(rows[2]).getByTestId('participant-status')).toHaveTextContent('pending');
+    expect(within(rows[3]).getByTestId('participant-status')).toHaveTextContent('UNSCORED');
+    expect(within(rows[3]).getByTestId('participant-brier')).toHaveTextContent('—');
+
+    const text = document.body.textContent ?? '';
+    for (const claim of FALSE_SCOPE_CLAIMS) {
+      expect(text, `card asserts ${claim} while an UNSCORED commitment is on screen`).not.toMatch(claim);
+    }
+    // And it says the true thing instead: a score exists only where a settled outcome does.
+    expect(text).toMatch(/only where a settled outcome/i);
+  });
+
+  it('still states the construction facts in the null-outcome state', async () => {
+    await card({ trial: () => jsonResponse(trial(null)) });
+    const text = document.body.textContent ?? '';
+    // The over-correction guard again: satisfying the negatives by deleting the rail is the other
+    // way to fail this finding.
+    expect(text).toContain('one sealed evidence payload');
+    expect(text).toMatch(/not a finding about any receipt/i);
+    expect(screen.getByTestId('trial-evidence-hash')).toHaveTextContent(trialWire.evidence_hash);
+    expect(text).toContain(String(trialWire.commit_deadline_ms));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GROUP F — the markout table (element 4)
 // ---------------------------------------------------------------------------
 describe('H5.3 markout table', () => {
