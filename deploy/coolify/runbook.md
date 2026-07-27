@@ -37,7 +37,8 @@ One Coolify project on a single VPS:
 |  |                     └────────────────────────┘   └──────────────┘       |  |
 |  +-------------------------------------------------------------------------+  |
 |                                                                               |
-|  Named volumes: postgres-data, wal-spool (WAL_DIR), replay-capture            |
+|  Named volumes: postgres-data, wal-spool (WAL_DIR), replay-capture,           |
+|                 signal-trials-data (SIGNAL_TRIALS_DATA_DIR)                   |
 |  Host path (ro): /srv/veridex/replay-packs/curated (REPLAY_PACK_ROOT)         |
 +-------------------------------------------------------------------------------+
 ```
@@ -65,6 +66,7 @@ Named volumes (declared in `compose.coolify.yml`):
 | `postgres-data` | postgres `/var/lib/postgresql/data` | database files |
 | `wal-spool` | api-runtime `/var/lib/veridex/wal` | `WAL_DIR` durable event spool (I-4/AC-13) |
 | `replay-capture` | api-runtime `/var/lib/veridex/replay-packs/capture` | writable ReplayPack capture root (R-0b/R-2) |
+| `signal-trials-data` | api-runtime `/var/lib/veridex/signal-trials` | published season + receipt store (`SIGNAL_TRIALS_DATA_DIR`). **The only durable record that a trial was opened, paid for and settled** — a receipt whose store is gone cannot be verified by anyone, so losing it on redeploy silently voids the Fair-Play claim rather than breaking anything visibly. |
 
 Read-only mount: curated seed packs at
 `/srv/veridex/replay-packs/curated` → api-runtime
@@ -107,7 +109,7 @@ In the Coolify dashboard:
    - **Dockerfile Location**: `Dockerfile.api` (**I-5-owned; exists
      only after D-1 wiring — do not create this service before then**).
    - **Ports Exposes**: `8000`.
-   - Attach volumes `wal-spool`, `replay-capture`, and the read-only
+   - Attach volumes `wal-spool`, `replay-capture`, `signal-trials-data`, and the read-only
      curated-pack host path per §2.
    - Health check: path + interval wired at D-1 (structural note only).
 4. **Add web** (Application → Dockerfile build pack):
@@ -186,7 +188,7 @@ Rules:
    7-day retention.
 2. Drill once before demo: restore the latest snapshot into a fresh
    Postgres container, read a sample row back.
-3. `wal-spool` and `replay-capture` are durability surfaces — never
+3. `wal-spool`, `replay-capture` and `signal-trials-data` are durability surfaces — never
    mount them `tmpfs`, never bind them to ephemeral paths.
 
 ## 11. Post-deploy smoke verification (III-1)
