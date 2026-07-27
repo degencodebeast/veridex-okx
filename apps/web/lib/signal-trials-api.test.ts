@@ -892,7 +892,14 @@ const PATH_PARAM = 'PARAM';
 // route (see `getOpenTrial`'s note on the two 503s it therefore never sees), so no entry exists to
 // derive from. That is a disclosed gap in the binding, not an oversight — the commit path is the
 // one route here whose spelling this test cannot keep in step with the client automatically.
-const SKILL_MD_ENDPOINTS: readonly { readonly method: string; readonly path: string }[] = [
+type SkillEndpoint = { readonly method: string; readonly path: string };
+
+// `{`, `}` and `$` all carry regex meaning and all occur in these paths (`{id}`, `{payer}`).
+function escapeForRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const SKILL_MD_ENDPOINTS: readonly SkillEndpoint[] = [
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.openTrial() },
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.season() },
   { method: 'POST', path: '/signal-trials/commit' },
@@ -902,8 +909,44 @@ const SKILL_MD_ENDPOINTS: readonly { readonly method: string; readonly path: str
   { method: 'GET', path: SIGNAL_TRIALS_PATHS.verifyReceipt(PATH_PARAM).replace(PATH_PARAM, '{id}') },
 ];
 
-function endpointLine(e: { method: string; path: string }) {
+function endpointLine(e: SkillEndpoint) {
   return `${e.method} ${e.path}`;
+}
+
+// THE PREDICATE, defined ONCE and used by both the naming assertion and the discrimination matrix
+// below, so the matrix genuinely exercises the predicate the document is held to rather than a
+// lookalike written beside it.
+//
+// THE TRAILING `(?![\w/-])` IS THE WHOLE OF THE MINOR-1 FIX, and it is worth stating why a plain
+// substring test was not merely weak but non-discriminating. `GET /signal-trials/trials/{id}` is a
+// PREFIX of `GET /signal-trials/trials/{id}/receipts`, so `toContain` on the shorter one was
+// satisfied by the receipts heading alone: deleting the entire results entry left the assertion
+// GREEN. Six of seven endpoints were pinned and the seventh only transitively — and seven passing
+// assertions look exactly like seven pinned endpoints. The negative lookahead says "this endpoint,
+// not a longer path that merely starts with it": at the receipts heading the next character after
+// `{id}` is `/`, so the match is rejected there and accepted at the results heading, where the next
+// character is a backtick.
+//
+// A lookahead rather than an anchor on the markdown backticks, deliberately: the claim being pinned
+// is "this endpoint is named", not "this endpoint is named in bold code formatting". A predicate
+// that broke when the document was re-styled would train an editor to weaken it.
+function namesEndpoint(text: string, e: SkillEndpoint): boolean {
+  return new RegExp(`${escapeForRegExp(endpointLine(e))}(?![\\w/-])`).test(text);
+}
+
+// The MUTATION anchor, deliberately independent of the predicate under test. A heading in SKILL.md
+// is the markdown form **`METHOD /path`**, whose closing backtick makes it identify exactly one line
+// per endpoint no matter how `namesEndpoint` behaves. Deriving the mutation from the predicate would
+// make the control circular — it would inherit whatever blindness the predicate has, which is the
+// precise reason the previous `split(line).join('')` control could not catch MINOR-1: it removed
+// BOTH occurrences of the prefix, so the mutant it built was never the mutant that mattered.
+function headingOf(e: SkillEndpoint) {
+  return `**\`${endpointLine(e)}\`**`;
+}
+
+function withoutEndpointEntry(text: string, e: SkillEndpoint): string {
+  const heading = headingOf(e);
+  return text.split('\n').filter((line) => !line.includes(heading)).join('\n');
 }
 
 describe('public SKILL.md names the API surface it claims to document', () => {
@@ -911,25 +954,34 @@ describe('public SKILL.md names the API surface it claims to document', () => {
     expect(SKILL_MD.trim().length).toBeGreaterThan(0);
   });
 
-  // SIX, not five. One assertion per endpoint so a drop is attributable to the endpoint dropped
-  // rather than to "the list changed".
-  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e)] as const))(
+  // SEVEN. One assertion per endpoint so a drop is attributable to the endpoint dropped rather
+  // than to "the list changed".
+  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e), e] as const))(
     'names %s',
-    (line) => {
-      expect(SKILL_MD).toContain(line);
+    (_label, e) => {
+      expect(namesEndpoint(SKILL_MD, e)).toBe(true);
     },
   );
 
-  // C66 — the discrimination control for the predicate above, and the direct answer to "would this
-  // fail if an endpoint were dropped?". Each endpoint's line is DELETED from a copy of the document
-  // and the same predicate is re-run: it must fail. A `toContain` over a document that happens to
-  // mention a path proves nothing on its own; this is what makes the six load-bearing.
-  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e)] as const))(
-    'a document with %s removed FAILS the same predicate',
-    (line) => {
-      const without = SKILL_MD.split(line).join('');
-      expect(without).not.toEqual(SKILL_MD); // the mutation demonstrably landed
-      expect(without).not.toContain(line);
+  // C66 — THE DISCRIMINATION MATRIX, and the direct answer to "would this fail if an endpoint were
+  // dropped?". For each endpoint its own entry is removed from a copy of the document and the FULL
+  // ROW is asserted: its own predicate must die AND the other six must survive. Both directions are
+  // required. "Its own predicate dies" alone would be satisfied by a predicate that dies whenever
+  // anything at all is removed; "the others survive" is what proves the predicate is bound to its
+  // own endpoint and not to the document's bulk.
+  //
+  // This replaces a weaker control that asserted only the first half over a mutant built by deleting
+  // every occurrence of the endpoint string. SPEC proved that control could not catch MINOR-1.
+  it.each(SKILL_MD_ENDPOINTS.map((e) => [endpointLine(e), e] as const))(
+    'removing the %s entry kills its own predicate and NO other',
+    (_label, e) => {
+      const mutant = withoutEndpointEntry(SKILL_MD, e);
+      expect(mutant).not.toEqual(SKILL_MD); // C41 — the mutation demonstrably landed
+      expect(namesEndpoint(mutant, e)).toBe(false);
+      for (const other of SKILL_MD_ENDPOINTS) {
+        if (other === e) continue;
+        expect(namesEndpoint(mutant, other)).toBe(true);
+      }
     },
   );
 

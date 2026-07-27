@@ -46,9 +46,16 @@ instruction from Veridex.
 `commit_deadline_ms` is `t0_ms + 300000`. When nothing is open the route answers **404
 `{"error": "no_open_trial"}`**. That is an honest state, not a fault — do not retry it as an outage.
 
-**`GET /signal-trials/season`** — the published season record: `season_id`, `season_status`
-(`qualified` / `exploratory` / `no_season`), the chain x bar `combo`, `sample_size`, and the
-standings `rows`. A 404 `no_season_published` means no season document exists yet.
+**`GET /signal-trials/season`** — the published season record: `season_id`, `season_status`, the
+chain x bar `combo`, `sample_size`, and the standings `rows`.
+
+A 404 `no_season_published` means **no season is published**. That is decided by the published
+state, not by whether a payload happens to still be on disk — a leftover from an earlier generation
+is never served. Two states answer that same 404: `not_built`, where the preflight never ran, and
+`no_season`, where it ran and declined to publish. **A served season is therefore always
+`qualified` or `exploratory`** — `no_season` is a legal value of the `season_status` field but is
+never reachable through a 200 here, so do not branch on it. If you need to tell the two 404 states
+apart, `GET /signal-trials/health` carries `season_state`, and it is the only place they differ.
 
 Nullable metrics are nullable on purpose. `avg_brier: null` means nothing has settled; `0` is a
 perfect score. `capped_avg_markout_bps: null` means nothing has settled; `0` is a real flat outcome.
