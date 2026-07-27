@@ -1938,6 +1938,128 @@ def test_a_DRY_RUN_handoff_that_raises_is_NOT_reported_as_maybe_published():
     assert "MAY ALREADY EXIST" not in result.err, "a dry run published nothing; do not warn"
 
 
+class _FailsFirstWrite(io.StringIO):
+    """A stderr whose FIRST write raises and whose later writes succeed.
+
+    Codex's reproduction shape. The first write is the indeterminate warning inside `_run`; the
+    later ones are `main`'s refusal line. If the warning print is outside a post-handoff boundary,
+    the raw exception reaches the generic formatter and the operator gets the PRE-handoff wording
+    for a signal whose child has already started AND returned.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_first = False
+
+    def write(self, text: str) -> int:
+        if not self.failed_first:
+            self.failed_first = True
+            raise BrokenPipeError("first post-handoff warning write failed")
+        return super().write(text)
+
+
+def test_a_FAILING_warning_write_still_reaches_the_operator_as_post_handoff():
+    """CODEX R2 MAJOR-1 — the seventh instance of the class, inside the fix for the fifth.
+
+    The indeterminate warning print sat OUTSIDE every post-handoff boundary. If it raised, the raw
+    exception left `_run` and `main`'s GENERIC handler produced `refused: <exception>` — the
+    pre-handoff wording — for a child that had started and returned. That is the input that makes
+    an operator open a REST fallback and create the duplicate WS/REST trial.
+
+    THE FIX WAS NOT "WRAP THIS PRINT". Twice the correction enclosed everything that existed and
+    left what it added outside, so the whole tail of `_run` is now one boundary and a mechanical
+    enumeration reports the REGION rather than the known gaps. That enumeration also found a third
+    unprotected statement the review did not name — `return exit_status(summary)`.
+
+    NO SOCKET: connection injected, stderr injected, first write fails, later writes succeed.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    buffer = _FailsFirstWrite()
+    original = module._subprocess_handoff
+    module._subprocess_handoff = lambda _argv, _stdin: 120  # published, then failed to print
+    try:
+        with contextlib.redirect_stderr(buffer):
+            status = module.main(argv, connect_factory=lambda _url: _Ctx())
+    finally:
+        module._subprocess_handoff = original
+
+    assert buffer.failed_first, "the reproduction is only valid if the first write actually failed"
+    err = buffer.getvalue()
+    assert status == 1
+    assert module.INDETERMINATE_WARNING in err, f"the operator lost the instruction: {err!r}"
+    assert "check the data dir" in err
+    assert not err.startswith("refused: BrokenPipeError"), (
+        "the pre-handoff wording reached the operator for a child that had already returned"
+    )
+    assert err.startswith("refused AFTER handoff:"), f"got {err!r}"
+
+
+def test_BOTH_indeterminate_routes_emit_THE_SAME_warning_not_merely_similar_ones():
+    """CODEX R2 MINOR-1, and QUALITY found it first — two reviewers, so it is not a taste call.
+
+    `INDETERMINATE_WARNING` exists so the raising route and the nonzero-return route cannot drift.
+    It was referenced by ZERO tests: each route asserted its own substrings, so inlining different
+    text at one site while keeping the fragments left the suite green and could silently drop the
+    actionable "before opening a REST-sourced one" clause.
+
+    This binds the NAMED CONSTANT on both routes, and then asserts the two stderr lines share it
+    EXACTLY — substring-per-route is what failed to catch drift, so route-to-route equality is the
+    assertion that actually holds them together.
+    """
+    module = _ws_exhibition_module()
+    argv = ["--ws-url", "wss://example.invalid", "--chain-index", "501", "--data-dir", "/tmp/x"]
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _TeardownBoom:
+        async def __aenter__(self):
+            return _ScriptedConn([_ws_push(H22_WS)])
+
+        async def __aexit__(self, *exc):
+            raise RuntimeError("teardown failed after the child was spawned")
+
+    original = module._subprocess_handoff
+    try:
+        module._subprocess_handoff = lambda _argv, _stdin: 120
+        nonzero_route = _capture_main_stderr(module, argv, _Ctx).err
+        module._subprocess_handoff = lambda _argv, _stdin: 0
+        raising_route = _capture_main_stderr(module, argv, _TeardownBoom).err
+    finally:
+        module._subprocess_handoff = original
+
+    # The NAMED constant, on both routes — the assertion that was missing entirely.
+    assert module.INDETERMINATE_WARNING in nonzero_route
+    assert module.INDETERMINATE_WARNING in raising_route
+
+    # ...and it is the SAME text, not two texts that happen to share fragments.
+    assert module.INDETERMINATE_WARNING in (
+        nonzero_route.split(" -- ", 1)[-1].strip()
+    ), "the nonzero route's warning is not the shared constant"
+    assert module.INDETERMINATE_WARNING in (
+        raising_route.split(" -- ", 1)[-1].strip()
+    ), "the raising route's warning is not the shared constant"
+
+    # The routes differ in their PREFIX — they must, or the distinction is lost — and agree on the
+    # instruction. Asserting both is what makes this a shared invariant rather than a coincidence.
+    assert nonzero_route.startswith("handoff returned") or "AFTER starting" in nonzero_route
+    assert raising_route.startswith("refused AFTER handoff:")
+    assert "before opening a REST-sourced one" in module.INDETERMINATE_WARNING
+
+
 def test_a_NONZERO_child_status_is_reported_as_INDETERMINATE_not_as_not_published():
     """CODEX MAJOR-1, half two — the half no exception handler could ever have covered.
 
@@ -2002,26 +2124,50 @@ def test_the_REAL_child_publishes_BEFORE_it_prints_which_is_why_nonzero_is_indet
     argv = module.build_handoff_argv(data_dir=str(data_dir), dry_run=False)
 
     payload = json.dumps(H22_WS, separators=(",", ":"), sort_keys=True)
-    proc = subprocess.run(
+
+    # MADE TO DO WHAT IT SAYS, rather than narrowing the docstring to what it did. The previous
+    # version used `stdout=DEVNULL` — where writes SUCCEED — and asserted `returncode == 0`, so it
+    # documented a failure it never executed and checked the premise by a SOURCE-TEXT INDEX
+    # comparison that an ordinary refactor (moving the publish into a helper defined earlier) would
+    # survive. Executing the failure is what makes this evidence: the whole third state rests on
+    # "a nonzero child may still have published", and here that actually happens.
+    #
+    # The read end of the child's stdout is closed before it writes, so its print raises EPIPE
+    # AFTER the publish has landed. Local subprocess only — no socket, no network, no credential.
+    proc = subprocess.Popen(
         [sys.executable, *argv],
-        input=payload,
-        text=True,
-        stdout=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        text=True,
+    )
+    assert proc.stdout is not None and proc.stdin is not None
+    proc.stdout.close()  # the child's writes to stdout now fail
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except BrokenPipeError:  # pragma: no cover - the child died even earlier; asserted below
+        pass
+    stderr_text = proc.stderr.read() if proc.stderr else ""
+    returncode = proc.wait(timeout=30)
+
+    # THE PREMISE, EXECUTED: the trial is on disk even though the child reported failure.
+    written = sorted(p.name for p in (data_dir / "live").rglob("*") if p.is_file())
+    assert written, f"the child published nothing; rc={returncode} err={stderr_text!r}"
+    assert returncode != 0, (
+        f"the child succeeded despite a closed stdout (rc={returncode}); this test no longer "
+        "demonstrates publish-before-print and the third state needs a different justification"
     )
 
-    # The control: this child really did publish, whatever it returned.
-    written = sorted(p.name for p in (data_dir / "live").rglob("*") if p.is_file())
-    assert written, f"the child published nothing; rc={proc.returncode} err={proc.stderr!r}"
-    assert proc.returncode == 0, "baseline: with a working stdout the child succeeds"
-
-    # ...and the ordering is the point: the publish call precedes the print in the child's source,
-    # which is what makes a nonzero status compatible with a trial existing.
-    child = (Path(module.OPEN_LIVE_TRIAL_SCRIPT)).read_text()
-    publish_at = child.index(".publish(trial)")
-    print_at = child.index("print(json.dumps(summary")
-    assert publish_at < print_at, "the child now prints before publishing; revisit the third state"
+    # ACCEPTANCE CONTROL: the same child with a WORKING stdout succeeds and publishes, so the
+    # nonzero above is caused by the closed pipe rather than by anything else being broken.
+    ok_dir = tmp_path / "ok"
+    ok = subprocess.run(
+        [sys.executable, *module.build_handoff_argv(data_dir=str(ok_dir), dry_run=False)],
+        input=payload, text=True, capture_output=True, check=False,
+    )
+    assert ok.returncode == 0, f"baseline child failed: {ok.stderr!r}"
+    assert sorted(p.name for p in (ok_dir / "live").rglob("*") if p.is_file())
 
 
 def test_a_TIMEOUT_refusal_tells_the_operator_what_to_do(monkeypatch):

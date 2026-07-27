@@ -409,21 +409,32 @@ async def _run(args: argparse.Namespace, *, connect_factory: ConnectFactory | No
             raise PostHandoffError(error) from error
         raise
 
+    # ONE BOUNDARY OVER THE WHOLE TAIL, rather than one per statement, and the shape is the fix.
+    #
+    # Twice the correction enclosed everything that EXISTED and left what it ADDED outside: round 1
+    # wrapped the summary construction and left the handoff call out; round 2 wrapped the handoff
+    # call and left this warning print out. Wrapping statements individually is what produced that,
+    # because each new statement is a new decision nobody is prompted to make. Enclosing the REGION
+    # means anything added here later is inside by default, and the enumeration in
+    # `h25_postboundary.py` reports the region rather than the known gaps.
+    #
+    # Everything below runs after the child has started AND returned, so a failure here is
+    # post-handoff by construction — including `exit_status`, which the reviewer did not name and
+    # which has no business being reasoned about individually.
     try:
         print(json.dumps(summary.render(), indent=2, sort_keys=True))
+
+        # THE NONZERO-RETURN PATH. It never raises, so no exception handler could ever have covered
+        # the CHILD's failure — the child simply reports it, having published BEFORE it printed. The
+        # operator gets the same sentence here as on the raising path, from the same constant.
+        if summary.publication_indeterminate:
+            print(
+                f"handoff returned {summary.handoff_status} AFTER starting -- {INDETERMINATE_WARNING}",
+                file=sys.stderr,
+            )
+        return exit_status(summary)
     except Exception as error:
         raise PostHandoffError(error) from error
-
-    # THE NONZERO-RETURN PATH, which had no protection at all. It never raises, so no exception
-    # handler could ever have covered it — the child simply reports failure, and the child publishes
-    # BEFORE it prints. The operator gets the same sentence here as on the raising path, because it
-    # is the same situation.
-    if summary.publication_indeterminate:
-        print(
-            f"handoff returned {summary.handoff_status} AFTER starting -- {INDETERMINATE_WARNING}",
-            file=sys.stderr,
-        )
-    return exit_status(summary)
 
 
 def main(argv: list[str] | None = None, *, connect_factory: ConnectFactory | None = None) -> int:
