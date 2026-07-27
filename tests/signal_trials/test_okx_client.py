@@ -5,7 +5,6 @@ import math
 import sys
 from importlib import util as importlib_util
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -888,7 +887,33 @@ def test_the_finite_candle_defaults_are_distinct_AS_PARSED_VALUES():
     # EXAMINED count named beside its predicate rather than left implicit. Six NUMERIC columns: `ts`
     # is parsed by `int()` and `confirm` is compared as a string, so neither can take part in a
     # float transposition and neither is in scope for this invariant.
+    #
+    # This one DOES discriminate: it is `len(NUMERIC_COLUMN_TO_FIELD) == 6` in effect, so adding or
+    # dropping a numeric column fires it. Measured: 7 of 40 enumerated fixture states (MINOR-Q2).
     assert len(numeric_defaults) == 6
+    # TAUTOLOGY, retained for readability and LABELLED so — same category as the demonstration pair
+    # at the end of this function, and labelled for the same reason. The comprehension one line
+    # above is keyed BY `NUMERIC_COLUMN_TO_FIELD`, so this equality holds by construction whenever
+    # the comprehension completes at all; when it does not complete the failure is a `KeyError`
+    # raised before this line is ever reached. Measured over 40 mechanically enumerated fixture
+    # states — every single-key deletion from each dict, all 15 pairwise value collapses, the
+    # string-distinct collapse, three column additions, six consistent renames — IT FIRED ZERO
+    # TIMES, while its neighbours fired 7, 22, 16 and 12 times respectively (MINOR-Q2).
+    #
+    # WHY LABELLED RATHER THAN MADE TO DISCRIMINATE: the property it LOOKS like it is checking —
+    # that `NUMERIC_COLUMN_TO_FIELD`'s keys all exist in `_FINITE_CANDLE` — is already pinned, and
+    # genuinely, by `test_the_candle_vector_matches_the_DOCUMENTED_upstream_schema_field_for_field`:
+    # `set(_FINITE_CANDLE) == set(DOCUMENTED_CANDLE_COLUMNS)` together with
+    # `set(DOCUMENTED_CANDLE_COLUMNS) - set(NUMERIC_COLUMN_TO_FIELD) == {"ts", "confirm"}` gives it
+    # transitively, in the test whose actual job is schema pinning. Rewriting this line into a
+    # discriminating one would duplicate a working guard in the wrong place to avoid writing a
+    # label, which is manufacturing evidence rather than producing it.
+    #
+    # THE LABEL IS THE POINT, not the assertion. This function is credited for labelling its own
+    # non-discriminating assertion (below), so an UNLABELLED tautology three lines earlier taught a
+    # reader the opposite of the truth: that :892 was load-bearing and the demonstration pair was
+    # not. A labelling convention applied unevenly is worse than none, because it makes the
+    # unlabelled thing look verified.
     assert set(numeric_defaults) == set(NUMERIC_COLUMN_TO_FIELD)
 
     parsed = [float(raw) for raw in numeric_defaults.values()]
