@@ -81,15 +81,45 @@ type FrozenCheckKey = (typeof SIGNAL_TRIALS_CHECK_KEYS)[number]['key'];
 
 // What each check ASSERTS. Deliberately state-independent: the verdict is rendered separately, so
 // no description here implies its own outcome.
+//
+// THIS MAP IS RENDERED COPY, not commentary — it goes into every check row on the public route,
+// so each sentence is a public claim about what verification establishes and is written against
+// `veridex/signal_trials/receipts.py`, not against the check's NAME. Two of these names are
+// specifically over-readable and the backend author wrote paragraphs disclaiming the stronger
+// reading; those paragraphs are cited inline below so a later editor cannot re-introduce the
+// overstatement by reasoning from the name. Where a check binds membership in a frozen
+// vocabulary, this says membership — it is a weaker claim than correspondence with the live
+// trial, and it is the true one.
 const CHECK_DESCRIPTION: Record<FrozenCheckKey, string> = {
   body_hash: 'The canonical commit body re-hashes to the sealed value recorded at commit time.',
-  manifest: 'The receipt binds to the published run manifest hash it claims.',
+  manifest: 'The receipt binds to the published run manifest hash it claims, including the resolved trial id.',
   deadline_respected: 'The commitment was received strictly before the commit deadline.',
-  live_mode: 'The trial mode recorded on the receipt matches the trial it was committed to.',
-  bar_version: 'The settlement bar recorded on the outcome is the season bar.',
-  law_version: 'The scoring law version recorded on the receipt matches the published one.',
-  evidence_equality: 'Every scored agent is bound to the same evidence hash and the same tier.',
-  outcome_source: 'The settlement candle close is re-derived from the recorded candle.',
+  // receipts.py:1965 — `payload.get("trial_mode") == LIVE_TRIAL_MODE`, a comparison against a
+  // module constant. The trial is NEVER consulted, and receipts.py:1882-1884 states why that is
+  // deliberate: this and `deadline_respected` "read facts the receipt CARRIES rather than
+  // consulting the live trial, and that is what makes a historical receipt verifiable at all."
+  live_mode: 'The mode recorded on the receipt is exactly live — paid commitments are live-only. It reads the receipt, never the trial.',
+  // receipts.py:1843 — `BAR_MS.get(bar) == bar_ms`, pure membership in a frozen table.
+  // receipts.py:157-162 disclaims the selection reading under the heading "What it does NOT bind,
+  // stated so the name cannot be over-read": "It checks membership, not selection." Selection is
+  // enforced at the WRITER instead, because the only artifact naming the selected bar is the
+  // published season and a season is republished.
+  bar_version: 'The recorded bar label and its width are one of the frozen pairs this law settles on — membership, not a claim about which pair this season selected.',
+  // receipts.py:1844 — `row.get("law_version") == SETTLEMENT_LAW_VERSION`. It reads the OUTCOME
+  // row, not the receipt, and compares against what THIS BUILD implements (:172-174: "A record
+  // settled under an older law is not wrong, but it is not re-derivable HERE").
+  law_version: 'The scoring law version recorded on the outcome row is the one this build implements.',
+  // receipts.py:1849-1851 plus `_evidence_reproduces` (:801-806, which asserts
+  // `visible_at_decision(signal) == evidence` as well as the hash). Three properties of the
+  // OUTCOME ROW. receipts.py:181-185 disclaims the receipt-level reading: "it does not tie the
+  // RECEIPT to the trial" — that join is `manifest`'s finding, not this one's — so this sentence
+  // must not attach the binding to agents or to receipts.
+  evidence_equality: 'The outcome row’s sealed evidence re-hashes to its own recorded hash, carries nothing beyond the visible_at_decision tier, and is filed under the trial it names.',
+  // receipts.py:1852 → `_outcome_source_reproduces` (:986). THREE obligations under one name
+  // (:186-203), and the middle one is the strongest thing the verifier does: leaving the law's
+  // outputs unchecked "is what let a forged follow_profitable verify with all eight checks
+  // passing". Describing this as a boundary re-derivation sells it short.
+  outcome_source: 'Three obligations: the close boundary, the law’s outputs (entry, both markout legs and follow_profitable) and the fetch source all re-derive from the recorded candle.',
 };
 
 // ---------------------------------------------------------------------------
@@ -325,7 +355,7 @@ function TrialHead({ trial }: { trial: TrialCard }) {
           </p>
         </div>
         <div className={styles.headChips}>
-          <span className={styles.chip} data-mode={trial.trialMode}>● live exhibition</span>
+          <span className={styles.chip}>● live exhibition</span>
           <span className={styles.chip} data-status={status} data-testid="trial-status-chip">{status}</span>
         </div>
       </header>

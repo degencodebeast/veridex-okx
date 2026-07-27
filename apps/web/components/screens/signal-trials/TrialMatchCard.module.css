@@ -28,9 +28,19 @@
 }
 .back:hover, .back:focus-visible { color: var(--accent-hi); }
 
-/* Status chip. Deliberately NOT the shared <Badge> component: none of these states is an existing
-   BadgeVariant, and `verified` — the one that looks closest — is a legacy variant whose meaning (a
-   per-artifact check) must never be stretched into an aggregate claim over a trial. */
+/* Status chip. Deliberately NOT the shared <Badge> component, for three reasons that are each
+   checkable:
+   1. These states do not map cleanly onto the BadgeVariant vocabulary. `settled` and `none` have
+      no variant at all; `pending` and `unscored` DO exist there (lib/badges.ts:3, :8) but carry a
+      different domain meaning — the roster proof-state vocabulary, not a trial's settlement.
+      Borrowing a spelling whose meaning differs is worse than not borrowing it.
+   2. <Badge> cannot carry the `data-status` hook that the rules below and the tests both read.
+   3. `verified` — the variant that looks closest — already means something else here: it is a
+      ProofMode (lib/contracts.ts:10, one of reproducible | verified | partial) describing ONE
+      artifact's proof state, and it is rendered as such elsewhere (DesignSystemScreen.tsx:106).
+      Reusing it for a trial would stretch a per-artifact label into an aggregate claim over eight
+      independently-reported checks. See the "no aggregate badge" guard in TrialMatchCard.test.tsx.
+   SeasonScreen.module.css:16 rolled its own chip for the same reasons. */
 .chip {
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em;
   text-transform: uppercase; padding: 3px 8px; border-radius: var(--radius-badge);

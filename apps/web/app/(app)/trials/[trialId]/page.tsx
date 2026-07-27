@@ -16,9 +16,13 @@ import { TrialMatchCard } from '@/components/screens/signal-trials/TrialMatchCar
 // flattened them into one prop would have to pick a single failure state, destroying exactly the
 // distinctions the card exists to preserve. The card owns those status machines.
 //
-// The route segment is read with `useParams` (the client-component idiom used by every other
-// dynamic route in this tree) rather than the async `params` prop, because the card is a client
-// component and this wrapper adds nothing a server component could.
+// The route segment is read with `useParams`, the idiom the other CLIENT-component dynamic routes
+// use — `/agents/[agentId]` and `/instances/[instanceId]`. The async `params` prop is the more
+// common shape in this tree overall and is what the server-rendered dynamic routes use, so this is
+// a choice between two live conventions rather than the only one. It is the right one here because
+// the card is a client component that owns three status machines: a server wrapper could await
+// `params` and forward the string (`/proof/maker-ablation/[instanceId]` does exactly that), but it
+// would add a boundary without moving any work across it.
 export default function TrialPage() {
   const params = useParams<{ trialId: string }>();
   return <TrialMatchCard trialId={params.trialId} />;

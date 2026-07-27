@@ -654,6 +654,22 @@ describe('H5.3 language guard', () => {
     expect(text).toMatch(/reproducib/i);
     // The declared limit: never proof against a malicious storage operator.
     expect(text).not.toMatch(/tamper|immutab|cannot be (altered|changed)/i);
+    // THE FORBIDDEN LIST, RUN WHERE THE CHECK DESCRIPTIONS ARE GUARANTEED TO BE ON SCREEN.
+    //
+    // The test above scans a `card()` render, which awaits only the TRIAL panel; whether the
+    // participants panel — and therefore the eight rendered check descriptions — has resolved by
+    // then is a promise-ordering accident. Measured: it usually has, so that test does usually
+    // cover this copy. "Usually" is not a guard. This assertion awaits the participants panel
+    // explicitly, so the eight descriptions are always in `text`.
+    //
+    // Worth stating plainly: a QUALITY review, not a test, is what caught three of those
+    // descriptions overstating what the verifier establishes. The language guard would not have
+    // caught them either — none of the overstatements used a forbidden WORD — so this closes the
+    // reachability gap, not the semantic one. Nothing here can check a sentence against
+    // receipts.py; that remains a human obligation, recorded in CHECK_DESCRIPTION's own comments.
+    for (const bad of FORBIDDEN) {
+      expect(text, `forbidden ${bad} in the participant/checks copy`).not.toMatch(bad);
+    }
   });
 
   it('carries the verbatim paper-benchmark fence', async () => {
