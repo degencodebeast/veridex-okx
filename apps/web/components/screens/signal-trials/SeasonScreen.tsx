@@ -115,8 +115,8 @@ function LoadingState() {
     <>
       <p className={styles.stateSub}>SEASON STANDINGS</p>
       {/* Named so it is unmistakable in a screenshot: the bars below stand for nothing. A skeleton
-          filled with plausible agent names and scores is the most persuasive lie this screen could
-          tell, so it holds no names, no scores and no counts. */}
+          populated with plausible agent names and scores is the most persuasive lie this screen
+          could tell, so it holds no names, no scores and no counts. */}
       <p className={styles.stateBody}>LOADING · NO PLACEHOLDER RESULTS SHOWN</p>
       <div className={styles.skeletonRow} aria-hidden />
       <div className={styles.skeletonRow} aria-hidden />
@@ -198,6 +198,10 @@ function Standings({ season, state }: { season: SignalTrialsSeason; state: 'qual
           {season.combo
             ? Object.entries(season.combo).map(([k, v]) => ` · ${k} ${String(v)}`).join('')
             : ''}
+          {/* PROOFARENA-EXACT-COPY.md:51 — the exploratory combo line appends this suffix. It is a
+              plain copy string gated on the state and needs no data the screen lacks, so unlike the
+              design's humanized combo rendering there is nothing here to invent. */}
+          {state === 'exploratory' ? ' · below the 40-trial gate' : ''}
         </span>
       </div>
       <p className={styles.stateSub}>

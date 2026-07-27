@@ -70,6 +70,11 @@ function stubSeason200(over: Partial<W.SignalTrialsSeasonWire> = {}) {
   stubRoutes({ season: () => jsonResponse({ ...seasonWire, ...over }) });
 }
 
+// Never resolves, so the screen stays pinned in `loading` for the whole of an assertion.
+function stubNeverResolvingFetch() {
+  vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch);
+}
+
 // Every row carries qualified=false — what an `exploratory` season looks like on the wire.
 const exploratoryRows = seasonWire.rows.map((r) => ({ ...r, qualified: false }));
 
@@ -176,7 +181,7 @@ describe('H5.2 qualified season — Brier is the rank key and the metrics are ho
     expect(rendered).not.toEqual(brierSorted);
   });
 
-  it('numbers rows by served position (ORD = index + 1), a display ordinal and not a computed rank', async () => {
+  it('numbers rows by served index (ORD = index + 1), a display ordinal and not a computed rank', async () => {
     stubSeason200();
     await panel();
     expect(screen.getAllByTestId('season-ord').map((el) => el.textContent)).toEqual(['1', '2', '3', '4']);
@@ -242,6 +247,22 @@ describe('H5.2 exploratory season — provisional standings, zero skill claim', 
     await panel();
     expect(seasonWire.rows.some((r) => r.qualified)).toBe(true); // the fixture really does vary here
     expect(screen.queryAllByTestId('season-qualified-badge')).toHaveLength(0);
+  });
+
+  it('appends the 40-trial-gate suffix to the combo line, and ONLY in the exploratory state', async () => {
+    // PROOFARENA-EXACT-COPY.md:51 — verbatim, leading separator included.
+    stubSeason200({ season_status: 'exploratory', rows: exploratoryRows });
+    await panel();
+    expect(screen.getByTestId('season-combo')).toHaveTextContent('· below the 40-trial gate');
+
+    // Discrimination control (C52): the suffix is a claim that this season did NOT clear the gate,
+    // so a qualified season carrying it would state the opposite of its own status. A screen that
+    // appended it unconditionally would pass the assertion above and die here.
+    cleanup();
+    vi.unstubAllGlobals();
+    stubSeason200();
+    await panel();
+    expect(screen.getByTestId('season-combo')).not.toHaveTextContent('below the 40-trial gate');
   });
 
   it('still renders the provisional standings — exploratory is not an empty state', async () => {
@@ -358,8 +379,7 @@ describe('H5.2 a transport failure is never rendered as a season verdict', () =>
   });
 
   it('renders a loading state carrying no placeholder results', () => {
-    // Never resolves — the screen is pinned in its loading state for the whole assertion.
-    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch);
+    stubNeverResolvingFetch();
     render(<SeasonScreen />);
     expect(screen.getByTestId('season-panel')).toHaveAttribute('data-state', 'loading');
     expect(screen.getByText('LOADING · NO PLACEHOLDER RESULTS SHOWN')).toBeInTheDocument();
@@ -381,12 +401,34 @@ describe('H5.2 language and honesty boundary', () => {
     /\bbuy\b/i, /\bsell\b/i, /\brecommend/i,
   ];
 
+  // C44(b) scopes the banned-language check to the RENDERED OUTPUT of the route — which is ALL SIX
+  // states, not just the two that carry a table. The empty and error states are precisely where
+  // reassuring or fabricated language is most tempting, so they are the ones most worth pinning.
+  //
+  // Each case declares the state it MEANS to exercise and the helper asserts the screen actually
+  // reached it (C52 acceptance control). Without that, a case whose stub silently produced
+  // `unavailable` instead of `no_season` would still pass the banned-word check while covering the
+  // wrong state entirely — a parametrisation that measures nothing it claims to.
   it.each([
     ['qualified', () => stubSeason200()],
     ['exploratory', () => stubSeason200({ season_status: 'exploratory', rows: exploratoryRows })],
-  ])('uses no banned trading language in the %s render', async (_name, stub) => {
+    ['no_season', () => stubRoutes({ season: SEASON_404, health: () => jsonResponse({ ok: true, season_state: 'no_season' }) })],
+    ['not_built', () => stubRoutes({ season: SEASON_404, health: () => jsonResponse({ ok: true, season_state: 'not_built' }) })],
+    ['unavailable', () => stubRoutes({ season: () => errorResponse(500, 'boom') })],
+    ['loading', () => stubNeverResolvingFetch()],
+  ] as const)('uses no banned trading language in the %s render', async (state, stub) => {
     stub();
-    await panel();
+    render(<SeasonScreen />);
+    const el = await screen.findByTestId('season-panel');
+    if (state === 'loading') {
+      // The stub never resolves, so the screen is pinned in `loading` — waiting for it to leave
+      // that state would hang rather than assert.
+      expect(el).toHaveAttribute('data-state', 'loading');
+    } else {
+      await waitFor(() => expect(el).toHaveAttribute('data-state', state));
+    }
+    // The whole document, not just the panel: the title, lead and lead-sub render in every state.
+    // `textContent` also includes collapsed <details> content, so the probe-counts copy is covered.
     const text = document.body.textContent ?? '';
     for (const re of BANNED) expect(text).not.toMatch(re);
   });
