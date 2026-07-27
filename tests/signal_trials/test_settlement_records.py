@@ -79,6 +79,7 @@ from veridex.api.signal_trials_schemas import (
 )
 from veridex.signal_trials.challenge_spec import CanonicalSignal
 from veridex.signal_trials.live import (
+    DECLARED_COST_BPS,
     FETCH_GRACE_MS,
     MARKOUT_CAP_BPS,
     AgentRecord,
@@ -101,6 +102,7 @@ from veridex.signal_trials.receipts import (
     _OUTCOMES_DIRNAME,
     OUTCOME_FIELDS,
     OUTCOME_PROVENANCE_FIELDS,
+    SETTLED_ONLY_FIELDS,
     SETTLEMENT_FIELDS,
     SETTLEMENT_LAW_VERSION,
     VERIFY_COMMIT_CHECKS,
@@ -112,6 +114,9 @@ from veridex.signal_trials.receipts import (
     SettledTrial,
     TrialOutcome,
     verify_receipt,
+)
+from veridex.signal_trials.receipts import (
+    DECLARED_COST_BPS as RECEIPTS_DECLARED_COST_BPS,
 )
 from veridex.signal_trials.spot_markout import SpotMarkoutError, spot_markout
 
@@ -1415,6 +1420,388 @@ def test_the_LIMIT_of_the_law_re_derivation_is_pinned_rather_than_implied(
     )
 
 
+# ==================================================================================================
+# SPEC N1 — cost_bps was a law INPUT with an available referent and no predicate binding it.
+#
+# `_law_outputs_reproduce` recomputes both markout legs using cost_bps READ FROM THE ROW IT IS
+# VERIFYING. A re-derivation whose inputs all come from the artifact under test proves only that
+# the artifact agrees with itself. Measured at b92ac7a: drop cost_bps to 0, restate the legs, and
+# all eight checks pass while a published capped_avg_markout_bps moves 375 -> 400 — the entire
+# declared cost removed from an agent's record.
+#
+# This is NOT the declared `future` boundary, and the distinction is the finding. `future` has no
+# independent record anywhere, which is what makes declaring it legitimate. cost_bps HAS one in
+# this build: DECLARED_COST_BPS = 25, section 8.2. A field with an available referent is bindable
+# and therefore must be bound.
+# ==================================================================================================
+
+
+def test_the_declared_cost_constant_matches_the_trial_module() -> None:
+    """``receipts`` cannot import ``live`` — ``live`` imports ``receipts`` — so 25 is spelled twice.
+
+    Same coupling, and same risk, as the ``LIVE_TRIAL_MODE`` pin in ``test_receipts.py``. If §8.2's
+    cost is ever revised on one side only, every honest recorded outcome starts reporting
+    ``outcome_source: fail`` — fail-closed, but wrong, and this is what makes that a caught edit
+    rather than a mystery.
+    """
+    assert RECEIPTS_DECLARED_COST_BPS == DECLARED_COST_BPS == 25
+
+
+def test_a_SELF_CONSISTENT_forgery_off_a_free_cost_is_caught(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """N1 exactly: the row is internally perfect and inflates a published score by the whole cost.
+
+    Both legs are restated from the forged cost, so every relation among the row's own fields
+    holds — recomputing from its own ``cost_bps`` reproduces its own legs. It fails only because
+    ``cost_bps`` is anchored to §8.2's declared value rather than to itself.
+
+    The published consequence is asserted, not assumed: the FOLLOW leg an agent's
+    ``capped_avg_markout_bps`` is computed from moves by exactly the declared cost.
+    """
+    free = spot_markout(ENTRY, FUTURE, 0)
+    for field, value in (
+        ("cost_bps", 0),
+        ("follow_markout_bps", free.follow_markout_bps),
+        ("fade_markout_bps", free.fade_markout_bps),
+        ("follow_profitable", free.follow_profitable),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    # INTERNALLY CONSISTENT: the forged row re-derives its own legs from its own cost.
+    recomputed = spot_markout(row["entry"], row["future"], row["cost_bps"])
+    assert (recomputed.follow_markout_bps, recomputed.fade_markout_bps) == (
+        row["follow_markout_bps"],
+        row["fade_markout_bps"],
+    )
+    # AND THE FORGERY IS REAL: the follow leg is inflated by the entire declared cost.
+    assert row["follow_markout_bps"] == FOLLOW_BPS + COST_BPS == 400
+    assert build_agent_record(PAYER, store).capped_avg_markout_bps == 400
+    # AND IT IS CAUGHT.
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+@pytest.mark.parametrize(
+    "forged", [0, 10, 50, -25, "25", None], ids=["zero", "ten", "fifty", "negative", "string", "null"]
+)
+def test_a_recorded_outcome_may_carry_NO_COST_but_the_declared_one(
+    settled_receipt: CommitRecord, store: _TamperableStore, forged: Any
+) -> None:
+    """Every non-declared cost is refused, including the other three sweep values.
+
+    ``[0, 10, 25, 50]`` is a diagnostic DISPLAY and never a recorded outcome, which is what makes
+    the binding to a single value correct rather than over-strict. The negative row would also be
+    refused by the law's own guard; it is here so the check does not depend on that happening.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.cost_bps", value=forged)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+# ==================================================================================================
+# SPEC N2 — a status forgery ERASES a score and reports the benign `pending`.
+#
+# `_outcome_checks` gates on status BEFORE ANY PREDICATE RUNS, so status is the one field that
+# switches the checks off. A single-field settled -> UNSCORED edit moved settled 1 -> 0 and
+# avg_brier 0.04 -> None with four `pending` and no fail. Erasure rather than fabrication, and the
+# cheapest forgery on this surface.
+#
+# The fix is the asymmetry the forged row leaves behind: an honest non-settled row is all-None on
+# every settled-only field, so a row claiming UNSCORED while still carrying future=0.013,
+# follow_markout_bps=375 and follow_profitable=True is not merely unverified — it is INCONSISTENT.
+# ==================================================================================================
+
+
+@pytest.mark.parametrize(
+    "forged_status",
+    ["UNSCORED", "pending", "not_a_status", "", None, 1],
+    ids=["unscored", "pending", "unknown-string", "empty", "null", "int"],
+)
+def test_a_status_forgery_that_leaves_settled_VALUES_behind_is_caught(
+    settled_receipt: CommitRecord, store: _TamperableStore, forged_status: Any
+) -> None:
+    """One field, and the score is gone. The row's own metrics are what report it.
+
+    The first two rows are the real forgery — both are legal statuses, so nothing downstream
+    objects — and the rest are values outside the frozen triple, which are not states this law
+    produces and are refused for that reason alone.
+
+    ``outcome_source`` fails ALONE and the other three stay ``pending``. That is attribution, not
+    an omission: ``bar_version``, ``law_version`` and ``evidence_equality`` are gated on a settled
+    outcome and computed nothing here, so failing them would assert the bar and the law were wrong
+    on the evidence of a field neither of them reads.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.status", value=forged_status)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(
+        bar_version="pending", law_version="pending", evidence_equality="pending", outcome_source="fail"
+    )
+
+
+def test_the_status_forgery_ERASES_a_published_score_and_the_checks_say_so(
+    store: _TamperableStore, series_1m: CandleSeries
+) -> None:
+    """N2 end to end: the erasure is real, and it is reported.
+
+    Asserted in both halves for the same reason the CRITICAL test is: a check that caught a tamper
+    which changed nothing would not be worth having. The record loses its settled row and its
+    Brier entirely — this forgery does not move a score, it deletes one — and an agent whose bad
+    prediction simply vanishes from their record is the cheapest possible way to look calibrated.
+    """
+    receipt = _commit(store, _trial(), staging_id="s_erase", p=0.8)
+    store.record_outcome(TRIAL_ID, _settled_outcome_from(series_1m))
+
+    intact = build_agent_record(PAYER, store)
+    assert (intact.settled, intact.pending) == (1, 0)
+    assert intact.avg_brier == pytest.approx((0.8 - 1) ** 2)
+    assert _verdict(receipt.receipt_id, store) == _clean()
+
+    store.tamper(receipt.receipt_id, field="outcome.status", value="UNSCORED")
+
+    erased = build_agent_record(PAYER, store)
+    assert (erased.settled, erased.unscored) == (0, 1), "the score was not actually erased"
+    assert erased.avg_brier is None and erased.capped_avg_markout_bps is None
+    assert _verdict(receipt.receipt_id, store) == _clean(
+        bar_version="pending", law_version="pending", evidence_equality="pending", outcome_source="fail"
+    )
+
+
+@pytest.mark.parametrize("field", SETTLED_ONLY_FIELDS)
+def test_EACH_settled_only_field_left_behind_is_enough_to_report_the_forgery(
+    settled_receipt: CommitRecord, store: _TamperableStore, field: str
+) -> None:
+    """A forger who blanks all but ONE of the settled-only fields is still caught by that one.
+
+    The row is flipped to UNSCORED and every settled-only field is nulled EXCEPT ``field``, so each
+    parametrization asserts that this field alone carries the signature. Without this, a shape
+    check that only read ``future`` would pass the whole table above.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.status", value="UNSCORED")
+    for other in SETTLED_ONLY_FIELDS:
+        if other != field:
+            store.tamper(settled_receipt.receipt_id, field=f"outcome.{other}", value=None)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(
+        bar_version="pending", law_version="pending", evidence_equality="pending", outcome_source="fail"
+    )
+
+
+@pytest.mark.parametrize(
+    "forged_status", ["not_a_status", "", None, 1, "SETTLED"], ids=["unknown", "empty", "null", "int", "wrong-case"]
+)
+def test_a_status_OUTSIDE_THE_FROZEN_TRIPLE_is_refused_even_when_the_shape_is_clean(
+    settled_receipt: CommitRecord, store: _TamperableStore, forged_status: Any
+) -> None:
+    """The frozen-triple check, bound independently of the shape check.
+
+    Every row in the table above leaves settled VALUES behind, so the shape check alone catches all
+    of them and the membership test is never the thing being exercised — deleting it left the suite
+    green, which a mutation run found. Here the forger blanks every settled-only field first, so the
+    shape is impeccable and the STATUS is the only thing wrong with the row.
+
+    ``"SETTLED"`` is the row that matters most: it is one keystroke from a legal value, reads as
+    correct to a human, and is not a state this law produces.
+    """
+    for field in SETTLED_ONLY_FIELDS:
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=None)
+    store.tamper(settled_receipt.receipt_id, field="outcome.status", value=forged_status)
+
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    assert all(row.get(field) is None for field in SETTLED_ONLY_FIELDS), "the shape must be clean"
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(
+        bar_version="pending", law_version="pending", evidence_equality="pending", outcome_source="fail"
+    )
+
+
+@pytest.mark.parametrize("status", ["pending", "UNSCORED"], ids=["pending", "unscored"])
+def test_an_HONEST_non_settled_outcome_still_reports_four_pending(
+    committed_receipt: CommitRecord, store: _TamperableStore, status: str
+) -> None:
+    """ACCEPTANCE CONTROL for the whole N2 block, and the row that stops it over-reaching.
+
+    Every test above asserts a ``fail`` on a non-settled row; a shape check that failed EVERY
+    non-settled row would satisfy all of them while telling every honest agent whose trial has not
+    settled yet that their receipt does not verify. These outcomes come from the production
+    settlement path, so they carry whatever shape the law actually produces rather than one this
+    test asserted into existence.
+    """
+    trial = _trial()
+    now_ms = T0 + 60_000 if status == "pending" else T + 60_000 + FETCH_GRACE_MS
+    settled = _settle(trial, _empty_series(), now_ms=now_ms)
+    assert settled.outcome.status == status
+    store.record_outcome(committed_receipt.trial_id, settled)
+    assert _verdict(committed_receipt.receipt_id, store) == _unsettled()
+
+
+def test_the_LIMIT_of_the_status_check_is_pinned_rather_than_implied(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """A FULLY consistent erasure is indistinguishable from an honest UNSCORED, and that is declared.
+
+    A forger who flips the status AND blanks every settled-only field produces a row byte-identical
+    to one the settler would have written for a trial that genuinely never settled. Nothing in the
+    outcome row is bound to the market, so no predicate here can separate them.
+
+    Declared in the same spirit as the ``future`` boundary above: what is closed is the single-field
+    edit, and what remains costs the forger the entire settlement record rather than one word. If a
+    later change makes this row fail, the gap has been closed and this test should be REPLACED by
+    one asserting that — not deleted quietly.
+    """
+    store.tamper(settled_receipt.receipt_id, field="outcome.status", value="UNSCORED")
+    for field in SETTLED_ONLY_FIELDS:
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=None)
+    assert _verdict(settled_receipt.receipt_id, store) == _unsettled(), (
+        "a fully consistent erasure is the DOCUMENTED limit of the status check"
+    )
+
+
+# ==================================================================================================
+# FOUND BY THE C63 COVERAGE MATRIX — horizon_ms was the THIRD field of N1's class.
+#
+# Not reported by SPEC. The field-driven matrix built for N1/N2 found it on its first run: a
+# boundary input the row supplies about itself, with an available referent (FROZEN_HORIZON_MS,
+# section 8.3) that `settle_trial` hard-codes rather than accepts. `bar` and `t0_ms` came out of the
+# same run and are DECLARED rather than bound — see the tests below for why each is different.
+# ==================================================================================================
+
+
+@pytest.mark.parametrize(
+    "forged", [1_800_000, 7_200_000, 0, "3600000", None], ids=["half", "double", "zero", "string", "null"]
+)
+def test_a_forged_HORIZON_does_not_verify(settled_receipt: CommitRecord, store: _TamperableStore, forged: Any) -> None:
+    """The horizon is §8.3's frozen 1h, and a recorded outcome may claim no other."""
+    store.tamper(settled_receipt.receipt_id, field="outcome.horizon_ms", value=forged)
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_a_SELF_CONSISTENT_forgery_off_a_different_horizon_is_caught(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """The discriminating row: the lag is restated, so every other boundary relation still holds.
+
+    ``lag == close_ts - (t0 + horizon)`` is satisfied for ANY ``(t0, horizon)`` pair summing to the
+    same target, so a forger who halves the horizon and restates the lag leaves the arithmetic
+    perfect. It fails only because the horizon is anchored to the frozen constant — which is what
+    a lone-field probe cannot show, since a lone horizon edit breaks the lag and is caught for the
+    wrong reason.
+    """
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    forged_horizon = FROZEN_HORIZON_MS // 2
+    # The candle is slid too. Restating only the LAG leaves it outside the half-open window, which
+    # the boundary refuses for its own reason -- and a test that stopped there would pass with the
+    # horizon binding deleted. A mutation run confirmed exactly that.
+    target = row["t0_ms"] + forged_horizon
+    for field, value in (
+        ("horizon_ms", forged_horizon),
+        ("settlement_ts_open_ms", target - row["bar_ms"]),
+        ("close_ts_ms", target),
+        ("observation_lag_ms", 0),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+
+    forged_row = store.outcome_payload(TRIAL_ID)
+    assert forged_row is not None
+    # INTERNALLY CONSISTENT: every boundary relation holds against the claimed horizon.
+    assert forged_row["close_ts_ms"] == forged_row["settlement_ts_open_ms"] + forged_row["bar_ms"]
+    assert forged_row["observation_lag_ms"] == forged_row["close_ts_ms"] - (
+        forged_row["t0_ms"] + forged_row["horizon_ms"]
+    )
+    assert 0 <= forged_row["observation_lag_ms"] < forged_row["bar_ms"]
+    # It fails ONLY because the horizon is anchored to the frozen constant.
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
+def test_the_DECLARED_bar_limit_is_pinned_rather_than_implied(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """``bar_version`` checks pair MEMBERSHIP, not matrix SELECTION, and that gap is declared.
+
+    Moving BOTH halves to the other legal pair and restating the boundary produces a row that
+    passes. It is declared rather than closed because the only artifact naming the selected bar is
+    the published season, and a season is REPUBLISHED — a verifier bound to it would start failing
+    every earlier season's receipts, which is the same defect as consulting the live trial store.
+    The selection is enforced at the writer instead, where it is decidable and permanent.
+
+    No score moves here, and that is part of the disposition: no markout leg reads the bar. If a
+    later change closes this, REPLACE this test rather than deleting it.
+    """
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    target = row["t0_ms"] + row["horizon_ms"]
+    for field, value in (
+        ("bar", "1H"),
+        ("bar_ms", BAR_MS["1H"]),
+        ("settlement_ts_open_ms", target - BAR_MS["1H"]),
+        ("close_ts_ms", target),
+        ("observation_lag_ms", 0),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(), (
+        "a consistent move to the other frozen pair is the DECLARED limit of bar_version"
+    )
+    # The score is untouched, which is why this is a provenance claim and not a scoring one.
+    assert build_agent_record(PAYER, store).avg_brier == pytest.approx((0.8 - 1) ** 2)
+
+
+def test_the_DECLARED_t0_limit_is_pinned_rather_than_implied(
+    settled_receipt: CommitRecord, store: _TamperableStore
+) -> None:
+    """``t0_ms`` has no referent this verifier may reach, and the row states which two it rules out.
+
+    Not the evidence's ``t0_ms``: ``open_live_trial`` permits the signal's observation time and the
+    trial's open time to differ, so comparing them would fail honest rows. Not the live trial store:
+    a check that needed it could only verify recent commitments.
+
+    The fixture is built with the two times EQUAL, so this test would pass by accident if the
+    verifier did compare them — the assertion below pins that they are equal in the fixture, making
+    the limit a real statement rather than an artefact of the data.
+
+    The forger must also SLIDE THE CANDLE, and that is a genuine part of the disposition rather
+    than a detail of the fixture. Moving ``t0`` alone pushes the lag outside the half-open window
+    and IS caught — for the window's reason, not for ``t0``'s — so what passes is a forger who
+    restates the whole settlement narrative: a different open time, a different settlement candle,
+    a consistent boundary. That is the cost, and it is why the gap is narrow enough to declare.
+    """
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    assert row["t0_ms"] == row["evidence"]["t0_ms"], "the fixture must have the two times equal"
+
+    shifted = row["t0_ms"] - 600_000
+    target = shifted + row["horizon_ms"]
+    for field, value in (
+        ("t0_ms", shifted),
+        ("settlement_ts_open_ms", target - row["bar_ms"]),
+        ("close_ts_ms", target),
+        ("observation_lag_ms", 0),
+    ):
+        store.tamper(settled_receipt.receipt_id, field=f"outcome.{field}", value=value)
+
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(), (
+        "a fully restated t0 and candle is the DECLARED limit of the close-boundary check"
+    )
+
+
+def test_moving_t0_ALONE_is_still_caught_by_the_window(settled_receipt: CommitRecord, store: _TamperableStore) -> None:
+    """DISCRIMINATION for the declared limit above: the cheap version of that forgery IS reported.
+
+    Declaring a limit is only honest if the limit is as narrow as claimed. Shifting ``t0`` by ten
+    minutes without moving the candle leaves a lag of ten minutes on a one-minute bar, which the
+    half-open window refuses. So the declared gap costs the forger the settlement candle too.
+    """
+    row = store.outcome_payload(TRIAL_ID)
+    assert row is not None
+    shifted = row["t0_ms"] - 600_000
+    store.tamper(settled_receipt.receipt_id, field="outcome.t0_ms", value=shifted)
+    store.tamper(
+        settled_receipt.receipt_id,
+        field="outcome.observation_lag_ms",
+        value=row["close_ts_ms"] - (shifted + row["horizon_ms"]),
+    )
+    assert _verdict(settled_receipt.receipt_id, store) == _clean(outcome_source="fail")
+
+
 def test_the_recorded_SETTLEMENT_SOURCE_is_verified_against_the_sealed_evidence(
     settled_receipt: CommitRecord, store: _TamperableStore
 ) -> None:
@@ -2468,6 +2855,7 @@ def _settle_run(
     publish: bool = True,
     season_chain: str = CHAIN_INDEX,
     season_bar: str = "1m",
+    extra: tuple[str, ...] | list[str] = (),
 ) -> tuple[int, _StubMarketClient]:
     """Publish ``trial``, run the operator once, and return its exit status and the fetch log.
 
@@ -2491,6 +2879,7 @@ def _settle_run(
             bar,
             "--now-ms",
             str(T + FROZEN_HORIZON_MS),
+            *extra,
         ]
     )
     return exit_code, client
@@ -2683,3 +3072,88 @@ def test_settle_trial_REFUSES_to_record_a_settlement_that_states_no_source() -> 
         settle_trial(_trial(), _series(), now_ms=T + FROZEN_HORIZON_MS)  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="source_endpoint"):
         settle_trial(_trial(), _series(), now_ms=T + FROZEN_HORIZON_MS, chain_index=CHAIN_INDEX)  # type: ignore[call-arg]
+
+
+def test_a_run_at_a_NON_DECLARED_COST_is_refused_before_it_can_record(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The writer half of N1's binding, and the reason the flag is not now a trap.
+
+    ``outcome_source`` binds a recorded ``cost_bps`` to §8.2's declared 25. Without a matching
+    refusal at the writer, ``--cost-bps 50`` would record a TERMINAL outcome that can never verify
+    — a permanently unverifiable artifact produced by a documented flag, which is a worse failure
+    than the one the binding fixes.
+    """
+    exit_code, client = _settle_run(
+        settle_operator,
+        monkeypatch,
+        tmp_path,
+        trial=_trial(),
+        chain_index=CHAIN_INDEX,
+        bar="1m",
+        extra=["--cost-bps", "50"],
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert client.calls == [], "the run reached the network before checking a cost it could not record"
+    assert "--cost-bps 50 is not the declared cost 25" in captured.err
+    assert ReceiptStore(tmp_path).outcome(TRIAL_ID) is None
+
+
+def test_the_diagnostic_SWEEP_still_runs_under_dry_run(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DISCRIMINATION for the refusal above: the flag is refused for a WRITE, not for a display.
+
+    ``[0, 10, 25, 50]`` is a diagnostic sweep the constant explicitly preserves, and a gate that
+    refused every non-declared cost outright would delete it. ``--dry-run`` computes and prints and
+    writes nothing, so it is the state where a non-declared cost is harmless — and the assertion
+    that nothing was recorded is what makes that claim rather than assumes it.
+    """
+    exit_code, client = _settle_run(
+        settle_operator,
+        monkeypatch,
+        tmp_path,
+        trial=_trial(),
+        chain_index=CHAIN_INDEX,
+        bar="1m",
+        extra=["--cost-bps", "50", "--dry-run"],
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert client.calls == [(CHAIN_INDEX, _trial().sig.token_address, "1m")], "the sweep must still fetch"
+    summary = json.loads(captured.out)
+    (row,) = summary["trials"]
+    assert row["status"] == "settled" and row["recorded"] is False
+    assert ReceiptStore(tmp_path).outcome(TRIAL_ID) is None, "a dry run wrote a terminal outcome"
+
+
+def test_a_run_at_the_DECLARED_cost_records_and_the_row_verifies(
+    settle_operator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ACCEPTANCE CONTROL: the settler and the verifier agree on the declared cost end to end.
+
+    The two constants are pinned to each other by a unit test, but that pin is a statement about
+    two literals. This is the statement about the SYSTEM: a row the real operator wrote is a row
+    the real verifier accepts, so the binding cannot be satisfied by a writer and a reader that
+    happen to disagree with the same number.
+    """
+    store = _TamperableStore(tmp_path)
+    receipt = _commit(store, _trial(), staging_id="s_declared")
+    exit_code, _ = _settle_run(
+        settle_operator,
+        monkeypatch,
+        tmp_path,
+        trial=_trial(),
+        chain_index=CHAIN_INDEX,
+        bar="1m",
+        extra=["--cost-bps", str(DECLARED_COST_BPS)],
+    )
+    assert exit_code == 0, capsys.readouterr().err
+
+    stored = store.outcome_payload(TRIAL_ID)
+    assert stored is not None and stored["cost_bps"] == DECLARED_COST_BPS
+    # The whole point: a row the REAL operator wrote passes the REAL verifier's cost binding.
+    assert _verdict(receipt.receipt_id, store) == _clean()

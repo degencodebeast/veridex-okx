@@ -272,6 +272,31 @@ def assert_run_matches_selection(args: argparse.Namespace, selection: Mapping[st
         raise SelectionError("this run does not match the published season selection: " + "; ".join(wrong))
 
 
+def assert_cost_is_recordable(args: argparse.Namespace) -> None:
+    """Refuse to RECORD an outcome at any cost but §8.2's declared one.
+
+    ``--cost-bps`` exists for the ``[0, 10, 25, 50]`` diagnostic sweep, which
+    :data:`~veridex.signal_trials.live.DECLARED_COST_BPS` says is a display and never the recorded
+    outcome. The verifier now holds that line — ``outcome_source`` binds the row's ``cost_bps`` to
+    the declared value, because otherwise the row supplies both the input and its own authority
+    and a forger can remove the whole cost from a published markout.
+
+    That binding turns the flag into a trap unless the writer honours the same rule: a run at
+    ``--cost-bps 50`` would happily record a TERMINAL outcome that can never verify. So the flag is
+    still accepted for a ``--dry-run``, which computes and prints and writes nothing, and refused
+    for a run that would write. Fail closed at the writer, exactly as the coverage gate does.
+
+    Raises:
+        SelectionError: A non-declared cost was supplied for a run that would record.
+    """
+    if args.cost_bps != DECLARED_COST_BPS and not args.dry_run:
+        raise SelectionError(
+            f"--cost-bps {args.cost_bps} is not the declared cost {DECLARED_COST_BPS} (section 8.2), and a "
+            "recorded outcome may carry no other; re-run with --dry-run for the diagnostic sweep, or "
+            "drop the flag to settle"
+        )
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(
@@ -467,6 +492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         selection = selected_combo(data_dir)
         assert_run_matches_selection(args, selection)
+        assert_cost_is_recordable(args)
     except (SelectionError, ValueError) as error:
         print(f"aborted before any request: {error}", file=sys.stderr)
         return 2

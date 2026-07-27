@@ -71,6 +71,7 @@ from pydantic import BaseModel
 from veridex.chain.anchor import run_manifest_hash
 from veridex.signal_trials.challenge_spec import CanonicalSignal, evidence_hash, visible_at_decision
 from veridex.signal_trials.okx_client import BAR_MS, HISTORICAL_CANDLES_PATH
+from veridex.signal_trials.preflight import FROZEN_HORIZON_MS
 from veridex.signal_trials.spot_markout import spot_markout
 
 #: The slot states, as runtime values. ``SlotState`` is erased at runtime, so membership tests
@@ -89,6 +90,21 @@ INDETERMINATE_STATES: Final[frozenset[str]] = frozenset({"settle_attempted", "qu
 #: imports THIS module, so the dependency only runs one way. ``test_the_live_mode_constant_matches
 #: _the_trial_module`` is what keeps the two copies equal.
 LIVE_TRIAL_MODE: Final[str] = "live"
+
+#: The ONLY ``cost_bps`` a RECORDED outcome may carry — §8.2's official 25.
+#:
+#: A second local copy of a ``live`` constant, for the same one-way-dependency reason as
+#: :data:`LIVE_TRIAL_MODE` and held to it by ``test_the_declared_cost_constant_matches_the_trial
+#: _module``. ``live.DECLARED_COST_BPS`` says it in the other direction: the ``[0, 10, 25, 50]``
+#: sweep is a DIAGNOSTIC DISPLAY and never the recorded outcome.
+#:
+#: It is here because ``cost_bps`` is a law INPUT that :func:`_law_outputs_reproduce` reads FROM
+#: THE ROW IT IS VERIFYING, and a re-derivation whose inputs all come from the artifact under test
+#: proves only that the artifact is self-consistent. Both markout legs are computed from this
+#: value, so a forger who lowers it and restates the legs inflates a published markout by the whole
+#: declared cost with every check passing. Unlike ``future``, this input HAS a referent in this
+#: build — so it is bound to it, and the row's own copy is evidence rather than authority.
+DECLARED_COST_BPS: Final[int] = 25
 
 #: How each field of the payer's canonical commit body is recovered from a finalized record,
 #: as ``body field -> stored record key``.
@@ -139,6 +155,20 @@ VERIFY_COMMIT_CHECKS: Final[tuple[str, ...]] = ("body_hash", "manifest", "deadli
 #:     The recorded ``(bar, bar_ms)`` is one of the §5.1 frozen pairs. A season uses ONE bar and
 #:     never mixes them, so a width that does not belong to its own label is not a settlement this
 #:     law produced.
+#:
+#:     **What it does NOT bind, stated so the name cannot be over-read:** that this is the
+#:     MATRIX-SELECTED pair for this trial's season. It checks membership, not selection. A forger
+#:     who moves BOTH halves to the other legal pair and restates the close boundary produces a row
+#:     that passes — a settlement claiming the 1H bar when it was made on 1m. No score moves, since
+#:     no markout leg reads the bar; what moves is the claim about which candle settled the trial.
+#:
+#:     This is a DECLARED limit rather than an unbound field, and the reason it cannot be closed
+#:     HERE is the one that governs the whole verifier: the only artifact naming the selected bar is
+#:     the published season, and a season is republished. A check bound to it would start failing
+#:     every receipt from an earlier season the moment a new one is published, which is the same
+#:     defect as consulting the live trial store. The selection is therefore enforced where it is
+#:     decidable and permanent — at the WRITER, by ``settle_live_trials.assert_run_matches_selection``,
+#:     which refuses the run before any candle is fetched.
 #: ``law_version``
 #:     The outcome was produced under the law this build implements. A record settled under an
 #:     older law is not wrong, but it is not re-derivable HERE, and saying so is the honest report.
@@ -252,6 +282,41 @@ TrialStatus = Literal["pending", "settled", "UNSCORED"]
 #: The statuses no later write may replace. ``UNSCORED`` is an ANSWER — "the window closed with no
 #: settlement candle" — not the absence of one, so it is as final as a settled price.
 TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({"settled", "UNSCORED"})
+
+#: The three statuses, as runtime values. ``TrialStatus`` is erased at runtime, so the VERIFIER
+#: needs this alongside it: it reads raw stored rows, and a status outside the triple is not a
+#: state this law can produce, which is a finding rather than a fourth kind of pending.
+TRIAL_STATUSES: Final[frozenset[str]] = frozenset({"pending", "settled", "UNSCORED"})
+
+#: The outcome fields a NON-SETTLED row must leave ``None``, and the asymmetry that makes a status
+#: forgery detectable.
+#:
+#: :func:`~veridex.signal_trials.live.settle_trial_outcome` returns every one of these as ``None``
+#: unless a settlement candle was found — ``pending`` and ``UNSCORED`` carry IDENTICAL all-``None``
+#: metrics and differ only in ``status``. So a row claiming either state while carrying a
+#: settlement price, a markout leg or a verdict is not merely unverified: it is INCONSISTENT, and
+#: no honest writer in this codebase could have produced it.
+#:
+#: That is what closes the cheapest forgery on this surface. ``status`` is the one field that
+#: switches the outcome checks off, so a single-field ``settled -> UNSCORED`` edit ERASES a
+#: participant's score — settled 1 -> 0, a real Brier -> ``None`` — and the four checks report the
+#: benign ``pending``. The forger who does not also blank these fields leaves the signature this
+#: tuple names.
+#:
+#: ``entry`` is deliberately ABSENT: it is sealed at ``t0`` and is populated in every status, so
+#: requiring it to be ``None`` would fail every honest pending trial.
+#:
+#: ``settlement_ts_open_ms`` is included and is provenance rather than outcome: a row that settled
+#: against no candle cannot name the candle it settled against.
+SETTLED_ONLY_FIELDS: Final[tuple[str, ...]] = (
+    "future",
+    "close_ts_ms",
+    "observation_lag_ms",
+    "follow_markout_bps",
+    "fade_markout_bps",
+    "follow_profitable",
+    "settlement_ts_open_ms",
+)
 
 #: The display stance derived from a payer's own probability (§8.1). Never submitted, never a
 #: Veridex-originated recommendation (§3.8) — a rendering of what the caller themselves sent.
@@ -766,8 +831,14 @@ def _exact_float(value: Any) -> float | None:
 def _close_boundary_reproduces(row: dict[str, Any]) -> bool:
     """Return whether the stored close boundary re-derives from the stored settlement candle.
 
-    Three relations, all of §7, and each catches something the others do not:
+    Four relations, all of §7, and each catches something the others do not:
 
+    * ``horizon_ms == FROZEN_HORIZON_MS`` — §8.3's frozen 1h ranking horizon, which
+      :func:`~veridex.signal_trials.live.settle_trial` hard-codes rather than accepts. Like
+      ``cost_bps``, this is a boundary INPUT the row supplies about itself, and it has an available
+      referent — so it is bound to it. Without this, the other three relations hold for any
+      ``(t0, horizon)`` pair summing to the same target: a forger moves the horizon, restates the
+      lag, and publishes a settlement claiming a different measurement window.
     * ``close_ts == ts_open + bar_ms`` — OKX's ``ts`` is the candle OPEN, so the close is one bar
       later.
     * ``observation_lag == close_ts - (t0 + horizon)`` — the displayed lag is not an independent
@@ -775,6 +846,15 @@ def _close_boundary_reproduces(row: dict[str, Any]) -> bool:
       close would understate how late a settlement was.
     * ``0 <= lag < bar_ms`` — the half-open eligibility window. A candle a full bar or more late is
       not the bar that first closed after ``T``.
+
+    **``t0_ms`` is NOT bound, and this is where that is declared.** The trial's open instant has no
+    referent this function may reach. It is not the evidence's ``t0_ms``: ``open_live_trial``
+    explicitly permits the signal's observation time and the trial's open time to differ, so
+    comparing them would fail honest rows. The live trial store does record it, and consulting it is
+    the one thing :func:`verify_receipt` may not do — a check that needed the trial store could only
+    verify recent commitments, which is the property that makes a historical receipt verifiable at
+    all. A forger who moves ``t0_ms`` and restates the lag therefore passes; what they change is the
+    claimed measurement window, not any score, since no markout leg reads it.
 
     Every input is required to be an exact ``int``. A missing or non-integer field is ``False``:
     a boundary nothing can re-derive has not been shown to re-derive.
@@ -787,7 +867,12 @@ def _close_boundary_reproduces(row: dict[str, Any]) -> bool:
     horizon_ms = _exact_int(row.get("horizon_ms"))
     if close_ts is None or ts_open is None or lag is None or bar_ms is None or t0_ms is None or horizon_ms is None:
         return False
-    return close_ts == ts_open + bar_ms and lag == close_ts - (t0_ms + horizon_ms) and 0 <= lag < bar_ms
+    return (
+        horizon_ms == FROZEN_HORIZON_MS
+        and close_ts == ts_open + bar_ms
+        and lag == close_ts - (t0_ms + horizon_ms)
+        and 0 <= lag < bar_ms
+    )
 
 
 def _law_outputs_reproduce(row: dict[str, Any]) -> bool:
@@ -815,15 +900,31 @@ def _law_outputs_reproduce(row: dict[str, Any]) -> bool:
     ``1`` where the writer stored ``true`` is a ``fail``: the two are equal in Python and are not
     the same artifact.
 
-    **The boundary this check does NOT reach, stated rather than implied.** ``future`` is the only
-    law input with no independent record — the settlement candle's close price is not attested by
-    anything else on disk — so an adversary who rewrites ``future`` AND recomputes both legs and
-    the verdict consistently produces a self-consistent row that re-derives perfectly. What is
-    closed is the far commoner and far cheaper forgery: changing a RESULT without changing its
-    inputs. Attesting ``future`` itself would need a signed candle from the venue, which §7 does not
-    provide and this function cannot invent. ``settlement_ts_open_ms`` and the close boundary do pin
-    WHICH candle was claimed, so the surviving forgery has to restate an entire coherent settlement
-    rather than nudge one number.
+    **Every law input is bound to a referent OUTSIDE the row, except one, and this names it.** A
+    re-derivation whose inputs all come from the artifact under test proves only that the artifact
+    agrees with itself, which is a property any competent forger can restore. So each input is
+    anchored where an anchor exists:
+
+    * ``entry`` -> the sealed evidence's ``trigger_price``, bound by its own hash;
+    * ``cost_bps`` -> :data:`DECLARED_COST_BPS`, §8.2's official 25, which is the only cost a
+      RECORDED outcome may carry. Without this the row's own copy was both the input and its own
+      authority: dropping it to 0 and restating the legs inflates a published
+      ``capped_avg_markout_bps`` by the entire declared cost — 375 to 400 on the fixture — with all
+      eight checks passing. A lone ``cost_bps`` edit was always caught, because the stale legs stop
+      re-deriving; that is precisely why a tamper matrix drawn from the CHECK list reported this
+      field as covered while a forger walked through it;
+    * ``future`` -> NOTHING. The settlement candle's close price is not attested by any second
+      artifact on disk, so an adversary who rewrites ``future`` AND recomputes both legs and the
+      verdict from it produces a row that re-derives perfectly. This is a DECLARED boundary and not
+      an oversight, and the difference from ``cost_bps`` is the whole reason it can be declared: a
+      field with an available referent is bindable and therefore must be bound, and ``future`` has
+      none. Attesting it needs a signed candle from the venue, which §7 does not provide and this
+      function cannot invent.
+
+    What is closed either way is the far commoner and far cheaper forgery: changing a RESULT
+    without changing its inputs. ``settlement_ts_open_ms`` and the close boundary pin WHICH candle
+    was claimed, so the surviving forgery has to restate an entire coherent settlement rather than
+    nudge one number.
 
     Total by construction, in the same sense as :func:`_evidence_reproduces`: every way the
     re-derivation can fail over untrusted parsed JSON is ``False``. ``ValueError`` covers a
@@ -839,7 +940,7 @@ def _law_outputs_reproduce(row: dict[str, Any]) -> bool:
     cost_bps = _exact_int(row.get("cost_bps"))
     if entry is None or trigger_price is None or future is None or cost_bps is None:
         return False
-    if entry != trigger_price:
+    if entry != trigger_price or cost_bps != DECLARED_COST_BPS:
         return False
     try:
         markout = spot_markout(entry, future, cost_bps)
@@ -1662,21 +1763,51 @@ class ReceiptStore:
                 path.unlink(missing_ok=True)
 
 
+def _unsettled_shape_holds(row: dict[str, Any]) -> bool:
+    """Return whether a NON-SETTLED outcome row carries the all-``None`` metrics its state requires.
+
+    See :data:`SETTLED_ONLY_FIELDS` for why the asymmetry exists and what it catches. Absent keys
+    count as ``None``: a row that never wrote the field is not claiming a settlement with it.
+    """
+    return all(row.get(field) is None for field in SETTLED_ONLY_FIELDS)
+
+
 def _outcome_checks(payload: dict[str, Any], store: ReceiptStore) -> dict[str, CheckState]:
     """Evaluate the four SETTLEMENT-TIME checks for the receipt row ``payload``.
 
-    Three states are reachable here and each says something different:
+    Four states are reachable here and each says something different:
 
-    * **No outcome row, or one that is not ``settled``** -> four ``pending``. Nothing has been
-      shown to be wrong; there is simply no settlement to re-derive. This covers a recorded
-      ``UNSCORED`` outcome too, and that is a deliberate LIMIT rather than an oversight — see
+    * **No outcome row, or an HONEST non-settled one** -> four ``pending``. Nothing has been shown
+      to be wrong; there is simply no settlement to re-derive. This covers a recorded ``UNSCORED``
+      outcome too, and that is a deliberate LIMIT rather than an oversight — see
       :data:`CheckState`, and note that the participant ``status`` served beside these checks is
       what distinguishes "not yet" from "never".
+    * **A non-settled row that CONTRADICTS ITSELF** -> ``outcome_source`` ``fail``, the other three
+      ``pending``. ``status`` is the one field that switches the other checks off, which makes a
+      single-field ``settled -> UNSCORED`` edit the cheapest forgery on this surface: it ERASES a
+      participant's score — settled 1 -> 0, a real Brier -> ``None`` — and every check reports the
+      benign ``pending``. What the forger leaves behind is a row claiming no settlement while still
+      carrying a settlement price, both markout legs and a verdict, which no writer in this
+      codebase can produce (:data:`SETTLED_ONLY_FIELDS`). A status outside :data:`TRIAL_STATUSES`
+      is refused the same way and for the same reason: it is not a state this law produces.
+
+      Only ``outcome_source`` fails, and the other three stay ``pending`` rather than joining it,
+      because attribution means each check reports what IT found. ``bar_version``,
+      ``law_version`` and ``evidence_equality`` are gated on a settled outcome and computed
+      nothing here; failing them would assert the bar and the law were wrong on the evidence of a
+      field neither of them reads.
     * **An outcome row that EXISTS and is unreadable** -> four ``fail``. Same reading
       :func:`verify_receipt` already applies to an unreadable receipt row: a row that exists and
       re-derives nothing is exactly what ``fail`` means, and ``pending`` would claim no settlement
       had been recorded when one was recorded and then destroyed.
     * **A settled outcome** -> each check reports what IT found, independently.
+
+    **What a consistent status forgery still costs and still hides**, stated rather than implied: a
+    forger who ALSO blanks every :data:`SETTLED_ONLY_FIELDS` value produces a row byte-identical to
+    an honest ``UNSCORED`` one, and nothing here can tell them apart — the outcome row is not bound
+    to the market. That residual is declared in the same spirit as ``future``: what is closed is
+    the single-field edit, and what remains requires the forger to destroy the whole settlement
+    record rather than flip one word.
 
     An unreadable RECEIPT row never reaches here (:func:`verify_receipt` short-circuits), because
     a row that cannot be read cannot name its trial — so no outcome could be looked up, and
@@ -1699,8 +1830,13 @@ def _outcome_checks(payload: dict[str, Any], store: ReceiptStore) -> dict[str, C
         row = store.outcome_payload(trial_id)
     except ValueError:
         return dict.fromkeys(VERIFY_OUTCOME_CHECKS, "fail")
-    if row is None or row.get("status") != "settled":
+    if row is None:
         return pending
+    status = row.get("status")
+    if status != "settled":
+        if status in TRIAL_STATUSES and _unsettled_shape_holds(row):
+            return pending
+        return {**pending, "outcome_source": "fail"}
     bar = row.get("bar")
     bar_ms = _exact_int(row.get("bar_ms"))
     verdicts: dict[str, bool] = {
