@@ -365,20 +365,49 @@ function TrialHead({ trial }: { trial: TrialCard }) {
         PAPER BENCHMARK — NOT A TRADE RECOMMENDATION
       </p>
 
+      {/* THE RAIL — and the line this section had to be rewritten to respect.
+          Two kinds of sentence want to live here and they are NOT the same claim:
+
+            CONSTRUCTION — what this trial record IS. It carries one sealed evidence payload, one
+            commit deadline, one settlement law, one outcome. True from the record alone, true
+            whatever any verdict says, and stated unconditionally below.
+
+            VERIFICATION — what is true OF A PARTICULAR RECEIPT: that it really re-derives against
+            that record, really binds this trial, really arrived before the deadline. NOTHING on
+            this rail can establish those. Only the per-receipt checks can, and they report one
+            verdict at a time.
+
+          This rail previously asserted the SECOND kind unconditionally — "IDENTICAL FOR EVERY
+          AGENT", "every agent … committed before the same deadline", "the rail is the fairness
+          claim". Those sentences stayed on screen while a receipt's `deadline_respected` read
+          `fail`, so the card asserted as fact the exact thing its own verifier had just denied.
+
+          The fix is ATTRIBUTION, not gating. Hiding this copy when some check fails would require
+          computing "did everything pass" — an aggregate, and the same defect with the opposite
+          sign. So the construction is stated outright and every per-receipt claim is handed to the
+          checks below, which is why this copy is correct in all four verdict states at once. */}
       <div className={styles.rail}>
         <p className={styles.panelLabel}>SHARED EVIDENCE RAIL</p>
         <p className={styles.panelSub}>ONE SNAPSHOT · ONE DEADLINE · ONE LAW · ONE OUTCOME</p>
         <div className={styles.hashChip}>
           <span className={styles.hashLabel}>⬢ SEALED EVIDENCE</span>
           {/* The hash renders in full. A truncation the card invented is a value the backend never
-              served, and this chip is the one thing every agent's commitment is bound to. */}
+              served, and this chip is the record every commitment is scored against. */}
           <code className={styles.hash} data-testid="trial-evidence-hash">{trial.evidenceHash}</code>
-          <span className={styles.hashLabel}>IDENTICAL FOR EVERY AGENT</span>
+          {/* Was "IDENTICAL FOR EVERY AGENT" — a claim about what each receipt is bound to, which
+              is `manifest`'s finding and not this chip's. This states the record instead. */}
+          <span className={styles.hashLabel}>ONE RECORD · ONE HASH</span>
         </div>
         <p className={styles.footNote}>
-          Every agent below received byte-identical visible_at_decision evidence under one hash,
-          committed before the same deadline, and is settled by one law against one candle. The rail
-          is the fairness claim.
+          This trial has one sealed evidence payload, one commit deadline and one settlement law,
+          and they are what every commitment below is scored against. That is the structure of the
+          record, not a finding about any receipt.
+        </p>
+        <p className={styles.footNote}>
+          Whether a given commitment actually re-derives against this record — that its body
+          re-hashes, that it binds the trial it names, and that it arrived before the deadline — is
+          not asserted here. The Fair-Play checks below report it per receipt, one independent
+          verdict at a time.
         </p>
         <p className={styles.footNote}>
           t0 {trial.t0Ms} · one commit deadline {trial.commitDeadlineMs}
@@ -658,11 +687,16 @@ function ParticipantsBody({ state }: { state: ParticipantsState }) {
             Every check reports independently as pass / fail / pending. There is no single aggregate
             badge — one pending or failed check is never absorbed into a green summary.
           </p>
+          {/* Was "They certify that the benchmark was produced correctly" — an unconditional
+              aggregate success claim sitting six lines under this file's own rule that no failed
+              check is absorbed into a green summary. What the checks do is REPORT; what they
+              report is scoped to the one receipt each verdict sits under. */}
           <p className={styles.footNote}>
             These are reproducibility checks over recorded evidence: they re-derive each
-            receipt&apos;s commit-time and settlement-time claims from the stored artifacts. They
-            certify that the benchmark was produced correctly, and they say nothing about how a
-            submitted probability scored.
+            receipt&apos;s commit-time and settlement-time claims from the stored artifacts and
+            report independently whether those claims re-derive. A verdict is a finding about the
+            receipt it sits under and nothing else — it establishes nothing about any other
+            receipt, and it says nothing about how a submitted probability scored.
           </p>
         </>
       );
@@ -710,8 +744,11 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
       data-receipt-status={receipt.status}
     >
       <p className={styles.panelLabel}>FAIR-PLAY CHECKS · {receipt.payer}</p>
+      {/* Was "was this benchmark produced correctly?". Interrogative, so it asserted nothing — but
+          it puts the aggregate phrasing on screen beside eight independent verdicts, and a reader
+          skimming a screenshot does not parse a question mark. Scoped to this receipt instead. */}
       <p className={styles.panelSub}>
-        was this benchmark produced correctly? · receipt status {receipt.status}
+        does this receipt&apos;s record re-derive? · receipt status {receipt.status}
         {receipt.status === 'pending'
           ? ' — outcome-time checks cannot be evaluated until a candle exists'
           : ''}

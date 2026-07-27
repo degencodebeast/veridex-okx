@@ -533,6 +533,133 @@ describe('H5.3 Fair-Play checks', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GROUP E2 — the card never asserts what its own checks have not established
+// ---------------------------------------------------------------------------
+// THE DEFECT THIS GROUP EXISTS FOR. The card used to state, unconditionally and in prose:
+// "IDENTICAL FOR EVERY AGENT", "Every agent below received byte-identical evidence … committed
+// before the same deadline", "The rail is the fairness claim", and that the checks "certify that
+// the benchmark was produced correctly". Those sentences stayed on screen while a receipt's
+// `deadline_respected` read `fail` — so the card asserted as fact the very thing its own verifier
+// had just denied, six lines under its own rule that no failed check is absorbed into a green
+// summary.
+//
+// The existing `body_hash: fail` test (GROUP E) proved the scenario was reachable and did not
+// notice the contradiction: it asserted the failure was VISIBLE and never asked what the rest of
+// the card was simultaneously claiming.
+//
+// WHY THE ALL-PASS CASE IS PINNED HERE TOO, and it is the load-bearing choice in this group.
+// Asserting the absence only on a `fail` would be satisfied by gating the prose on "every check
+// passed" — which is an AGGREGATE, the same defect wearing the opposite sign, and it is forbidden.
+// Pinning the absence when all eight PASS forecloses that fix and forces the only honest one:
+// the card states what is true BY CONSTRUCTION (one record, one deadline, one law) unconditionally,
+// and ATTRIBUTES every per-receipt claim to the verdicts instead of asserting it.
+const UNCONDITIONAL_FAIRNESS_CLAIMS: RegExp[] = [
+  /identical for every agent/i,
+  /committed before the same deadline/i,
+  /produced correctly/i,
+  /certif/i,
+  /the rail is the fairness claim/i,
+  /every agent (below |above )?received/i,
+];
+
+// Present in the honest replacement, absent from the claim-asserting version. Without this the
+// group is a pile of negatives that a card rendering NOTHING would satisfy (C52).
+const ATTRIBUTION = /one independent verdict at a time/i;
+
+function verifyRoute(checks: Record<string, W.SignalTrialsCheckStatusWire>): Route {
+  return (url) => {
+    const id = decodeURIComponent(url.split('/signal-trials/receipts/')[1]?.split('/')[0] ?? '');
+    return jsonResponse(verifyWire(id, checks));
+  };
+}
+
+describe('H5.3 the card never asserts a fairness claim its own checks have not established', () => {
+  it('asserts NONE of them when deadline_respected FAILS — and still shows the failure', async () => {
+    const panel = await participants({
+      verify: verifyRoute({ ...ALL_EIGHT, deadline_respected: 'fail' }),
+    });
+    // ACCEPTANCE CONTROL: the failed verdict must remain VISIBLE. A card that "fixed" this by
+    // hiding the failure would satisfy every negative below and be far worse.
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    const row = within(group).getAllByTestId('check-row')[2];
+    expect(row).toHaveAttribute('data-key', 'deadline_respected');
+    expect(row).toHaveAttribute('data-status', 'fail');
+
+    const text = document.body.textContent ?? '';
+    // `deadline_respected` is precisely the check that establishes "committed before the same
+    // deadline". While it reads `fail`, the card must not be asserting it.
+    for (const claim of UNCONDITIONAL_FAIRNESS_CLAIMS) {
+      expect(text, `card asserts ${claim} while deadline_respected reads fail`).not.toMatch(claim);
+    }
+    expect(text).toMatch(ATTRIBUTION);
+  });
+
+  it('asserts none of them when a check is NOT SERVED — an absent verdict establishes nothing', async () => {
+    const { deadline_respected: _dropped, ...missing } = ALL_EIGHT;
+    const panel = await participants({ verify: verifyRoute(missing) });
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    expect(within(group).getAllByTestId('check-row')[2]).toHaveAttribute('data-status', 'not_served');
+
+    const text = document.body.textContent ?? '';
+    for (const claim of UNCONDITIONAL_FAIRNESS_CLAIMS) {
+      expect(text, `card asserts ${claim} while deadline_respected was not served`).not.toMatch(claim);
+    }
+    expect(text).toMatch(ATTRIBUTION);
+  });
+
+  it('asserts none of them when verification is UNAVAILABLE for a receipt', async () => {
+    const panel = await participants({
+      verify: (url) => {
+        const id = decodeURIComponent(url.split('/signal-trials/receipts/')[1]?.split('/')[0] ?? '');
+        return id === 'rcpt_1' ? jsonResponse({ error: 'boom' }, 500) : jsonResponse(verifyWire(id));
+      },
+    });
+    expect(within(panel).getAllByTestId('fairplay-checks')[0])
+      .toHaveAttribute('data-checks-state', 'unavailable');
+
+    const text = document.body.textContent ?? '';
+    for (const claim of UNCONDITIONAL_FAIRNESS_CLAIMS) {
+      expect(text, `card asserts ${claim} while a receipt could not be verified`).not.toMatch(claim);
+    }
+    expect(text).toMatch(ATTRIBUTION);
+  });
+
+  // THE ONE THAT FORECLOSES AN AGGREGATE-GATED "FIX". See the block comment above.
+  it('asserts none of them even when ALL EIGHT PASS — attributed, never gated on an aggregate', async () => {
+    const panel = await participants({ verify: verifyRoute(ALL_PASS) });
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    expect(within(group).getAllByTestId('check-row').map((r) => r.getAttribute('data-status')))
+      .toEqual(Array(SIGNAL_TRIALS_CHECK_KEYS.length).fill('pass'));
+
+    const text = document.body.textContent ?? '';
+    // A card that gated the prose on "all eight passed" would render the claims HERE and pass the
+    // three tests above. This is what makes that solution die.
+    for (const claim of UNCONDITIONAL_FAIRNESS_CLAIMS) {
+      expect(text, `card asserts ${claim} once every check passes — that is an aggregate`).not.toMatch(claim);
+    }
+    expect(text).toMatch(ATTRIBUTION);
+  });
+
+  // The construction-true half must SURVIVE the rewrite. The trial really does carry one evidence
+  // record, one deadline and one law; deleting those statements to satisfy the negatives above
+  // would strip the card of its actual content, which is the other way to fail this finding.
+  it('still states the construction — one record, one deadline, one law — under a failed check', async () => {
+    await participants({ verify: verifyRoute({ ...ALL_EIGHT, deadline_respected: 'fail' }) });
+    expect(screen.getByTestId('trial-evidence-hash')).toHaveTextContent(trialWire.evidence_hash);
+    const text = document.body.textContent ?? '';
+    // These two phrases belong ONLY to the construction sentences. An earlier draft of this test
+    // asserted `/one sealed evidence|one commit deadline|one settlement law/` — and the middle
+    // alternative also matches the raw `t0 … one commit deadline {value}` line further down, so
+    // deleting the construction sentence entirely left the test GREEN. Caught by mutation M-R3,
+    // which is the whole reason this test exists in a group full of negatives: it is the guard
+    // against satisfying those negatives by deleting the card's actual content.
+    expect(text).toContain('one sealed evidence payload');
+    expect(text).toMatch(/not a finding about any receipt/i);
+    expect(text).toContain(String(trialWire.commit_deadline_ms));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GROUP F — the markout table (element 4)
 // ---------------------------------------------------------------------------
 describe('H5.3 markout table', () => {
