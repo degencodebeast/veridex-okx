@@ -93,14 +93,17 @@ FROZEN_DECLARED_COST_BPS = 25
 #: Where packs live under the signal-trials data directory.
 PACKS_DIRNAME = "packs"
 
-#: The width of each bar in the frozen matrix. The NAMES are pinned by ``COMBO_ORDER`` and the
-#: widths are the OKX candle bars those names denote; ``test_frozen_bar_ms_covers_the_frozen_matrix``
-#: is what fails if the matrix ever names a bar this table does not price.
+#: What each frozen bar name is WORTH in milliseconds. A PRICING table, and nothing else: it is not
+#: the authority on which bars exist. Adding an entry here must not widen any guard, because a
+#: hand-added ``"4H"`` would otherwise admit a bar the frozen matrix can never select.
+#: ``test_frozen_bar_ms_covers_the_frozen_matrix`` fails if the matrix names a bar this cannot price.
 FROZEN_BAR_MS: dict[str, int] = {"1m": 60_000, "1H": 3_600_000}
 
-#: The chains the frozen matrix can select, DERIVED from ``COMBO_ORDER`` rather than restated, so a
-#: change to the frozen matrix cannot leave this guard behind.
+#: The chains and bars the frozen matrix can select. BOTH are DERIVED from ``COMBO_ORDER`` — the one
+#: authority — rather than restated, so widening the matrix cannot leave either guard behind, and
+#: adding a row to the pricing table above cannot widen this one.
 FROZEN_CHAINS: frozenset[str] = frozenset(chain for chain, _bar in COMBO_ORDER)
+FROZEN_BARS: frozenset[str] = frozenset(bar for _chain, bar in COMBO_ORDER)
 
 #: The season statuses that authorize a seal. ``no_season`` is handled before this is consulted, so
 #: these are the whole remainder of the ``SeasonStatus`` domain — a value outside it is a corrupted
@@ -119,10 +122,12 @@ class NonSealable:
 def non_sealable_reason(artifact: Mapping[str, Any]) -> NonSealable | None:
     """Return why ``artifact`` must not be sealed, or ``None`` when it may be.
 
-    The three conditions are checked in this order because the artifact's own key order guarantees a
-    reader reaches ``probe_status`` first (``preflight.py:703-706``), and because a probe that never
-    ran carries a null ``season_status`` AND a null combo — reporting it under the later, narrower
-    reasons would describe the artifact rather than the run.
+    SIX conditions, in this order: probe status, ``no_season``, a null combo, season-status
+    membership, chain membership, bar membership. C48 named the first three; the last three were
+    added later and the order still matters for the same reason. The artifact's own key order
+    guarantees a reader reaches ``probe_status`` first (``preflight.py:703-706``), and a probe that
+    never ran carries a null ``season_status`` AND a null combo — reporting it under any of the
+    later, narrower reasons would describe the artifact rather than the run.
 
     Returns:
         A :class:`NonSealable` naming the state to publish and the reason, or ``None`` for a
@@ -179,13 +184,21 @@ def non_sealable_reason(artifact: Mapping[str, Any]) -> NonSealable | None:
             f"chain_index {chain_index!r} is not in the frozen matrix {sorted(FROZEN_CHAINS)}: "
             f"a season may only be sealed against a market the frozen probe could have selected",
         )
-    if bar not in FROZEN_BAR_MS:
+    if bar not in FROZEN_BARS:
         return NonSealable(
             published.NOT_BUILT,
-            f"bar {bar!r} is not a frozen width {sorted(FROZEN_BAR_MS)}: "
+            f"bar {bar!r} is not a frozen width {sorted(FROZEN_BARS)}: "
             f"a season may only be sealed at a bar the frozen probe could have selected",
         )
 
+    # LATENT, stated so it is a decision rather than an oversight: the two axes are checked
+    # INDEPENDENTLY, while "a market the frozen probe could have selected" is a property of the
+    # PAIR. `COMBO_ORDER` is currently the full cross product {196,501} x {1m,1H}, so the two are
+    # equivalent. If it ever becomes non-rectangular, `(chain_index, bar) not in COMBO_ORDER`
+    # replaces both checks and is strictly stronger. It is not written that way today because the
+    # third branch it would need — a valid chain and a valid bar that are not a valid PAIR — cannot
+    # be reached under the current matrix, and an unreachable rejection reason is one that can
+    # silently become wrong (the hazard `preflight._screen`'s own docstring names).
     return None
 
 

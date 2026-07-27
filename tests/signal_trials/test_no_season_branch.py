@@ -129,7 +129,12 @@ class RecordingClient:
         # Answers at the width it was ASKED for. A fake that always returned 1m would make every
         # non-1m combo trip the mixed-bar guard for a reason the venue never caused, and would hide
         # whether the caller requests the right bar at all.
-        width = _BAR_MS_BY_NAME[bar]
+        #
+        # An UNKNOWN bar gets a nominal width rather than a KeyError. A real venue does not raise
+        # `KeyError` because this file has no row for a bar, and a fake that did would preempt the
+        # subject's own behaviour: the non-frozen-combo vectors would fail inside the HARNESS before
+        # the module under test ever decided anything.
+        width = _BAR_MS_BY_NAME.get(bar, BAR_MS)
         settle_ms = T0_MS + FROZEN_HORIZON_MS
         candles = tuple(
             Candle(settle_ms - width * offset, 1.0, 1.5, 0.5, 1.0 + offset, 10.0, 100.0, True) for offset in (1, 0)
@@ -472,9 +477,27 @@ async def test_a_corrupt_artifact_is_refused_rather_than_interpreted(tmp_path: P
 
 
 def test_frozen_bar_ms_covers_the_frozen_matrix() -> None:
-    """Every bar the frozen matrix can select has a width this module can price."""
+    """Every bar the frozen matrix can select has a width this module can price.
+
+    Subset, not equality: ``FROZEN_BAR_MS`` is a PRICING table and an extra row in it is harmless.
+    What must not happen is an extra row WIDENING a guard, which is what the next test pins.
+    """
     module = _fetch_and_seal_module()
     assert {bar for _chain, bar in COMBO_ORDER} <= set(module.FROZEN_BAR_MS)
+
+
+def test_the_membership_guards_derive_from_the_frozen_matrix() -> None:
+    """The combo guards' authority is ``COMBO_ORDER`` EXACTLY — not a table that happens to agree.
+
+    Asserted as equality against the matrix rather than by naming rejected strings. A guard pinned
+    only by the vectors that exercise it (``5m``, ``1D``, ``999``) is pinned for those strings and
+    not structurally: adding ``"4H"`` to a table the guard consulted would silently admit a bar the
+    frozen probe can never select, and no vector in this file names ``4H``. This is what makes the
+    pricing table unable to widen the guard, and it is why the two are separate objects.
+    """
+    module = _fetch_and_seal_module()
+    assert {bar for _chain, bar in COMBO_ORDER} == module.FROZEN_BARS
+    assert {chain for chain, _bar in COMBO_ORDER} == module.FROZEN_CHAINS
 
 
 async def test_a_series_at_the_wrong_width_is_refused(tmp_path: Path) -> None:
@@ -717,15 +740,22 @@ async def test_a_combo_outside_the_frozen_matrix_fetches_nothing(
 ) -> None:
     """A non-frozen chain or bar is non-sealable, and is refused before the first ``await``.
 
-    ASSERTED AS A CALL COUNT, not as a raise. An earlier revision checked the combo only for
-    ``is None``, so an artifact carrying ``bar: "5m"`` passed the guard, ran the ENTIRE fetch at the
-    bogus bar — one ``list_signals`` plus one ``get_candles`` per token — and was refused only at
-    seal time by ``frozen_bar_ms``. It failed closed, so a bare ``pytest.raises`` would have passed
-    throughout; only the call count can tell the two apart. On a credentialed run those were real
-    requests against a venue at a bar the frozen matrix never selects.
+    THE CALL COUNT IS THE DISCRIMINATOR, AND THE TEST IS ARRANGED SO THAT IT ACTUALLY IS ONE.
+    Without the ``try`` below it would not be: with the guard removed, these vectors fail by a
+    propagating exception — ``frozen_bar_ms`` at SEAL time, or the ``season_id`` traversal guard —
+    which reaches the test before any assertion runs. The mutants would still die, but by the same
+    exception mechanism the guard is supposed to make unnecessary, and the count would be decoration.
+    Catching first makes ``client.calls == []`` the assertion that fails, which is the claim: the
+    old behaviour ran the ENTIRE fetch at the bogus combo — one ``list_signals`` plus one
+    ``get_candles`` per token — and only then objected. On a credentialed run those were real
+    requests against a venue at a combo the frozen matrix never selects.
 
-    ``chain_index`` is covered by the same vector because it is fetched just as eagerly, and a guard
-    on one axis only would leave the module's stated invariant half true.
+    A refusal is also NOT a raise, and the second assertion pins that: a non-sealable artifact is
+    recorded and returns ``None`` like every other one, rather than propagating.
+
+    ``chain_index`` is covered by the same vector because it is fetched just as eagerly. Under the
+    unguarded chain it was strictly worse than the bar: the bar failed closed at ``frozen_bar_ms``,
+    while a non-frozen chain SEALED A PACK unless its id happened to be path-unsafe.
     """
     preflight_path = tmp_path / "preflight_result.json"
     data_dir = tmp_path / "data"
@@ -735,10 +765,17 @@ async def test_a_combo_outside_the_frozen_matrix_fetches_nothing(
     preflight_path.write_text(json.dumps(artifact), encoding="utf-8")
     client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
 
-    result = await run_fetch_and_seal(preflight_path, client, data_dir)
+    raised: Exception | None = None
+    result: Path | None = None
+    try:
+        result = await run_fetch_and_seal(preflight_path, client, data_dir)
+    except (ValueError, KeyError) as error:
+        raised = error
 
+    # FIRST, so it is the assertion that fails when the guard is removed.
+    assert client.calls == [], f"a non-frozen combo must fetch nothing (raised={raised!r})"
+    assert raised is None, f"a non-sealable combo must be RECORDED and refused, not raise: {raised!r}"
     assert result is None
-    assert client.calls == []
     assert _state_of(data_dir) == "not_built"
     assert needle in _reason_of(data_dir)
 
@@ -780,12 +817,28 @@ async def test_the_same_token_cooldown_decides_which_trials_are_sealed(tmp_path:
     2. **The window is a window** — a third signal on the same token OUTSIDE the window SURVIVES.
        Without this the test passes against "one trial per token, forever", a strictly wrong rule.
     3. **WHICH member survives** — the EARLIEST of each cluster, which ``_dedup_by_cooldown``
-       argues is the no-look-ahead choice a chronological replay reaches first. Without this,
-       keeping the latest — a look-ahead rule — satisfies 1 and 2.
+       argues is the no-look-ahead choice a chronological replay reaches first. Bound by token C,
+       and ONLY by token C. See below: this assertion was unbound in the first version of this test.
 
     Plus acceptance: a different token is untouched, so it cannot pass against a cooldown that eats
     everything. The window is half-open (exactly ``cooldown_ms`` apart survives), so the outside
     vector sits a full bar clear of the boundary rather than on it.
+
+    **WHY TOKEN C EXISTS, AND WHY TOKEN A CANNOT DO ITS JOB.** Token A's cluster is 0, +1h, +4h1m
+    against a 4h window, and it is SYMMETRIC under the transformation property 3 claims to detect::
+
+        |mid - first|  =  3_600_000 < 14_400_000   -> inside
+        |last - mid|   = 10_860_000 < 14_400_000   -> inside
+
+    The middle signal is inside the cooldown of BOTH neighbours, so it drops under an
+    earliest-first sweep and under a latest-first one alike, and the survivors are the two extremes
+    either way. Asserting ``a_offsets == [0, outside_ms]`` therefore holds under the correct rule
+    AND under its look-ahead inverse — it was passing property 3 for no reason at all. A two-member
+    cluster has no middle to be symmetric about, which is what makes the direction observable:
+    earliest-first keeps ``[0]``, latest-first keeps ``[inside_ms]``.
+
+    THE FIXTURE IS PART OF THE PREDICATE. A cluster symmetric under the transformation you are
+    trying to detect is exactly as blind as a control that cannot fire.
     """
     inside_ms = 3_600_000
     outside_ms = FROZEN_COOLDOWN_MS + BAR_MS
@@ -798,6 +851,10 @@ async def test_the_same_token_cooldown_decides_which_trials_are_sealed(tmp_path:
             _wire_signal(1, token="0xtokenA", offset_ms=inside_ms),
             _wire_signal(2, token="0xtokenA", offset_ms=outside_ms),
             _wire_signal(3, token="0xtokenB", offset_ms=inside_ms),
+            # An ASYMMETRIC cluster: two members, one window, no middle. This is the only vector
+            # here that can tell an earliest-first sweep from a latest-first one.
+            _wire_signal(4, token="0xtokenC", offset_ms=0),
+            _wire_signal(5, token="0xtokenC", offset_ms=inside_ms),
         )
     )
 
@@ -805,12 +862,15 @@ async def test_the_same_token_cooldown_decides_which_trials_are_sealed(tmp_path:
     assert result is not None
     pack = load_pack(read_pack_ref(result))
 
-    # 1 — four eligible signals in, three trials sealed.
-    assert len(pack.trials) == 3
-    # 2 and 3 — the token's surviving trials are the EARLIEST of each cluster, and the one beyond
-    # the window is one of them. The dropped signal is the middle one, inside the window.
+    # 1 — six eligible signals in, four trials sealed.
+    assert len(pack.trials) == 4
+    # 2 — the window is a window: token A's signal beyond it survives, the one inside it does not.
     a_offsets = sorted(trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenA")
     assert a_offsets == [0, outside_ms]
     assert inside_ms not in a_offsets
+    # 3 — NO LOOK-AHEAD: of two signals inside one window, the EARLIER survives. Keeping the later
+    # would be a rule that consults what happens after the decision point.
+    c_offsets = [trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenC"]
+    assert c_offsets == [0], f"expected the EARLIEST of the cluster to survive, got {c_offsets}"
     # ACCEPTANCE — a different token inside the same window is untouched.
     assert [trial.t0_ms - T0_MS for trial in pack.trials if trial.token_address == "0xtokenB"] == [inside_ms]
