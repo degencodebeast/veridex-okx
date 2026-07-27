@@ -7,6 +7,12 @@ out of scope for this task):
 - ``get_candles``   -> ``GET  /api/v6/dex/market/historical-candles`` (the frozen settlement
   source, design spec §7).
 
+Plus one write-nothing WS path, ``subscribe_one_signal`` (H2.5): subscribe to
+``dex-market-new-signal-openapi``, take the FIRST pushed signal, close. A signal that arrives this
+way and the same signal fetched over REST normalize to the same ``evidence_hash`` — that equality
+is what makes the live-exhibition and replay paths interchangeable as evidence, and it is enforced
+in ``tests/signal_trials/test_okx_client.py``, not merely intended here.
+
 Two trust-relevant properties this module is responsible for:
 
 1. **Bar provenance.** The candle wire rows carry no bar field, so ``CandleSeries.bar`` /
@@ -29,6 +35,7 @@ Normalization of the raw signal dicts is task H2.2 and deliberately does NOT hap
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -40,6 +47,17 @@ from urllib.parse import urlencode
 
 SIGNAL_LIST_PATH = "/api/v6/dex/market/signal/list"
 HISTORICAL_CANDLES_PATH = "/api/v6/dex/market/historical-candles"
+
+# The WS channel that pushes a new smart-money signal. Pinned as a constant and asserted on the
+# ARRIVING frame as well as the outgoing op: a push is only a signal if it came from this channel,
+# and everything returned from that channel is about to be labelled a WS arrival.
+WS_SIGNAL_CHANNEL = "dex-market-new-signal-openapi"
+
+# Control frames that are lawfully skipped while waiting for the first push. Deliberately a closed
+# set rather than a "skip anything unrecognized" rule: a one-shot subscriber that silently ignored
+# frames it did not understand would spin against a socket that is telling it something.
+_WS_SKIPPABLE_EVENTS = frozenset({"subscribe"})
+_WS_HEARTBEAT = "pong"
 
 # OKX signals application errors in the envelope `code`, not in the HTTP status, so an
 # `raise_for_status` in the transport cannot stand in for this check.
@@ -77,6 +95,14 @@ class OKXResponseError(OKXClientError, ValueError):
 
     Also a ``ValueError`` so that callers written against H2.1's documented malformed-row
     behaviour keep working.
+
+    **The ``ValueError`` base is part of the public contract, not an implementation detail**, and is
+    pinned by ``test_okx_response_error_is_a_value_error_because_the_module_promises_callers_it_is``
+    (MINOR-Q1). ``_finite_candle_number``'s ``Raises:`` section instructs callers to assert the
+    EXACT exception type *because* of this base; while nothing enforced it, removing the base left
+    the whole suite green and silently invalidated every caller written against that instruction.
+    ``OKXAPIError`` deliberately does NOT share it — a remote non-success verdict is not a malformed
+    local value — and that separation is pinned alongside.
     """
 
 
@@ -97,6 +123,26 @@ class Transport(Protocol):
         json_body: object | None,
         headers: dict[str, str],
     ) -> dict[str, Any]: ...
+
+
+class WSTransport(Protocol):
+    """One already-connected WS conversation, as text frames.
+
+    **The transport owns the connection AND its authentication.** ``subscribe_one_signal`` owns the
+    SUBSCRIPTION PROTOCOL only and never sees a credential. That split is deliberate on two counts:
+    the OKX WS handshake auth scheme for this channel is not among the wire facts this program has
+    verified, so signing one here would be a guess baked into the trust path; and a subscriber that
+    holds no credential cannot leak one, which is the property the exhibition script relies on.
+
+    ``recv`` yields ``str`` — a transport over a library that can deliver ``bytes`` decodes at its
+    own edge, so the frame parsing below has exactly one input type to reason about.
+    """
+
+    async def send(self, message: str) -> None: ...
+
+    async def recv(self) -> str: ...
+
+    async def close(self) -> None: ...
 
 
 @dataclass(frozen=True, repr=False)
@@ -239,6 +285,95 @@ def _rows(payload: dict[str, Any]) -> list[Any]:
     return list(data)
 
 
+def _ws_frame(text: str) -> dict[str, Any] | None:
+    """Parse one WS text frame. ``None`` means "heartbeat, keep waiting".
+
+    Fails closed for the same reason ``_rows`` does: a frame this module cannot read is not
+    evidence of anything, and treating it as "nothing arrived yet" would let a subscriber sit on a
+    socket that is actively telling it something is wrong.
+    """
+    if text == _WS_HEARTBEAT:
+        return None
+    try:
+        frame = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise OKXResponseError(f"WS frame is not JSON: {exc}") from exc
+    if not isinstance(frame, dict):
+        raise OKXResponseError(f"WS frame must be a JSON object, got {type(frame).__name__}")
+    return frame
+
+
+def _ws_signal(frame: dict[str, Any]) -> dict[str, Any]:
+    """Extract the first signal from a data push, or refuse the frame.
+
+    The channel identity is checked BEFORE the payload, and that ordering is the point rather than
+    a detail. A REST response replayed onto this path (``{"code": "0", "data": [...]}``) carries a
+    perfectly well-formed list of signal dicts; only the absent ``arg.channel`` distinguishes it
+    from a genuine push. Since everything returned here is about to be labelled a WS arrival, a
+    payload-first check would let a REST-sourced signal acquire a WS label — precisely the
+    mislabel the plan's truth rule forbids.
+
+    A push carrying several signals is lawful and only the first is taken: this path is the
+    one-shot exhibition, and the receipt records what was returned, not what the socket held.
+    """
+    arg = frame.get("arg")
+    channel = arg.get("channel") if isinstance(arg, dict) else None
+    if channel != WS_SIGNAL_CHANNEL:
+        raise OKXResponseError(
+            f"WS frame is not a push on {WS_SIGNAL_CHANNEL!r}; its channel is {channel!r}. "
+            "A signal is only a WS arrival if it arrived on the signal channel."
+        )
+    data = frame.get("data")
+    if not isinstance(data, list) or not data:
+        raise OKXResponseError(f"WS push must carry a non-empty 'data' list, got {data!r}")
+    signal = data[0]
+    if not isinstance(signal, dict):
+        raise OKXResponseError(f"WS signal must be a JSON object, got {type(signal).__name__}")
+    return signal
+
+
+async def _ws_converse(ws_transport: WSTransport, chain_index: str) -> dict[str, Any]:
+    """Send the subscribe op and return the first pushed signal. Does not close the transport."""
+    request = {"op": "subscribe", "args": [{"channel": WS_SIGNAL_CHANNEL, "chainIndex": chain_index}]}
+    await ws_transport.send(json.dumps(request, separators=(",", ":")))
+
+    while True:
+        frame = _ws_frame(await ws_transport.recv())
+        if frame is None:
+            continue
+        event = frame.get("event")
+        if event is None:
+            return _ws_signal(frame)
+        if event == "error":
+            # A remote verdict on a well-formed request, so `OKXAPIError` and not
+            # `OKXResponseError` — the same envelope/shape split `_rows` draws on the REST wire.
+            raise OKXAPIError(str(frame.get("code", "")), str(frame.get("msg", "")))
+        if event not in _WS_SKIPPABLE_EVENTS:
+            raise OKXResponseError(f"unexpected WS event {event!r} while waiting for a signal push")
+
+
+async def subscribe_one_signal(ws_transport: WSTransport, chain_index: str) -> dict[str, Any]:
+    """Subscribe, return the FIRST pushed signal dict, and close the transport. Credential-free.
+
+    The returned dict is the raw wire signal, untouched — normalization is
+    ``challenge_spec.normalize_signal`` and stays there, exactly as it does for ``list_signals``.
+
+    The close discipline is asymmetric on purpose. On the success path a failing ``close`` is a
+    real failure and propagates. On the failure path it is best-effort, because a socket-close
+    error raised from a ``finally`` REPLACES the exception being propagated: an ``OKXAPIError``
+    carrying OKX's own refusal code is the diagnosis, and losing it to a teardown error on a
+    connection that is being discarded anyway would trade the answer for the noise.
+    """
+    try:
+        signal = await _ws_converse(ws_transport, chain_index)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await ws_transport.close()
+        raise
+    await ws_transport.close()
+    return signal
+
+
 class OKXMarketClient:
     def __init__(self, transport: Transport, creds: OKXCredentials) -> None:
         self._transport = transport
@@ -359,3 +494,15 @@ class OKXMarketClient:
                 )
             )
         return CandleSeries(bar=bar, bar_ms=BAR_MS[bar], candles=tuple(candles))
+
+    async def subscribe_one_signal(self, ws_transport: WSTransport, chain_index: str) -> dict[str, Any]:
+        """The plan-frozen entry point (H2.1's ``Produces`` block), delegating to the module function.
+
+        Both spellings exist and are pinned as one behaviour by
+        ``test_the_client_METHOD_and_the_module_function_are_the_same_subscription``. The method is
+        kept because the plan freezes its signature; the module-level function is what
+        ``scripts/signal_trials/ws_exhibition.py`` calls, so the exhibition path needs no
+        ``OKXCredentials`` it would have no use for. This method reads no credential either — see
+        ``WSTransport`` for why the WS handshake, not the subscriber, owns authentication.
+        """
+        return await subscribe_one_signal(ws_transport, chain_index)

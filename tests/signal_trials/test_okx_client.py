@@ -1,17 +1,38 @@
+import functools
+import inspect
+import json
 import math
+import sys
+from importlib import util as importlib_util
+from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests.signal_trials.test_challenge_spec import REST as H22_REST
+from tests.signal_trials.test_challenge_spec import WS as H22_WS
+from veridex.signal_trials import okx_client
+from veridex.signal_trials.challenge_spec import evidence_hash, normalize_signal
 from veridex.signal_trials.okx_client import (
     BAR_MS,
     CANDLE_FIELD_COUNT,
     CandleSeries,
     OKXAPIError,
+    OKXClientError,
     OKXCredentials,
     OKXMarketClient,
     OKXResponseError,
     SignalFilters,
 )
+
+# H2.5's new names (`WS_SIGNAL_CHANNEL`, `subscribe_one_signal`) are reached through the MODULE
+# object above rather than added to this `from ... import` list, and that is load-bearing rather
+# than stylistic. `okx_client.py` is a MODIFY, so a behavioural RED is obtainable here: importing
+# the new names directly would raise ImportError at COLLECTION and take all 100+ existing tests in
+# this file down with it, which proves only that a name is absent. Through the module object the
+# file collects, every pre-existing test still runs and passes, and the new tests fail at RUNTIME
+# naming exactly the behaviour that is missing. Same test text before and after the implementation.
+# `test_challenge_spec.py` imports its module the same way for its own (monkeypatch) reason.
 
 
 class RecordingFake:
@@ -920,3 +941,572 @@ async def test_UNPARSEABLE_wire_values_still_propagate_their_ORIGINAL_exception_
     series = await control.get_candles("501", "So1", "1m")
     assert isinstance(series, CandleSeries)
     assert series.candles[0].open == 11.0
+
+
+# ======================================================================================
+# MINOR-Q1 (carried since H2.6 with the trigger "the next Data commit that opens
+# okx_client.py" — H2.5 IS that commit). `_finite_candle_number`'s docstring TELLS callers
+# that `OKXResponseError` subclasses `ValueError` and instructs test authors to assert the
+# EXACT type because of it. NOTHING PINNED THAT BASE: a reviewer rebuilt the class without
+# `ValueError` and 95 tests passed — the mutant SURVIVED. The measured `issubclass`-assertion
+# count naming `OKXResponseError` across all of `tests/` was 0.
+#
+# Precedent for the idiom, already in this package: `test_controls.py:183`,
+# `assert issubclass(FullPackClimatologyError, ValueError)`, under the rationale that an
+# exception's place in the hierarchy is part of its PUBLIC CONTRACT. Same rationale here, and
+# a stronger one: a documented instruction to callers that no test enforces is a promise the
+# code is free to break silently.
+# ======================================================================================
+
+
+def test_okx_response_error_is_a_value_error_because_the_module_promises_callers_it_is():
+    """The ACCEPTANCE half: the documented base is really there.
+
+    `_finite_candle_number`'s `Raises:` section states "``OKXResponseError`` is itself a
+    ``ValueError`` subclass, so a caller catching ``ValueError`` catches both". Callers written
+    against that sentence — including `test_UNPARSEABLE_wire_values_still_propagate_their_ORIGINAL_
+    exception_type` above, whose whole content is the `type(...) is ValueError` / `isinstance`
+    distinction — are silently wrong the moment the base is dropped.
+    """
+    assert issubclass(OKXResponseError, ValueError)
+    assert issubclass(OKXResponseError, OKXClientError)
+
+
+def test_the_value_error_base_DISCRIMINATES_and_is_not_just_true_of_every_error_here():
+    """The DISCRIMINATION half: `ValueError` is not simply painted onto the whole hierarchy.
+
+    Without this, the assertion above would pass just as happily against a module where every
+    exception descended from `ValueError` — in which case `issubclass(OKXResponseError, ValueError)`
+    would be measuring nothing about `OKXResponseError` in particular. `OKXAPIError` is the
+    separation: an OKX-side non-success envelope is a REMOTE verdict, not a malformed local value,
+    so it deliberately does NOT answer to a caller's `except ValueError`.
+    """
+    assert not issubclass(OKXAPIError, ValueError)
+    assert issubclass(OKXAPIError, OKXClientError)
+    assert not issubclass(OKXClientError, ValueError)
+
+
+# ======================================================================================
+# H2.5 — the one-shot WS exhibition path.
+#
+# THIS IS A WEBSOCKET TASK AND NOTHING BELOW OPENS A REAL CONNECTION. Every WS conversation
+# here is `RecordingWS`, an in-memory script of text frames. `socket` is never patched
+# (patching `socket.socket` wholesale breaks `ssl`'s subclassing at import), because no test
+# here goes anywhere near a socket to begin with.
+# ======================================================================================
+
+#: The channel name spelled out INDEPENDENTLY of the module's own `WS_SIGNAL_CHANNEL`, on
+#: purpose and for the same reason `test_no_season_branch.py` keeps its own bar-width table: a
+#: fake that imported the constant could not disagree with it, and disagreeing is exactly what
+#: `test_subscribe_one_signal_refuses_a_push_frame_from_a_DIFFERENT_channel` needs it to do.
+WS_CHANNEL_ON_THE_WIRE = "dex-market-new-signal-openapi"
+
+#: A chain index that is NOT the client's default anything, so a request that echoed a constant
+#: instead of the argument would be visible (the C21 pin's lesson, applied to the WS op).
+WS_CHAIN_INDEX = "501"
+
+
+class RecordingWS:
+    """A scripted, in-memory WS conversation. Records what was sent and how often it was closed.
+
+    `recv` raises rather than blocking or returning a sentinel when the script runs out: a
+    one-shot subscriber that asked for a frame the fake never promised is a defect in the
+    subscriber, and a test that hung instead of failing would report it as a timeout.
+    """
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.sent = []
+        self.closed = 0
+        self.recv_calls = 0
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def recv(self):
+        self.recv_calls += 1
+        if not self.frames:
+            raise AssertionError(
+                "the subscriber asked for more frames than the fake was scripted with; "
+                "a one-shot subscribe must stop at the first signal push"
+            )
+        return self.frames.pop(0)
+
+    async def close(self):
+        self.closed += 1
+
+
+def _ws_arg(channel=WS_CHANNEL_ON_THE_WIRE, chain_index=WS_CHAIN_INDEX):
+    return {"channel": channel, "chainIndex": chain_index}
+
+
+def _ws_ack(chain_index=WS_CHAIN_INDEX):
+    """The subscribe acknowledgement OKX sends before any push — lawfully skipped, never returned."""
+    return json.dumps({"event": "subscribe", "arg": _ws_arg(chain_index=chain_index), "connId": "conn-1"})
+
+
+def _ws_push(signal, channel=WS_CHANNEL_ON_THE_WIRE, chain_index=WS_CHAIN_INDEX):
+    """One data push frame carrying one signal on `channel`."""
+    return json.dumps({"arg": _ws_arg(channel=channel, chain_index=chain_index), "data": [signal]})
+
+
+def _ws_client():
+    """A client whose REST transport is a tripwire: the WS path must not touch it.
+
+    The payload is deliberately an error envelope, so any accidental REST call raises loudly
+    rather than returning something the WS assertions could absorb.
+    """
+    return OKXMarketClient(RecordingFake({"code": "50000", "msg": "the WS path must not call REST"}),
+                           OKXCredentials("k", "s", "p"))
+
+
+# --- The fixture is part of the predicate --------------------------------------------------
+# H2.2's REST/WS twin pair is REUSED rather than retyped, so the two cannot drift apart. But a
+# reused fixture still has to be CHECKED for the property the reuse depends on, because a pair
+# that turned out to be byte-identical dicts would make the hash-equality test below tautological.
+
+
+def test_the_reused_H22_twin_fixtures_really_are_a_TWIN_PAIR_and_not_the_same_dict():
+    """The REST and WS fixtures must differ in SPELLING while describing the SAME event.
+
+    If they were equal dicts, `test_a_ws_arrival_hashes_IDENTICALLY_to_its_rest_twin` would be
+    asserting `h(x) == h(x)` — true for every hash function including a constant one — and would
+    bind nothing at all. If they described different events, the equality it asserts would be
+    false for a CORRECT implementation. Both halves are checked here, at the fixture, so the
+    equality test downstream is known to be a real question before it is answered.
+    """
+    assert H22_REST != H22_WS, "the twins must differ, or the hash-equality test is tautological"
+    assert set(H22_REST) != set(H22_WS), "the twins must differ in KEY SPELLING, which is the thing normalized"
+    # ...and the difference must be confined to the alias spellings, not the observed values.
+    shared = set(H22_REST) & set(H22_WS) - {"token"}
+    assert shared, "the twins share no top-level fields; they cannot be describing one event"
+    for key in shared:
+        assert H22_REST[key] == H22_WS[key], f"twin fixtures disagree on the VALUE of {key!r}"
+
+
+# --- subscribe_one_signal: the one-shot subscription protocol ------------------------------
+
+
+async def test_subscribe_one_signal_returns_the_pushed_signal_and_CLOSES_the_transport():
+    """The H2.5 Step-1 contract: one push frame in, the parsed signal dict out, transport closed.
+
+    The close is asserted as hard as the return value. A one-shot exhibition that returned its
+    signal but left the socket open would look completely correct in every downstream assertion
+    while leaking a connection per demo run.
+    """
+    ws = RecordingWS([_ws_ack(), _ws_push(H22_WS)])
+
+    signal = await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert signal == H22_WS
+    assert ws.closed == 1
+    assert ws.frames == [], "the subscriber must stop at the FIRST push, not drain the socket"
+
+
+async def test_subscribe_one_signal_sends_the_REQUESTED_channel_and_chain_not_a_constant():
+    """The op frame must carry the caller's chain index and the signal channel.
+
+    The C21 pin's lesson: a request built from a hard-coded constant passes every test that only
+    inspects the RESPONSE. Here it would silently subscribe the wrong chain and exhibit a signal
+    from a market nobody asked about.
+    """
+    ws = RecordingWS([_ws_push(H22_WS, chain_index="196")])
+
+    await okx_client.subscribe_one_signal(ws, "196")
+
+    assert len(ws.sent) == 1
+    op = json.loads(ws.sent[0])
+    assert op["op"] == "subscribe"
+    assert op["args"] == [{"channel": WS_CHANNEL_ON_THE_WIRE, "chainIndex": "196"}]
+    # The module's own constant must be the one that reached the wire, not a coincidence.
+    assert okx_client.WS_SIGNAL_CHANNEL == WS_CHANNEL_ON_THE_WIRE
+
+
+async def test_subscribe_one_signal_raises_the_OKX_ERROR_EVENT_rather_than_waiting_forever():
+    """An `event: error` frame is a remote verdict — `OKXAPIError`, carrying its code.
+
+    Not `OKXResponseError`: the frame is perfectly well-formed, OKX is simply refusing. This is
+    the same envelope/shape split the REST path draws, and the discrimination test above is what
+    makes the two distinguishable to a caller.
+    """
+    ws = RecordingWS([json.dumps({"event": "error", "code": "60012", "msg": "Invalid request"})])
+
+    with pytest.raises(OKXAPIError) as excinfo:
+        await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert excinfo.value.code == "60012"
+    assert ws.closed == 1, "the transport must be closed on the failure path too, not only on success"
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pytest.param('{"code":"0","data":[{"timestamp":"1"}]}', id="rest-envelope"),
+        pytest.param('{"arg":{"chainIndex":"501"},"data":[{"timestamp":"1"}]}', id="push-without-channel"),
+        pytest.param('{"arg":{"channel":"dex-market-new-signal-openapi"}}', id="push-without-data"),
+        pytest.param('{"arg":{"channel":"dex-market-new-signal-openapi"},"data":[]}', id="push-with-empty-data"),
+        pytest.param('{"arg":{"channel":"dex-market-new-signal-openapi"},"data":["not-an-object"]}', id="row-not-object"),
+        pytest.param("[]", id="frame-not-an-object"),
+        pytest.param("{{not json", id="frame-not-json"),
+    ],
+)
+async def test_subscribe_one_signal_refuses_anything_that_is_not_a_signal_PUSH_frame(frame):
+    """Fail closed on the WS wire exactly as `_rows` does on the REST wire.
+
+    `rest-envelope` is the trust-critical member and the reason this list exists at all: a REST
+    response replayed onto the WS path must NOT be accepted, because everything that comes out of
+    this method is about to be labelled a WS arrival. See the truth-rule tests below.
+    """
+    ws = RecordingWS([frame])
+
+    with pytest.raises(OKXResponseError):
+        await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert ws.closed == 1
+
+
+async def test_subscribe_one_signal_refuses_a_push_frame_from_a_DIFFERENT_channel():
+    """A well-formed push on some other channel is not a signal, whatever its `data` looks like.
+
+    Separated from the parametrized refusals above because this one is not a SHAPE failure — the
+    frame is a valid push and would deserialize perfectly. Only the channel identity rejects it.
+    """
+    ws = RecordingWS([_ws_push(H22_WS, channel="dex-market-price-openapi")])
+
+    with pytest.raises(OKXResponseError) as excinfo:
+        await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert "dex-market-price-openapi" in str(excinfo.value)
+    assert ws.closed == 1
+
+
+async def test_subscribe_one_signal_returns_the_FIRST_signal_of_a_multi_signal_push():
+    """A push may batch several signals; the one-shot path takes the FIRST of them.
+
+    Added because the mutation drill for this commit found the rule unbound: every other fixture
+    here carries exactly one signal in `data`, so `data[0]` and `data[-1]` were the same object and
+    a mutant swapping them SURVIVED the whole suite. Which signal is exhibited decides which market
+    event the demo is about, so "some signal from the frame" is not the contract.
+    """
+    first = dict(H22_WS, price="0.011")
+    second = dict(H22_WS, price="0.022")
+    frame = json.dumps({"arg": _ws_arg(), "data": [first, second]})
+
+    signal = await okx_client.subscribe_one_signal(RecordingWS([frame]), WS_CHAIN_INDEX)
+
+    assert signal == first
+    assert signal != second, "the fixtures must differ, or this test cannot tell first from last"
+
+
+async def test_subscribe_one_signal_refuses_an_UNRECOGNIZED_control_event():
+    """An event this module has no rule for is refused, not silently skipped.
+
+    Also added off the back of the drill: with no test feeding an unknown event, a mutant deleting
+    this refusal SURVIVED. Skipping the unknown is the dangerous default — a one-shot subscriber
+    would sit on a socket that is actively telling it something (an auth failure, a channel
+    deprecation) and report it as "no signal has arrived yet".
+    """
+    ws = RecordingWS([json.dumps({"event": "login", "code": "0"}), _ws_push(H22_WS)])
+
+    with pytest.raises(OKXResponseError) as excinfo:
+        await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert "login" in str(excinfo.value)
+    assert ws.closed == 1
+    # ...and the refusal is specifically about the UNKNOWN event, not about control frames in
+    # general: `subscribe` sits in the same position and is skipped, as the next test shows.
+    assert "subscribe" in okx_client._WS_SKIPPABLE_EVENTS
+
+
+async def test_subscribe_one_signal_skips_heartbeats_and_acks_but_not_indefinitely():
+    """`pong` and the subscribe ack are control traffic and are skipped; the FIRST push wins.
+
+    The acceptance control for the refusal suite above: a method that refused every frame would
+    pass all of those tests. This one proves the skip path can actually reach a signal.
+    """
+    ws = RecordingWS(["pong", _ws_ack(), "pong", _ws_push(H22_WS)])
+
+    signal = await okx_client.subscribe_one_signal(ws, WS_CHAIN_INDEX)
+
+    assert signal == H22_WS
+    assert ws.recv_calls == 4
+
+
+async def test_the_client_METHOD_and_the_module_function_are_the_same_subscription():
+    """The plan freezes `OKXMarketClient.subscribe_one_signal`; H2.5 also exposes it credential-free.
+
+    The method is retained exactly as the plan specifies. The module-level function exists so the
+    exhibition script can subscribe WITHOUT constructing credentials it has no use for — see
+    `test_the_exhibition_script_reads_NO_credential_from_the_environment`. This test pins that the
+    two are one behaviour rather than two implementations that can drift.
+    """
+    via_method = await _ws_client().subscribe_one_signal(RecordingWS([_ws_push(H22_WS)]), WS_CHAIN_INDEX)
+    via_function = await okx_client.subscribe_one_signal(RecordingWS([_ws_push(H22_WS)]), WS_CHAIN_INDEX)
+    assert via_method == via_function == H22_WS
+
+
+# --- THE HEART OF H2.5: a WS arrival and its REST twin are ONE piece of evidence -------------
+
+
+async def test_a_ws_arrival_hashes_IDENTICALLY_to_its_rest_twin():
+    """A signal that arrived over WS must normalize to the SAME `evidence_hash` as over REST.
+
+    This is what makes the two paths interchangeable as evidence: a receipt sealed against a
+    WS-observed signal and one sealed against the same event observed over REST name the same
+    thing. If these ever diverged, the live-exhibition path and the replay path would silently
+    describe two different markets while claiming to describe one.
+
+    The fixture guard above establishes that this is a real question (the twins differ in
+    spelling); the discrimination control below establishes that the hash can still say NO.
+    """
+    arrived = await okx_client.subscribe_one_signal(RecordingWS([_ws_ack(), _ws_push(H22_WS)]), WS_CHAIN_INDEX)
+
+    assert evidence_hash(normalize_signal(arrived, "ws")) == evidence_hash(normalize_signal(H22_REST, "rest"))
+
+
+async def test_a_DIFFERENT_ws_signal_hashes_DIFFERENTLY_from_the_rest_twin():
+    """DISCRIMINATION control (C52). Equality proves nothing unless inequality is also reachable.
+
+    Without this, the test above passes identically for an `evidence_hash` that ignores its input
+    and returns a constant — a hash function under which every signal in the season is the same
+    piece of evidence. Each perturbed field is a field the hash is REQUIRED to be sensitive to, so
+    each is its own assertion rather than one combined dict.
+    """
+    rest_hash = evidence_hash(normalize_signal(H22_REST, "rest"))
+
+    for field, value in (("price", "0.043"), ("timestamp", "1753400000001"), ("amountUsd", "1600")):
+        perturbed = dict(H22_WS)
+        perturbed[field] = value
+        arrived = await okx_client.subscribe_one_signal(RecordingWS([_ws_push(perturbed)]), WS_CHAIN_INDEX)
+        assert evidence_hash(normalize_signal(arrived, "ws")) != rest_hash, f"the hash ignored {field!r}"
+
+    # ...and a nested field, since `token` is the sub-object the alias normalization rewrites.
+    perturbed = dict(H22_WS)
+    perturbed["token"] = dict(H22_WS["token"], tokenAddress="So2")
+    arrived = await okx_client.subscribe_one_signal(RecordingWS([_ws_push(perturbed)]), WS_CHAIN_INDEX)
+    assert evidence_hash(normalize_signal(arrived, "ws")) != rest_hash, "the hash ignored token.tokenAddress"
+
+
+# ======================================================================================
+# `scripts/signal_trials/ws_exhibition.py` — a CREATE.
+#
+# Loaded BY PATH (the idiom `test_no_season_branch.py` and `test_preflight.py` already use for
+# operator scripts), which keeps this file's collection intact: the okx_client half above keeps
+# its behavioural RED while these tests fail on the script's ABSENCE.
+# ======================================================================================
+
+
+@functools.lru_cache(maxsize=1)
+def _ws_exhibition_module():
+    """Load the operator script by path, once, registering it in `sys.modules` before execution.
+
+    Registered first because `@dataclass` resolves its annotations through
+    `sys.modules[cls.__module__]`, which is `None` for a module that was never registered.
+    """
+    script = Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "ws_exhibition.py"
+    assert script.exists(), f"operator script missing at {script}"
+    name = "ws_exhibition_under_test"
+    spec = importlib_util.spec_from_file_location(name, script)
+    assert spec is not None and spec.loader is not None
+    module = importlib_util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class RecordingHandoff:
+    """Stands in for spawning `open_live_trial.py`. Records the argv and the stdin it was given."""
+
+    def __init__(self, status=0):
+        self.status = status
+        self.calls = []
+
+    def __call__(self, argv, stdin_text):
+        self.calls.append((list(argv), stdin_text))
+        return self.status
+
+
+async def _exhibit(frames, handoff=None, **kwargs):
+    """Run one exhibition over a scripted WS conversation, returning (summary, handoff, ws)."""
+    module = _ws_exhibition_module()
+    ws = RecordingWS(frames)
+    handoff = RecordingHandoff() if handoff is None else handoff
+    summary = await module.exhibit_one_signal(
+        ws, WS_CHAIN_INDEX, data_dir="/tmp/does-not-need-to-exist", handoff=handoff, **kwargs
+    )
+    return summary, handoff, ws
+
+
+async def test_the_exhibition_composes_subscribe_then_normalize_then_handoff():
+    """H2.5 Step 3: subscribe -> `normalize_signal(raw, "ws")` -> the payments-lane open-trial script.
+
+    The handoff is spawned with the RAW signal on stdin, not the canonical form: `open_live_trial.py`
+    normalizes it itself, and handing it a pre-normalized payload would move the leakage boundary
+    into this script where no reviewer of that script would look for it.
+    """
+    summary, handoff, ws = await _exhibit([_ws_ack(), _ws_push(H22_WS)])
+
+    assert ws.closed == 1
+    assert len(handoff.calls) == 1
+    argv, stdin_text = handoff.calls[0]
+    assert json.loads(stdin_text) == H22_WS
+    assert argv[0].endswith("open_live_trial.py")
+    assert summary.evidence_hash == evidence_hash(normalize_signal(H22_REST, "rest"))
+
+
+async def test_the_handoff_labels_the_signal_ws_and_there_is_no_argv_that_says_rest():
+    """THE TRUTH RULE, at the one place a mislabel could be introduced.
+
+    The plan: "if live WS is unreliable at demo time, the demo says REST-sourced live trial — REST
+    IS NEVER LABELED A WS ARRIVAL." The converse obligation is this one: a signal that DID arrive
+    over WS is handed off as `ws`, by a constant, on a code path only a consumed WS push frame can
+    reach. `"rest"` is asserted absent from the whole argv rather than only from the `--source`
+    value, because the label is wrong wherever it appears.
+    """
+    _, handoff, _ = await _exhibit([_ws_push(H22_WS)])
+
+    argv, _stdin = handoff.calls[0]
+    assert "--source" in argv
+    assert argv[argv.index("--source") + 1] == "ws"
+    assert "rest" not in argv
+
+
+async def test_the_exhibition_offers_NO_WAY_to_choose_the_source():
+    """The label is a recorded fact, not an operator's assertion — so nothing may accept it as input.
+
+    A `--source` flag, or a `source=` parameter, would be exactly the affordance that lets a
+    REST-sourced signal be published as a WS arrival at demo time under deadline pressure. Both
+    surfaces are checked: the CLI an operator types, and the function another module could call.
+    """
+    module = _ws_exhibition_module()
+
+    options = {opt for action in module.build_parser()._actions for opt in action.option_strings}
+    assert "--source" not in options
+    assert not any("source" in opt for opt in options)
+
+    for name in ("exhibit_one_signal", "build_handoff_argv"):
+        parameters = inspect.signature(getattr(module, name)).parameters
+        assert "source" not in parameters, f"{name} accepts a caller-supplied source"
+
+
+async def test_the_summary_RECORDS_the_source_and_the_record_cannot_be_reassigned():
+    """The rendered summary states where the signal came from, and that statement is not settable.
+
+    `source` is derived, not stored: there is no constructor argument and no assignable attribute
+    through which a caller could write `"rest"` into a record produced by the WS path.
+    """
+    summary, _, _ = await _exhibit([_ws_push(H22_WS)])
+
+    assert summary.source == "ws"
+    assert summary.render()["source"] == "ws"
+    with pytest.raises((AttributeError, TypeError)):
+        summary.source = "rest"
+
+
+async def test_the_rendered_summary_carries_evidence_FIELD_NAMES_but_not_evidence_VALUES():
+    """The printed summary names the evidence fields and hashes them; it does not publish them.
+
+    `open_live_trial.py` renders on exactly this principle and this script's docstring claims the
+    same one, but the mechanical decision-point sweep for this commit found `render()` unbound: no
+    mutant and no assertion reached it, so the claim was documentation only. The demo transcript is
+    not where the payload gets published — the free read is — and the hash is what an operator
+    actually compares against a receipt.
+    """
+    summary, _, _ = await _exhibit([_ws_push(H22_WS)])
+    rendered = json.dumps(summary.render(), sort_keys=True)
+
+    assert summary.evidence_hash in rendered
+    assert "trigger_price" in rendered, "the FIELD NAMES are the useful part and must be present"
+
+    # ACCEPTANCE CONTROL. Every value below really is in the fixture, so a rendering that leaked
+    # values WOULD contain it — without this the absence assertions could be passing because the
+    # values were never in the signal in the first place.
+    assert (H22_WS["price"], H22_WS["amountUsd"], H22_WS["triggerWalletAddress"]) == ("0.042", "1500", "0xa")
+    assert H22_WS["token"]["tokenAddress"] == "So1"
+    for value in ("0.042", "1500", "So1", "0xa"):
+        assert value not in rendered, f"the rendered summary published the evidence value {value!r}"
+
+    # `t0_ms` is the DECLARED exception and is asserted PRESENT rather than quietly omitted from
+    # the list above. It is trial metadata (when the trial opens, which an operator needs to check
+    # a deadline) and `open_live_trial.py` prints it for the same reason. Stating it here means the
+    # rule is "market data never, metadata deliberately" rather than an unexplained hole.
+    assert str(H22_WS["timestamp"]) in rendered
+
+
+async def test_a_REST_envelope_on_the_ws_wire_produces_NO_record_at_all():
+    """The mislabel cannot be reached by feeding the WS path a REST response.
+
+    This is the discrimination partner of the truth-rule test above: it is not enough that the WS
+    path labels things `ws`, it must also be impossible for a REST arrival to travel it. The
+    handoff must never fire — a refusal that still published would be the exact failure the truth
+    rule exists to prevent.
+    """
+    with pytest.raises(OKXResponseError):
+        await _exhibit(['{"code":"0","data":[{"timestamp":"1753400000000"}]}'])
+
+    module = _ws_exhibition_module()
+    handoff = RecordingHandoff()
+    with pytest.raises(OKXClientError):
+        await module.exhibit_one_signal(
+            RecordingWS(['{"code":"0","data":[]}']), WS_CHAIN_INDEX, data_dir="/tmp/x", handoff=handoff
+        )
+    assert handoff.calls == [], "a refused frame must not reach the open-trial handoff"
+
+
+async def test_a_nonzero_handoff_status_is_reported_and_not_swallowed():
+    """If `open_live_trial.py` refuses the capture, the exhibition must say so.
+
+    A script that printed a summary and exited 0 over a trial that was never published would be
+    the demo telling the operator a live trial exists when none does.
+    """
+    module = _ws_exhibition_module()
+    summary, _, _ = await _exhibit([_ws_push(H22_WS)], handoff=RecordingHandoff(status=1))
+
+    assert summary.handoff_status == 1
+    assert summary.published is False
+    assert module.exit_status(summary) != 0
+
+
+def test_the_exhibition_script_reads_NO_credential_from_the_environment(monkeypatch):
+    """Gate A: this script cannot leak a credential because it never reads one.
+
+    `subscribe_one_signal` authenticates nothing — the WS handshake belongs to the transport — so
+    the exhibition path has no reason to hold `OKX_API_KEY`, `OKX_SECRET_KEY` or `OKX_PASSPHRASE`.
+    Sentinels are planted and their ABSENCE from every rendered surface is asserted; the sentinels
+    are obvious non-secrets, never a realistic credential.
+    """
+    module = _ws_exhibition_module()
+    sentinels = {
+        "OKX_API_KEY": "SENTINEL-API-KEY-MUST-NOT-APPEAR",
+        "OKX_SECRET_KEY": "SENTINEL-SECRET-MUST-NOT-APPEAR",
+        "OKX_PASSPHRASE": "SENTINEL-PASSPHRASE-MUST-NOT-APPEAR",
+    }
+    for name, value in sentinels.items():
+        monkeypatch.setenv(name, value)
+
+    # The predicate is the MECHANISM, not the spelling. An earlier draft asserted that the variable
+    # NAMES never appear in the source, which flagged the module docstring's own explanation that it
+    # does not read them — a predicate that fires on documentation is measuring the wrong thing.
+    # What "reads no credential" actually means is that no environment read exists at all.
+    source = inspect.getsource(module)
+    assert not hasattr(module, "os"), "the exhibition script imported `os`; it has no environment to read"
+    for reader in ("environ", "getenv"):
+        assert reader not in source, f"the exhibition script calls {reader}; it has no use for credentials"
+
+    rendered = json.dumps(module.build_handoff_argv(data_dir="/tmp/x", dry_run=False))
+    for value in sentinels.values():
+        assert value not in rendered
+
+
+def test_the_handoff_argv_targets_the_payments_lane_script_that_actually_exists():
+    """The composition is script-level: this argv must name a real `open_live_trial.py`.
+
+    An argv pointing at a path that does not exist would fail only at demo time, in front of the
+    thing it exists to demonstrate.
+    """
+    module = _ws_exhibition_module()
+
+    argv = module.build_handoff_argv(data_dir="/tmp/x", dry_run=True)
+    assert Path(argv[0]).exists()
+    assert "--dry-run" in argv
+    assert "--dry-run" not in module.build_handoff_argv(data_dir="/tmp/x", dry_run=False)
