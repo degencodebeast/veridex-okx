@@ -3,7 +3,7 @@
 // go green against the exact defects they exist to catch. Each case below is one of those defects,
 // written as CSS this reader must refuse to answer.
 import { describe, it, expect } from 'vitest';
-import { cssDeclaration } from './css-source';
+import { cssDeclaration, cssSelectors } from './css-source';
 
 describe('cssDeclaration — what it refuses to be satisfied by', () => {
   it('does not answer a selector query from a DIFFERENT selector', () => {
@@ -83,6 +83,47 @@ describe('cssDeclaration — @media scoping', () => {
 
   it('does not answer a media query from a base rule', () => {
     expect(cssDeclaration(css, '.retry', 'padding', { media: '(max-width: 760px)' })).toBeNull();
+  });
+});
+
+describe('cssSelectors — the enumerator the closing guards are built on', () => {
+  // Its failure mode is the same false pass as the reader's, arriving from the opposite direction: a
+  // guard that asks "is every selector carrying the reserved token classified?" goes green for free
+  // if the enumeration comes back short. So the cases below are the ways it could come back short.
+  it('splits a selector LIST into its members and keeps attribute selectors intact', () => {
+    const css = ".chip[data-state='not_built'], .chip[data-state='loading'] { color: var(--text-3); }";
+    expect(cssSelectors(css)).toEqual([
+      ".chip[data-state='not_built']",
+      ".chip[data-state='loading']",
+    ]);
+  });
+
+  it('deduplicates a selector declared by more than one rule', () => {
+    expect(cssSelectors('.retry { color: a; } .retry { min-height: 44px; }')).toEqual(['.retry']);
+  });
+
+  it('does not invent a selector out of a comment', () => {
+    // The defect this closes: a stylesheet that DOCUMENTS a class it does not style would otherwise
+    // enter the enumeration, and the classification guard would demand a row for a rule that does
+    // not exist — training the next reader to ignore it.
+    const css = '/* .notQualified { color: var(--text-3); } was removed */ .retry { color: a; }';
+    expect(cssSelectors(css)).toEqual(['.retry']);
+  });
+
+  it('separates base scope from a breakpoint, in both directions', () => {
+    const css = '.a { color: x; } @media (max-width: 760px) { .b { min-height: 44px; } }';
+    expect(cssSelectors(css)).toEqual(['.a']);
+    expect(cssSelectors(css, { media: '(max-width: 760px)' })).toEqual(['.b']);
+    expect(cssSelectors(css, { media: '(max-width: 640px)' })).toEqual([]);
+  });
+
+  it('returns the selectors that answer a cssDeclaration query, so the two agree', () => {
+    // The pairing the closing guard depends on: every selector this returns must be one
+    // `cssDeclaration` can then be asked about. If the two disagreed on selector spelling — a
+    // stray space, a kept comma — the filter in the guard would silently match nothing.
+    const css = ".a, .b[data-x='y'] { color: var(--text-3); } .c { color: var(--text-2); }";
+    const dim = cssSelectors(css).filter((s) => cssDeclaration(css, s, 'color') === 'var(--text-3)');
+    expect(dim).toEqual(['.a', ".b[data-x='y']"]);
   });
 });
 

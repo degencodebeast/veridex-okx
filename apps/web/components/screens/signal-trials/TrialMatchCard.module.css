@@ -144,11 +144,23 @@
 .verbatimUpper { text-transform: uppercase; }
 .frozenLabel { text-transform: none; }
 
+/* THE DIAGNOSTIC TAG, and the one case in this file classified AGAINST its own typography. Its single
+   call site renders `diagnostic — does not change ranking` (TrialMatchCard.tsx:879), and
+   `.verbatimUpper` presents it uppercase — so by FORM it satisfies the reservation. It moves on
+   CONTENT: that string is the line that stops a judge reading the cost sweep as a ranking, which puts
+   it in the class §12:302 calls "the product-boundary disclaimer" and §12:304 calls
+   "honesty-critical disclaimers". The reservation is a floor for the protected class, not a ceiling
+   for the permitted one, so a string that is both may be brightened and a disclaimer must be.
+   3.29:1 → 7.20:1 on the `--panel` this pill sets on itself.
+   SEPARATELY, AND NOT DONE HERE: handoff §3:38 puts the diagnostic tag in the warning amber family
+   rather than on a text token at all. That is a colour-fidelity delta outside this change's mandate;
+   it is recorded rather than taken silently, because amber would also change what the tag competes
+   with (`.fence`, the exploratory banner). */
 .tag {
   margin: 0; align-self: flex-start; padding: 3px 8px;
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em;
   border: 1px solid var(--border); border-radius: var(--radius-badge);
-  color: var(--text-3); background: var(--panel);
+  color: var(--text-2); background: var(--panel);
 }
 
 .actionChip {
@@ -188,8 +200,23 @@
 .checkStatus[data-status='fail'] { border-color: var(--negative); color: var(--negative); }
 .checkStatus[data-status='pending'] { border-color: var(--warning); color: var(--warning); }
 /* `not served` is the ABSENCE of a verdict, not a verdict. It is styled as neither a pass nor a
-   pending so it can never be read as one the verifier actually made. */
-.checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-3); }
+   pending so it can never be read as one the verifier actually made. WHAT CARRIES THAT, measured
+   rather than assumed: the neutral HUE against three coloured verdicts (pass `--accent-hi`, fail
+   `--negative`, pending `--warning` — named by token because PAT-001 makes styles/tokens.css the only
+   file allowed to spell a hex, comments included), plus the lowercase spelling in a family where
+   every real verdict is uppercase. NOT the dashed border — it is `--border` at 1.14:1 on `--panel-2`,
+   which is very nearly invisible. Both of the signals that do the work are unaffected by the colour
+   token, which is why this could move at all: it goes from a dark neutral to a lighter neutral and
+   stays neutral.
+   IT MOVED, and it is the one member of this pill family that does. Every real verdict here is
+   `c.status.toUpperCase()` — PASS / FAIL / PENDING, uppercase micro-labels on the reserved token's
+   own terms. This variant instead renders the lowercase AUTHORED string `not served`
+   (TrialMatchCard.tsx:836), invented for the case where the backend served no key at all. That is the
+   same copy class as SeasonScreen's `.notQualified`: an absence disclosure, not a data code and not a
+   label, so §12:302 reaches it where it does not reach the 9px lowercase `.checkPhase` tag beside it
+   (`commit-time` IS a data code — `phase: 'commit' | 'outcome'`, lib/contracts.ts:599). 3.18:1 →
+   6.97:1 on the `--panel-2` of the `.checks` box these rows sit in. */
+.checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-2); }
 
 .retry {
   /* An explicit flex box rather than the <button> UA default: the narrow breakpoint below gives this

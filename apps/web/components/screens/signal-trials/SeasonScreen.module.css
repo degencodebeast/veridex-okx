@@ -61,7 +61,16 @@
    borrow the visual weight of one we do. */
 .chip[data-state='not_built'], .chip[data-state='loading'] { border-style: dashed; color: var(--text-3); }
 
-.metaRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-3); }
+/* THE ROW MOVES, THE LABEL INSIDE IT DOES NOT. `.metaRow` is a CARRIER: the only element that takes
+   its colour by inheritance is the unclassed `season-combo` span (SeasonScreen.tsx:277-287), which
+   renders the season id, the humanized combo, and — in the exploratory state — the suffix
+   `· below the 40-trial gate`. That suffix is a lowercase honesty qualifier saying the combo never
+   reached the gate (handoff §6:189), so the carrier is MIXED and §12:302 moves it. `.metaLabel`
+   declares its own colour on the next line and keeps the micro-label token, which is what preserves
+   the SEASON-label/value register distinction across this change. 3.42:1 → 7.49:1 on `--bg`: the
+   shell's `.main` sets no background (ProofArenaShell.module.css:106), so this row sits on the body
+   background, not on a panel. */
+.metaRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-2); }
 .metaLabel { letter-spacing: 0.1em; color: var(--text-3); }
 
 .banner { margin: 0; padding: var(--space-2) var(--pad-panel); border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: var(--radius-control); background: var(--panel); color: var(--text-2); font-size: 11px; }
@@ -94,12 +103,25 @@
   padding: 2px 6px; border-radius: var(--radius-badge);
   border: 1px solid var(--accent); color: var(--accent-hi); background: var(--panel);
 }
-.notQualified { color: var(--text-3); }
+/* THE EXCLUSION NOTES. §12:302 names "exclusion notes" verbatim among the strings that must clear a
+   body-copy token, and these are the handoff's own: §5:145 lists `qualified` / `not qualified` /
+   `n/a — control` as one [DER] row, and §9:257 explains why a control renders `n/a — control` rather
+   than "not qualified". 11px, lowercase, `letter-spacing` normal — it misses all three criteria of
+   the reservation, where the seven selectors fixed in c4ed6ba missed two or three. It also renders in
+   the DEFAULT `qualified` state, on every non-qualified contestant row AND every control row, which
+   makes it the most-rendered member of this cluster. 3.42:1 → 7.49:1 on `--bg` (the table declares no
+   background on `td`, and `.tableWrap` none at all). */
+.notQualified { color: var(--text-2); }
 
 .tableFoot { display: flex; flex-direction: column; gap: 6px; padding: var(--space-2) var(--pad-panel); border-top: 1px solid var(--border); }
 /* §12:302 names "footnotes" verbatim among the sentence-case strings that must clear a body-copy
    token. All four of these are multi-sentence, and none is letter-spaced, so none is in the class
-   §12:302 reserves the darker tokens for. 3.29:1 → 7.20:1 on the panel these sit on. */
+   §12:302 reserves the darker tokens for. 3.42:1 → 7.49:1 on `--bg`.
+   THE SURFACE IS CORRECTED HERE: this said "on the panel these sit on" and gave the panel's 3.29:1 →
+   7.20:1. Chrome disagrees — `.tableFoot` and `.tableWrap` declare no background and the shell's
+   `.main` declares none either (ProofArenaShell.module.css:106), so the first painted ancestor is
+   `body`, which `app/globals.css:7` sets to `--bg`. The direction of the fix was right and both
+   figures clear AA; the surface named was not. */
 .footNote { font-size: 10px; color: var(--text-2); margin: 0; }
 
 /* Empty / loading / error panels. None of them is ever populated with values. */
@@ -117,7 +139,9 @@
    multi-sentence. It ALSO carries two short strings (`SEASON STANDINGS`, `N = n settled trials`), and
    they move with it deliberately: §12:302 reserves the darker tokens for LETTER-SPACED micro-labels,
    this rule sets no letter-spacing, and the authority is a contrast FLOOR rather than an instruction
-   to keep anything dim. 3.29:1 → 7.20:1 on the panel. */
+   to keep anything dim. TWO SURFACES, both measured, because this class has call sites in both
+   places: 3.29:1 → 7.20:1 inside `.statePanel` (which does set `--panel`), and 3.42:1 → 7.49:1 at
+   SeasonScreen.tsx:288, where the paragraph is a bare child of the screen and lands on `--bg`. */
 .stateSub { margin: 0; font-size: 10px; color: var(--text-2); font-family: var(--font-mono), monospace; }
 
 .probeCounts { font-size: 11px; color: var(--text-2); }

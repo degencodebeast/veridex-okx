@@ -91,6 +91,35 @@ function bodiesFor(scoped: string, selector: string): string[] {
  * point: `cssDeclaration(css, '.retry', 'min-height', …)` cannot be satisfied by a `min-height` on
  * any other class, and returns `null` — a failing assertion — if the rule is missing entirely.
  */
+/**
+ * Every selector-list entry that appears in `source` at the requested scope, in source order and
+ * deduplicated.
+ *
+ * WHY THIS EXISTS ALONGSIDE `cssDeclaration`. `cssDeclaration` answers "is THIS selector right?",
+ * which can only ever check a list of selectors someone remembered to write down. The failure mode
+ * of an accessibility classification is the selector nobody enumerated: the ProofArena contrast
+ * cluster was undercounted four times in a row, each pass fixing the members it happened to look at.
+ * Pairing this with `cssDeclaration` lets a test ask the CLOSING question instead — "which selectors
+ * in this file carry the reserved token, and is every one of them classified?" — so a new dim
+ * selector fails the guard until someone classifies it.
+ *
+ * It reuses this module's comment stripping and `@media` scoping, so a selector cannot be conjured
+ * out of a comment and a base-scope enumeration cannot be polluted by a breakpoint-only rule.
+ */
+export function cssSelectors(source: string, options: { media?: string } = {}): string[] {
+  const scoped = scopeTo(stripComments(source), options.media);
+  const seen = new Set<string>();
+  const rule = /([^{}]+)\{([^{}]*)\}/g;
+  let match: RegExpExecArray | null;
+  while ((match = rule.exec(scoped)) !== null) {
+    for (const selector of match[1].split(',')) {
+      const trimmed = selector.trim();
+      if (trimmed !== '') seen.add(trimmed);
+    }
+  }
+  return [...seen];
+}
+
 export function cssDeclaration(
   source: string,
   selector: string,
