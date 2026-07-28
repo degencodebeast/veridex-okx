@@ -6,7 +6,12 @@
 .headText { display: flex; flex-direction: column; gap: 4px; min-width: 240px; }
 .title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
 .lead { margin: 0; font-size: 11px; color: var(--text-2); }
-.leadSub { margin: 0; font-size: 11px; color: var(--text-3); }
+/* `--text-2`, not `--text-3`: two sentences, and the honesty boundary between the ranked metric and
+   the legibility one. PROOFARENA-OKX-DELTA-HANDOFF §12:302 puts every sentence-case string on a
+   body-copy token and reserves the darker two for "8–9px uppercase letter-spaced micro-labels only";
+   §12:304 forbids a multi-sentence string below the descriptive value outright. Measured 3.42:1 on
+   the page background at `--text-3`, 7.49:1 at `--text-2`. See prose-contrast.test.ts. */
+.leadSub { margin: 0; font-size: 11px; color: var(--text-2); }
 
 /* The route's identity copy, under the h1. Mono descriptor, sans thesis — the same pairing the
    prototype uses, and the reason it reads as a product statement rather than as more table
@@ -92,7 +97,10 @@
 .notQualified { color: var(--text-3); }
 
 .tableFoot { display: flex; flex-direction: column; gap: 6px; padding: var(--space-2) var(--pad-panel); border-top: 1px solid var(--border); }
-.footNote { font-size: 10px; color: var(--text-3); margin: 0; }
+/* §12:302 names "footnotes" verbatim among the sentence-case strings that must clear a body-copy
+   token. All four of these are multi-sentence, and none is letter-spaced, so none is in the class
+   §12:302 reserves the darker tokens for. 3.29:1 → 7.20:1 on the panel these sit on. */
+.footNote { font-size: 10px; color: var(--text-2); margin: 0; }
 
 /* Empty / loading / error panels. None of them is ever populated with values. */
 .statePanel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-4) var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
@@ -104,7 +112,13 @@
 .statePanel[data-state='unavailable'] { border-color: var(--negative); }
 .stateTitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
 .stateBody { margin: 0; font-size: 12px; color: var(--text-2); }
-.stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
+/* §12:302 names "empty/error bodies" verbatim. This class carries the transport-failure line, the
+   probe-counts explanation and the no-season disclosure — sentence-case, several of them
+   multi-sentence. It ALSO carries two short strings (`SEASON STANDINGS`, `N = n settled trials`), and
+   they move with it deliberately: §12:302 reserves the darker tokens for LETTER-SPACED micro-labels,
+   this rule sets no letter-spacing, and the authority is a contrast FLOOR rather than an instruction
+   to keep anything dim. 3.29:1 → 7.20:1 on the panel. */
+.stateSub { margin: 0; font-size: 10px; color: var(--text-2); font-family: var(--font-mono), monospace; }
 
 .probeCounts { font-size: 11px; color: var(--text-2); }
 /* `text-decoration: none` is required, not cosmetic: H5.5 applies this class to an <a> as well as

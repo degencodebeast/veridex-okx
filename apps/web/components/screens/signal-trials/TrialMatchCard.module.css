@@ -70,8 +70,24 @@
 .settlement[data-status='UNSCORED'] { border-color: var(--warning); }
 .settlement[data-status='none'] { border-style: dashed; }
 
+/* THE TWO REGISTERS, AND WHY THEY CARRY DIFFERENT TOKENS. These two rules sit adjacent on purpose:
+   they are the classification PROOFARENA-OKX-DELTA-HANDOFF §12:302-304 draws, and the difference
+   between them is not taste.
+
+   `.panelLabel` KEEPS `--text-3`. Mono, letter-spaced, and every string it renders is a short
+   uppercase panel heading — SHARED EVIDENCE RAIL, SETTLEMENT, AGENT DECISIONS, FAIR-PLAY CHECKS,
+   COST SENSITIVITY. That is precisely what §12:304 reserves the token FOR ("short uppercase mono
+   labels and timestamps"), so brightening it would erase the register distinction between a heading
+   and the prose under it.
+
+   `.panelSub` moves to `--text-2`. Sans, NOT letter-spaced, and it renders the explanatory line
+   under each of those headings — including "does this receipt's record re-derive? · receipt status
+   …" with its two trailing clauses. It fails every criterion §12:302 attaches to the reserved
+   tokens. 3.18:1 on `--panel-2` and 3.29:1 on `--panel` → 6.97:1 and 7.20:1.
+
+   prose-contrast.test.ts asserts BOTH directions, so a change to either rule fails on its own. */
 .panelLabel { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.1em; color: var(--text-3); }
-.panelSub { margin: 0; font-size: 10px; color: var(--text-3); }
+.panelSub { margin: 0; font-size: 10px; color: var(--text-2); }
 
 .hashChip { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .hashLabel { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em; color: var(--text-3); }
@@ -88,8 +104,22 @@
 
 .stateTitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
 .stateBody { margin: 0; font-size: 12px; color: var(--text-2); max-width: 78ch; }
-.stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
-.footNote { margin: 0; font-size: 10px; color: var(--text-3); max-width: 88ch; }
+/* Both on `--text-2` per §12:302, which names "empty/error bodies" and "footnotes" verbatim.
+
+   `.stateSub` carries this route's single most honesty-critical string — the pending-settlement
+   disclosure that the settlement target is DERIVED from the published law and not served by the
+   endpoint (TrialMatchCard.tsx:550, three sentences) — plus "404 is not a transport failure — retry
+   is not offered." It also carries two `LOADING …` lines and a raw error code; those move with it for
+   the reason given on `.panelSub` above, and brightening the line that tells a judge the skeleton
+   below it stands for nothing is the right direction for it anyway.
+
+   `.footNote` is `max-width: 88ch` of multi-sentence prose throughout — the paper-markout
+   qualifier, the no-aggregate-badge rule, the re-derivation scoping.
+
+   3.18:1 on `--panel-2` (`.rail` / `.checks` / `.settlement`) and 3.29:1 on `--panel` → 6.97:1 and
+   7.20:1. */
+.stateSub { margin: 0; font-size: 10px; color: var(--text-2); font-family: var(--font-mono), monospace; }
+.footNote { margin: 0; font-size: 10px; color: var(--text-2); max-width: 88ch; }
 
 .errorDetail {
   margin: 0; padding: var(--space-2); overflow-x: auto; white-space: pre-wrap;
@@ -143,7 +173,12 @@
 }
 .checkKey { font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-1); }
 .checkPhase { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); }
-.checkDesc { font-size: 10px; color: var(--text-3); }
+/* §12:302 names "check descriptions" verbatim AND cites Direction A's own `Veridex.dc.html`
+   proof-check description rows as the precedent — "for exactly this class of copy". These are the
+   eight CHECK_DESCRIPTION sentences, sans and not letter-spaced; the 9px letter-spaced
+   `.checkPhase` tag beside them is the micro-label in this row and keeps `--text-3`. 3.18:1 →
+   6.97:1 on `--panel-2`. */
+.checkDesc { font-size: 10px; color: var(--text-2); }
 .checkStatus {
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
   padding: 2px 6px; border-radius: var(--radius-badge);
