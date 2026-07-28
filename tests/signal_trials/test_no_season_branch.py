@@ -1148,3 +1148,152 @@ def test_the_frozen_command_is_a_real_command_in_a_subprocess() -> None:
         timeout=60,
     )
     assert elsewhere.returncode == 3, f"the command must work from any cwd: {elsewhere.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# CF-6 — the credential-redaction boundary on the SUCCESS paths.
+#
+# `main` builds `secrets` as soon as credentials are read, and the FAILURE path at
+# exit 1 redacts against it. The three exit-0 outputs did not, while the function's
+# own docstring promised "every message is redacted before it is printed". The
+# redactor was in scope and simply not applied — a stated contract the success path
+# did not honour.
+#
+# Each test below drives a sentinel credential value into one success output through
+# a CONTROLLED SEAM and asserts the value does not survive to stdout. The failure-path
+# and diagnostic-preservation controls sit alongside them, because a redactor that
+# blanks everything would satisfy the leak tests while destroying the output.
+# ---------------------------------------------------------------------------
+
+
+def test_the_sealed_pack_path_does_not_echo_a_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit-0 output 3 — ``pack sealed at {sealed}``.
+
+    Seam: the operator-supplied ``--out``. A path carrying a credential value is
+    printed verbatim on the success path while the identical value in a failure
+    message is redacted.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    leak = _SENTINEL_ENV["OKX_API_KEY"]
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / f"data-{leak}"
+    _write_qualified(preflight_path)
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert code == 0
+    assert leak not in capsys.readouterr().out, "the sealed-pack line published a credential value"
+
+
+def test_the_no_season_state_line_does_not_echo_a_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit-0 output 1 — ``published state is {state!r}``.
+
+    Seam: the published-state read. ``!r`` does not redact; it only adds quotes.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    leak = _SENTINEL_ENV["OKX_SECRET_KEY"]
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_no_season(preflight_path)
+    monkeypatch.setattr(
+        module.published, "read_state", lambda _dir: {"state": f"no_season::{leak}"}
+    )
+    client = RecordingClient()
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert code == 0
+    assert leak not in capsys.readouterr().out, "the state line published a credential value"
+
+
+def test_the_state_location_line_does_not_echo_a_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit-0 output 2 — ``state written under {data_dir / PUBLISHED_DIRNAME}``."""
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    leak = _SENTINEL_ENV["OKX_PASSPHRASE"]
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / f"data-{leak}"
+    _write_no_season(preflight_path)
+    client = RecordingClient()
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+
+    assert code == 0
+    assert leak not in capsys.readouterr().out, "the state-location line published a credential value"
+
+
+def test_the_success_output_keeps_its_non_secret_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DISCRIMINATION — redaction must not be achieved by printing nothing useful.
+
+    A redactor that blanked the whole line would pass every leak test above. The
+    operator still needs to know WHICH state was published and WHERE it went, so the
+    non-secret substance of both lines is pinned here.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_no_season(preflight_path)
+    client = RecordingClient()
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "no pack sealed" in out, "the operator must still learn no pack was sealed"
+    assert "no_season" in out, "the published state must still be named"
+    assert "state written under" in out, "the operator must still learn where state went"
+    assert str(data_dir) in out, "the non-secret path must survive redaction"
+
+
+def test_the_failure_path_remains_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CONTROL — exit 1 was already redacted and must stay that way.
+
+    Green before and after, by design: it exists so a change to the success boundary
+    cannot silently regress the failure boundary that already worked.
+    """
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    leak = _SENTINEL_ENV["OKX_API_KEY"]
+    preflight_path = tmp_path / "preflight_result.json"
+    _write_qualified(preflight_path)
+
+    @contextlib.asynccontextmanager
+    async def _exploding_factory(_credentials: Any) -> Any:
+        raise RuntimeError(f"upstream rejected {leak}")
+        yield  # pragma: no cover - unreachable, present so this is an async generator
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(tmp_path / "data" / "packs")],
+        source_factory=_exploding_factory,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert leak not in captured.err, "the failure path leaked a credential value"
+    assert "upstream rejected" in captured.err, "the diagnostic itself must survive"

@@ -563,13 +563,19 @@ def main(argv: Sequence[str] | None = None, *, source_factory: SourceFactory | N
         print(f"fetch_and_seal FAILED: {seam.redact(f'{type(error).__name__}: {error}', secrets)}", file=sys.stderr)
         return 1
 
+    # CF-6. The docstring above promises every message is redacted before it is printed,
+    # and until this commit only the exit-1 path honoured it. `secrets` has been in scope
+    # since the credentials were read, so the redactor was present and simply not applied
+    # to the exit-0 outputs. `redact` replaces credential VALUES only, so the state name
+    # and the destination path survive it — the operator still learns what happened and
+    # where, which is the point of printing these at all.
     if sealed is None:
         state = published.read_state(data_dir)["state"]
-        print(f"no pack sealed; published state is {state!r}")
-        print(f"state written under {data_dir / published.PUBLISHED_DIRNAME}")
+        print(seam.redact(f"no pack sealed; published state is {state!r}", secrets))
+        print(seam.redact(f"state written under {data_dir / published.PUBLISHED_DIRNAME}", secrets))
         return 0
 
-    print(f"pack sealed at {sealed}")
+    print(seam.redact(f"pack sealed at {sealed}", secrets))
     return 0
 
 
