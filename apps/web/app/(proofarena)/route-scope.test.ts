@@ -85,29 +85,27 @@ describe('the scope boundary — the legacy chrome is untouched and still used',
   });
 });
 
-describe('page metadata is ProofArena for these two routes only', () => {
-  it('declares ProofArena metadata on the route group', async () => {
-    const mod = (await import('./layout')) as { metadata?: { title?: unknown; description?: unknown } };
-    const title = String(mod.metadata?.title ?? '');
-    const description = String(mod.metadata?.description ?? '');
-
-    expect(title).toContain('ProofArena');
-    expect(description.length).toBeGreaterThan(0);
-
-    // Discrimination: the shipped metadata said `Veridex — TxLINE Agent Proof Arena` and described
-    // Solana anchoring. Both are true of the legacy product and neither is true of these two
-    // routes, which read OKX DEX signals on X Layer and anchor nothing.
-    expect(title).not.toContain('Veridex');
-    expect(description).not.toContain('Veridex');
-    expect(description).not.toMatch(/solana/i);
-    expect(title).not.toMatch(/solana/i);
-  });
-
-  it('leaves the ROOT metadata alone — it is every other route\'s title', () => {
-    // The root layout serves the marketing landing and all of `(app)`. Rewriting it would rename
-    // the whole product from inside a two-route task.
-    const root = read('app/layout.tsx');
-    expect(root).toContain('Veridex — TxLINE Agent Proof Arena');
+// The metadata CONTENT contract — the exact per-route copy from PROOFARENA-OKX-DELTA-HANDOFF
+// §4:107-116 — lives in `route-metadata.test.ts`. What belongs HERE is only the part that is a
+// FILESYSTEM fact, for the same reason the rest of this file is filesystem assertions: which layout
+// a route's metadata comes from is decided by file location.
+//
+// The block this replaces asserted `title.toContain('ProofArena')` and a non-empty description
+// against the group layout's single metadata object, and passed while `/trials/[trialId]` served the
+// season title with no trial id in it. It was a substring guard standing in for an exact-copy
+// requirement; it is not weakened here, it is superseded by whole-string assertions next door.
+describe('the metadata scope is per ROUTE, which is a fact about file placement', () => {
+  it('gives the trial route its own nested layout to generate metadata from', () => {
+    // A metadata export cannot vary with a route param from the GROUP layout — that layout is
+    // rendered once for both routes and receives no `[trialId]`. Per-trial metadata therefore
+    // requires a layout at this exact path, and that requirement is what this asserts. It must be a
+    // SERVER component: `generateMetadata` is a server-only export, and the page beside it is
+    // `'use client'`.
+    const path = 'app/(proofarena)/trials/[trialId]/layout.tsx';
+    expect(existsSync(p(path)), 'the trial route has no nested metadata layout').toBe(true);
+    const layout = read(path);
+    expect(layout).toContain('generateMetadata');
+    expect(layout, 'a server layout cannot be a client component').not.toMatch(/^\s*'use client'/m);
   });
 });
 
