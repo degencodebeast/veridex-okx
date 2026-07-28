@@ -153,7 +153,14 @@
   margin: 0;
   max-width: 920px;
   font-family: var(--font-mono), monospace; font-size: 11px; line-height: 1.6;
-  color: var(--text-3);
+  /* `--text-2`, NOT `--text-3`, and the handoff fixes this per role rather than per taste: §7:304
+     reserves `--text-3`/`--text-4` for 8–9px uppercase micro-labels and assigns sentence-case body
+     and HONESTY-CRITICAL DISCLAIMERS to `--text-2`, with an explicit "do not put a multi-sentence
+     string" below the descriptive-mono value. This string is both. At `--text-3` it measured 3.42:1
+     on the page background this paragraph actually sits on (it is a sibling of `.footerBand`, so
+     `--bg`, not `--panel`), which fails AA at 11px; `--text-2` measures 7.49:1. Same token as
+     `.closingLine` above — one band of footer prose should not render at two contrasts. */
+  color: var(--text-2);
 }
 
 /* ── narrow ──────────────────────────────────────────────────────────────── */

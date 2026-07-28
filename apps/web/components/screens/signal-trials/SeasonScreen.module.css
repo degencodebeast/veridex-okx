@@ -116,6 +116,10 @@
 .probeSummary:hover, .probeSummary:focus-visible { color: var(--accent-hi); }
 
 .retry {
+  /* An explicit flex box rather than the <button> UA default, for the same reason `.headAction`
+     above declares one: the narrow breakpoint gives this control a 44px minimum that its 10px label
+     does not fill, and centring must not depend on how a UA happens to align button content. */
+  display: inline-flex; align-items: center; justify-content: center;
   align-self: flex-start; font-family: var(--font-mono), monospace; font-size: 10px;
   letter-spacing: 0.06em; padding: 5px 10px; border-radius: var(--radius-control);
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text-1); cursor: pointer;
@@ -130,4 +134,9 @@
   .headSide { align-items: flex-start; width: 100%; }
   .statusRow, .actionRow { justify-content: flex-start; }
   .headAction { min-height: 44px; }
+  /* The retry offered on a transport failure is a real tap target and was not one: 10px type with
+     5px of vertical padding measured ~25px at 390px. The same control is authored again in
+     TrialMatchCard.module.css and is fixed at THIS breakpoint there too — a judge moves between
+     /trials and /trials/[trialId], and one control must not render at two sizes. */
+  .retry { min-height: 44px; }
 }

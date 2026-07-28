@@ -14,10 +14,16 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { cssDeclaration } from '@/lib/css-source';
 
 const WEB = resolve(__dirname, '../..');
 const p = (...seg: string[]) => resolve(WEB, ...seg);
 const read = (...seg: string[]) => readFileSync(p(...seg), 'utf8');
+
+// The handoff's narrow breakpoint — CLAUDE-CODE-BRIEF §"At ≤ 760px … every tap target is ≥ 44px",
+// restated in PROOFARENA-OKX-DELTA-HANDOFF §7:232. Named once so no assertion can quietly move to a
+// different one.
+const NARROW = { media: '(max-width: 760px)' } as const;
 
 describe('the ProofArena routes live outside the legacy (app) shell group', () => {
   it('serves both routes from the (proofarena) group', () => {
@@ -143,6 +149,84 @@ describe('the shell cannot force a min-content width wider than a phone', () => 
   it('gives every shell tap target at least 44px', () => {
     // The handoff's §7 breakpoint rule. Both header links and the footer action are real tap
     // targets on a phone.
-    expect(css()).toMatch(/min-height:\s*44px/);
+    //
+    // ASSERTED PER SELECTOR, deliberately. The previous form of this test was
+    // `expect(css()).toMatch(/min-height:\s*44px/)`, which is satisfied by 44px on ANY rule in the
+    // file — including a decorative one — and so passed elsewhere in this repo while the real tap
+    // targets were 20px. Naming the two selectors makes the assertion fail when either control
+    // regresses, which is the only version of it worth having.
+    for (const selector of ['.navLink', '.footerSkill']) {
+      expect(
+        cssDeclaration(css(), selector, 'min-height', NARROW),
+        `${selector} is not ≥ 44px at ${NARROW.media}`,
+      ).toBe('44px');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The product-boundary disclaimer's contrast.
+//
+// PROOFARENA-OKX-DELTA-HANDOFF §7 fixes the token per ROLE, not per taste. Quoted by token name
+// rather than by literal value, because PAT-001 makes `styles/tokens.css` the only file in the
+// scanned tree permitted to carry a raw hex — including inside a comment:
+//
+//   :302 — every sentence-case string (descriptor, thesis, footnotes, check descriptions, exclusion
+//          notes, empty/error bodies, AND the product-boundary disclaimer) renders at one of the two
+//          body-copy values, `--text-2` or the slightly dimmer descriptive-mono value; the two
+//          darkest values, `--text-3` and `--text-4`, are "reserved for 8–9px uppercase
+//          letter-spaced micro-labels ONLY".
+//   :304 — `--text-3`/`--text-4` = short uppercase mono labels and timestamps. `--text-2` =
+//          "sentence-case sans body and honesty-critical disclaimers", and: "DO NOT PUT A
+//          MULTI-SENTENCE STRING BELOW" the descriptive-mono value.
+//
+// The disclaimer is multi-sentence AND honesty-critical, so it is the `--text-2` case twice over. It
+// shipped at `--text-3`, which measures 3.42:1 against the page background it actually renders on —
+// below the 4.5:1 AA floor for 11px text. `--text-2` measures 7.49:1 there.
+//
+// Note the backdrop: the disclaimer is a SIBLING of `.footerBand`, not a child, so it sits on `--bg`
+// rather than on `--panel`. That makes both ratios marginally better than the panel-based estimate
+// in the review that raised this, and changes neither verdict.
+//
+// The companion assertion that `--text-2` still HOLDS the value §7 names lives in
+// __tests__/token-conformance.test.ts, beside the other token-value pins — that is the file PAT-001
+// exempts, and the only lawful home for an assertion that must name a hex.
+// ---------------------------------------------------------------------------
+describe('the product-boundary disclaimer renders at the honesty-critical body token', () => {
+  const css = () => read('components/layout/ProofArenaShell.module.css');
+
+  it('colours the disclaimer with the sentence-case body token', () => {
+    expect(cssDeclaration(css(), '.disclaimer', 'color')).toBe('var(--text-2)');
+  });
+
+  it('does NOT colour it with a micro-label token', () => {
+    // Stated as its own assertion because it is the specific defect: `--text-3`/`--text-4` are
+    // reserved by §7:304 for 8–9px uppercase micro-labels, and this is an 11px multi-sentence
+    // string. A future edit that reaches for either token fails here with the reason attached.
+    const color = cssDeclaration(css(), '.disclaimer', 'color');
+    expect(color, 'the disclaimer is not a micro-label').not.toBe('var(--text-3)');
+    expect(color, 'the disclaimer is not a micro-label').not.toBe('var(--text-4)');
+  });
+
+  it('uses the SAME token as the adjacent sentence-case footer copy', () => {
+    // `.closingLine` is the other sentence-case string in this footer and was already correct. The
+    // two are one band of prose; a fix that made only the disclaimer right would leave the footer
+    // rendering one register of copy at two contrasts.
+    expect(cssDeclaration(css(), '.disclaimer', 'color'))
+      .toBe(cssDeclaration(css(), '.closingLine', 'color'));
+  });
+
+  it('does not reach the right token by retinting it', () => {
+    // The token indirection is what makes the assertion above readable; it is also a way to satisfy
+    // it while regressing the rendered colour, by pointing `--text-2` at a darker value. The
+    // VALUE pin lives in __tests__/token-conformance.test.ts (PAT-001 exempts that file and forbids
+    // a hex here). What is checkable in this file is the relationship: the body token and the
+    // micro-label tokens must remain three DIFFERENT values in the dark theme, so `--text-2` cannot
+    // have been quietly collapsed onto either reserved one.
+    const tokens = read('styles/tokens.css');
+    const body = cssDeclaration(tokens, ':root', '--text-2');
+    expect(body).not.toBeNull();
+    expect(body).not.toBe(cssDeclaration(tokens, ':root', '--text-3'));
+    expect(body).not.toBe(cssDeclaration(tokens, ':root', '--text-4'));
   });
 });

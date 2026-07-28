@@ -27,6 +27,24 @@ describe('token conformance (PAT-001: no raw hex outside the token source)', () 
     expect(tokens).toContain('#3B82F6');
   });
 
+  it('holds the text tokens at the values the handoff assigns to their roles', () => {
+    // PROOFARENA-OKX-DELTA-HANDOFF §7:302-304 assigns text values by ROLE: `--text-2` is
+    // sentence-case body and HONESTY-CRITICAL DISCLAIMERS, while `--text-3`/`--text-4` are reserved
+    // for 8–9px uppercase micro-labels because they do not clear AA at body sizes. The
+    // product-boundary disclaimer shipped at `--text-3` (3.42:1 on `--bg`) and is now at `--text-2`
+    // (7.49:1); see app/(proofarena)/route-scope.test.ts for the per-selector assertion.
+    //
+    // This pin belongs HERE and not with that assertion: this file is the one PAT-001 exempts, so it
+    // is the only place a test may name a hex. Without it, `--text-2` could be retinted to a failing
+    // value and the selector assertion would still pass.
+    const tokens = readFileSync(join(ROOT, 'styles/tokens.css'), 'utf8');
+    // The dark theme lives in `:root`; the light theme is `[data-direction='b']`, so anchor on the
+    // block rather than searching the file, or this reads whichever value appears last.
+    const dark = tokens.slice(tokens.indexOf(':root'), tokens.indexOf('[data-direction'));
+    expect(dark).toContain('--text-2: #93A0B4');
+    expect(dark).toContain('--text-3: #5D6675');
+  });
+
   it('contains no raw hex color outside tokens.css', () => {
     const offenders: string[] = [];
     for (const dir of SCAN_DIRS) {

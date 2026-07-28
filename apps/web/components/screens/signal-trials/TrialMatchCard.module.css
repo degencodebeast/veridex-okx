@@ -157,6 +157,10 @@
 .checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-3); }
 
 .retry {
+  /* An explicit flex box rather than the <button> UA default: the narrow breakpoint below gives this
+     control a 44px minimum that its 10px label does not fill, and centring must not depend on how a
+     UA happens to align button content. Kept identical to SeasonScreen.module.css `.retry`. */
+  display: inline-flex; align-items: center; justify-content: center;
   align-self: flex-start; font-family: var(--font-mono), monospace; font-size: 10px;
   letter-spacing: 0.06em; padding: 5px 10px; border-radius: var(--radius-control);
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text-1); cursor: pointer;
@@ -164,6 +168,15 @@
 .retry:hover, .retry:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
 
 .skeletonRow { height: 11px; border-radius: 3px; background: var(--panel-2); }
+
+/* Narrow (handoff §7: "at ≤ 760px … every tap target is ≥ 44px"). This stylesheet had no 760px
+   block — its only breakpoint was the 640px grid reflow below — so the tap-target rule gets its own
+   at the breakpoint the handoff actually names. Reusing 640px because it was already here would
+   leave this control undersized from 641px to 760px, and would put it at a different size from the
+   byte-identical retry on /trials, which is fixed at 760px. */
+@media (max-width: 760px) {
+  .retry { min-height: 44px; }
+}
 
 @media (max-width: 640px) {
   .checkRow { grid-template-columns: 1fr auto; }
