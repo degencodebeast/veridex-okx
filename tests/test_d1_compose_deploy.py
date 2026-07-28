@@ -700,3 +700,114 @@ class TestRestoreDrill:
         proc = subprocess.run(cmd, cwd=str(ROOT), input=script, capture_output=True, text=True, timeout=180)
         assert proc.returncode == 0, f"restore drill failed:\n{proc.stdout}\n{proc.stderr}"
         assert "RESTORE_DRILL_OK" in proc.stdout, f"drill must confirm sample-row read-back:\n{proc.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# P0-1 — the image's Ethereum dependency family.
+#
+# `origin/signal-trials` deployed and crashed in `create_server_app` with
+# `ModuleNotFoundError: eth_abi`, then the vendored package's own
+# `ImportError: EVM mechanism requires ethereum packages`. Root cause:
+# `okxweb3-app-x402` gates eth-abi / eth-account / eth-keys / eth-utils / web3
+# behind extras (`evm`, `mechanisms`, `all`) and the bare distribution pulls none.
+#
+# NO IMPORT TEST CAN GUARD THIS. `import eth_abi` passes on any host whose venv
+# already carries web3 for unrelated reasons, and every `uv sync` environment does:
+# uv.lock already resolved the family, so the lock-based dev path always worked
+# while the image's `pip install ".[...]"` path got nothing. The two install paths
+# diverge, and that divergence is exactly what stayed invisible.
+#
+# So these assert on the DECLARATION, which is host-independent by construction.
+# ---------------------------------------------------------------------------
+
+# The five distributions x402 needs for the EVM mechanism, per its own metadata.
+_X402_EVM_DISTS = ("eth-abi", "eth-account", "eth-keys", "eth-utils", "web3")
+
+
+def _pyproject_text() -> str:
+    return (ROOT / "pyproject.toml").read_text()
+
+
+def _signal_trials_extra() -> str:
+    """The one line declaring the `signal-trials` optional-dependency group."""
+    for line in _pyproject_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("signal-trials ="):
+            return stripped
+    raise AssertionError("pyproject.toml declares no 'signal-trials' extra")
+
+
+def test_the_signal_trials_extra_requests_x402s_evm_extra() -> None:
+    """ACCEPTANCE — the declaration must ASK for the Ethereum family.
+
+    `okxweb3-app-x402==0.1.1` installs no eth/web3 distribution at all. The image
+    runs `pip install ".[api,postgres,live,agent,signal-trials]"`, so whatever this
+    line omits is simply absent at runtime — and absent only inside the container.
+    """
+    line = _signal_trials_extra()
+    assert "okxweb3-app-x402" in line, line
+    assert "okxweb3-app-x402[" in line, (
+        "okxweb3-app-x402 is declared WITHOUT an extra, so no eth/web3 "
+        f"distribution reaches the image: {line}"
+    )
+    # `evm`, `mechanisms` and `all` each carry the identical five dists; any is
+    # sufficient, and pinning to one exact spelling would be over-tight.
+    assert any(f"[{name}]" in line or f",{name}]" in line or f"[{name}," in line
+               for name in ("evm", "mechanisms", "all")), (
+        f"the declared extra does not supply x402's Ethereum family: {line}"
+    )
+
+
+def test_the_declared_extra_is_narrow_rather_than_everything() -> None:
+    """`all` would also drag in the Solana mechanism this deployment does not use.
+
+    Not a correctness requirement — an image-size and attack-surface one — so it is
+    asserted separately from the acceptance test above and can be relaxed knowingly.
+    """
+    line = _signal_trials_extra()
+    assert "[all]" not in line, (
+        f"prefer the narrow [evm] extra over [all], which adds unused SVM machinery: {line}"
+    )
+
+
+def test_the_image_actually_installs_the_signal_trials_extra() -> None:
+    """DISCRIMINATION — the declaration only matters if the image asks for it.
+
+    Without this, the two tests above could both pass while `Dockerfile.api` had
+    quietly dropped `signal-trials` from its extras list, leaving the runtime
+    exactly as broken with the pyproject looking correct.
+    """
+    install_lines = [
+        line for line in (ROOT / "Dockerfile.api").read_text().splitlines()
+        if "pip install" in line and ".[" in line
+    ]
+    assert install_lines, "Dockerfile.api has no extras-based pip install line"
+    assert any("signal-trials" in line for line in install_lines), (
+        f"Dockerfile.api does not install the signal-trials extra: {install_lines}"
+    )
+
+
+def test_the_evm_distributions_are_resolvable_together() -> None:
+    """The five names are asserted against x402's OWN metadata, not a hand-list.
+
+    A hardcoded list would rot silently if upstream renamed or added a dependency.
+    Skipped rather than failed when the distribution is absent, because this file's
+    other tests must remain runnable in an environment without the extra installed.
+    """
+    import importlib.metadata as metadata
+
+    try:
+        dist = metadata.distribution("okxweb3-app-x402")
+    except metadata.PackageNotFoundError:  # pragma: no cover - env-dependent
+        pytest.skip("okxweb3-app-x402 is not installed in this environment")
+
+    declared = {
+        req.split(";")[0].split(">")[0].split("=")[0].strip().lower()
+        for req in (dist.metadata.get_all("Requires-Dist") or [])
+        if "extra == 'evm'" in req or 'extra == "evm"' in req
+    }
+    missing = [name for name in _X402_EVM_DISTS if name.replace("_", "-") not in declared]
+    assert not missing, (
+        f"x402's own 'evm' extra no longer declares {missing}; "
+        f"the guard above is checking for the wrong thing. Declared: {sorted(declared)}"
+    )

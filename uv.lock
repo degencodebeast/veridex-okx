@@ -1736,6 +1736,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/02/ab/3e644a3d8c1f39a80bd6d778a434ab5fe3a36cbb09f12b40b88e96ab2006/okxweb3_app_x402-0.1.1-py3-none-any.whl", hash = "sha256:5c16efd7b30b495609008fb690884909433a1af18b642f87e859ebfdbf2caefc", size = 134103, upload-time = "2026-07-09T11:49:12.266Z" },
 ]
 
+[package.optional-dependencies]
+evm = [
+    { name = "eth-abi" },
+    { name = "eth-account" },
+    { name = "eth-keys" },
+    { name = "eth-utils" },
+    { name = "web3" },
+]
+
 [[package]]
 name = "openai"
 version = "2.45.0"
@@ -2798,7 +2807,7 @@ postgres = [
 ]
 signal-trials = [
     { name = "httpx" },
-    { name = "okxweb3-app-x402" },
+    { name = "okxweb3-app-x402", extra = ["evm"] },
     { name = "websockets" },
 ]
 
@@ -2821,7 +2830,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'polymarket'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'signal-trials'", specifier = ">=0.27" },
     { name = "numpy", marker = "extra == 'polymarket'" },
-    { name = "okxweb3-app-x402", marker = "extra == 'signal-trials'", specifier = "==0.1.1" },
+    { name = "okxweb3-app-x402", extras = ["evm"], marker = "extra == 'signal-trials'", specifier = "==0.1.1" },
     { name = "openai", marker = "extra == 'agent'" },
     { name = "orjson", marker = "extra == 'polymarket'" },
     { name = "poly-eip712-structs", marker = "extra == 'polymarket'" },

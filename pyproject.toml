@@ -62,7 +62,17 @@ chain = ["solana", "solders"]
 # H4.1's SignalTrialsPaymentASGI binds to. Version pinned exactly: the middleware contract
 # (verify -> handler -> settle -> PAYMENT-RESPONSE ordering, hook signatures, settlement-status
 # surface, nonce replay behavior) is read from THIS installed source and must not drift silently.
-signal-trials = ["okxweb3-app-x402==0.1.1", "httpx>=0.27", "websockets>=12"]
+# `okxweb3-app-x402` gates its entire Ethereum dependency family — eth-abi,
+# eth-account, eth-keys, eth-utils, web3 — behind extras (`evm`, `mechanisms`,
+# `all`). The bare distribution pulls NONE of them, so a clean image installing
+# `.[…,signal-trials]` imported x402 fine and then died inside
+# `x402.mechanisms.evm.exact.server` with `ModuleNotFoundError: eth_abi`, followed
+# by the package's own `ImportError: EVM mechanism requires ethereum packages`.
+# `[evm]` is the narrowest extra that supplies the five; `mechanisms` and `all`
+# carry an identical dependency set, and `all` would pull SVM machinery we do not
+# use. A development host that already had web3 for other reasons could never
+# observe this — the extra must be declared, not inherited.
+signal-trials = ["okxweb3-app-x402[evm]==0.1.1", "httpx>=0.27", "websockets>=12"]
 
 [dependency-groups]
 # pyyaml: tests/test_deploy_scaffold.py parses compose.coolify.yml (D-0, dec-d0-dep-001).
