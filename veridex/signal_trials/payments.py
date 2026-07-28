@@ -3,7 +3,12 @@
 Fail-closed by construction: a production ``APP_ENV`` may not run with x402
 disabled, without a valid payout address, or against the in-memory
 :class:`FakeFacilitator`; and no configuration that can charge — production or
-merely enabled — may carry an invalid commit price.
+merely enabled — may carry an invalid commit price or an invalid advertised
+resource URL.
+
+The resource URL is the one advertised field with a security rule of its own: it
+is read from configuration and validated at startup, NEVER derived from the
+request. See :data:`DEFAULT_COMMIT_RESOURCE_URL`.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit
 
 # The x402 SDK (0.1.1) ships no ``py.typed`` marker, so mypy cannot analyze it.
 # Ignored at the import site rather than via a ``pyproject.toml`` override so the
@@ -32,6 +38,7 @@ from x402.http.utils import (  # type: ignore[import-untyped]
     encode_payment_required_header,
     encode_payment_response_header,
 )
+from x402.schemas.payments import ResourceInfo  # type: ignore[import-untyped]
 from x402.schemas.responses import (  # type: ignore[import-untyped]
     SettleResponse,
     SupportedKind,
@@ -54,6 +61,32 @@ GATED_METHODS = ("GET", "POST")
 X_LAYER_MAINNET = "eip155:196"
 DEFAULT_COMMIT_PRICE = "$0.01"
 COMMIT_MAX_TIMEOUT_SECONDS = 300
+
+# The canonical, absolute, HTTPS URL this route advertises as the x402 v2 ``resource``.
+#
+# WHY A CONFIGURED CONSTANT AND NOT THE REQUEST'S OWN HOST. Reconstructing this from the
+# incoming request — the ``Host`` header, ``X-Forwarded-Host``, or ``scope["headers"]``, which IS
+# the client's input — is the one implementation that must never be written here. The 402 is the
+# single response an unauthenticated caller can provoke at will, so a request-derived URL lets
+# any caller choose the resource URL that the challenge advertises. That challenge is a paying
+# agent's description of what it is about to buy, which makes an attacker-chosen host a
+# phishing primitive pointed at OTHER agents rather than a mistake confined to one request.
+# Nothing about the resource URL varies per request, so there is no benefit to trade against it.
+#
+# A DEFAULT, unlike ``PAY_TO_ADDRESS``, which has none. The two are not alike: a payout address
+# is deployment-specific and secret-adjacent, so the only safe absence is a refusal to boot. The
+# canonical route URL is public, has exactly one correct value for this deployment, and its
+# ABSENCE is precisely the conformance gap being closed — defaulting to the right answer is what
+# guarantees the challenge is never served without a ``resource`` again. Operators who serve this
+# route from another origin override it; see ``SIGNAL_TRIALS_COMMIT_RESOURCE_URL``.
+DEFAULT_COMMIT_RESOURCE_URL = "https://api.proofarena.xyz/signal-trials/commit"
+
+# HTTPS is required as a literal PREFIX of the configured string, not merely as the scheme
+# ``urlsplit`` reports. The distinction is load-bearing because the raw string is what reaches
+# the payer: ``urlsplit("HTTPS://host/x").scheme`` normalizes to ``"https"``, so a scheme-only
+# check would accept a value the frozen plan's "starts with ``https://``" expectation rejects,
+# and would advertise those exact uppercase bytes.
+_HTTPS_PREFIX = "https://"
 
 # Documented product ceiling for a single commit, enforced before the price ever
 # reaches the SDK. The hazard above it is silent rather than loud, and it starts
@@ -107,6 +140,13 @@ class X402Settings:
     price: str
     network: str
     sync_settle: bool
+    #: The absolute HTTPS URL advertised as the challenge's x402 v2 ``resource``. REQUIRED, with
+    #: no dataclass default on purpose: :data:`DEFAULT_COMMIT_RESOURCE_URL` is applied by
+    #: :func:`load_x402_settings`, so a hand-built settings object must state the value it
+    #: advertises rather than silently inheriting one. That mirrors the stance this module
+    #: already takes on ``price`` — a caller that builds settings directly never passes through
+    #: the loader, and :func:`build_resource_info` re-validates for exactly that reason.
+    resource_url: str
 
 
 @dataclass(frozen=True)
@@ -192,6 +232,89 @@ def _validate_commit_price(price: str) -> None:
         )
 
 
+def _validate_commit_resource_url(url: str) -> None:
+    """Refuse any resource URL that is not absolute, HTTPS, hosted, and credential-free.
+
+    The x402 v2 ``resource`` object tells a paying agent WHAT it is buying, so the failure this
+    guards is not a broken request — the pinned SDK types ``resource`` as optional and every
+    payment term lives in ``accepts`` — but a challenge that misdescribes the thing being paid
+    for. Five shapes are refused, and they are not five spellings of one rule:
+
+    * **Not ``https://``-prefixed.** A relative path, a bare host, or ``http://`` all fail. The
+      check is on the literal prefix rather than on ``urlsplit``'s normalized scheme, because the
+      configured bytes are the bytes the payer receives (see :data:`_HTTPS_PREFIX`).
+    * **No host.** ``https://`` and ``https:///commit`` clear a prefix test and name no origin,
+      so the payer is told to resolve nothing.
+    * **Embedded credentials.** ``https://user:token@host/commit`` is both a mispaste hazard and
+      the classic phishing shape; either way a secret must never be advertised in a 402.
+    * **Embedded whitespace.** Not a header-splitting risk here — the challenge is base64-encoded
+      into ``PAYMENT-REQUIRED``, so a newline cannot break the response — but a value with
+      whitespace in it is a configuration accident, and it is cheaper to refuse than to explain.
+    * **Unparseable authority.** An unterminated IPv6 literal, or a port that is not a number in
+      range. These already failed closed WITHOUT this clause, because the standard library raised
+      on its own — but it raised in ITS vocabulary, and that is the problem the clause fixes: see
+      the re-raise below.
+
+    Refused at STARTUP, which is the reason this is a separate validator rather than a check
+    inside the challenge path: :func:`_validate_commit_price` already argues that a boot refusal
+    beats raising per-request while the route is serving 402s, and the same argument applies
+    unchanged here.
+
+    No message reproduces the value, exactly as :func:`_redact` and :func:`_validate_commit_price`
+    withhold theirs. Diagnosability is preserved by naming WHICH rule failed, which is the part an
+    operator holding their own ``.env`` actually needs.
+
+    Args:
+        url: The configured resource URL.
+
+    Raises:
+        ValueError: ``url`` is not an absolute, HTTPS, hosted, credential-free URL with a
+            parseable authority.
+    """
+    rule = (
+        "must be an absolute HTTPS URL naming a host, with a parseable authority and no embedded "
+        "credentials or whitespace"
+    )
+
+    def refuse(detail: str) -> ValueError:
+        """Build the one refusal shape: name the variable and the rule, never the value."""
+        return ValueError(
+            f"X402 requires a valid SIGNAL_TRIALS_COMMIT_RESOURCE_URL: it {rule}, and it {detail}. "
+            "The configured value is withheld from this message."
+        )
+
+    if not url.startswith(_HTTPS_PREFIX):
+        raise refuse(f"does not begin with {_HTTPS_PREFIX!r}")
+    if any(character.isspace() for character in url):
+        raise refuse("contains whitespace")
+    try:
+        parts = urlsplit(url)
+        # Read INSIDE the try: ``port`` is a property that parses lazily, so a bad port raises here
+        # rather than at ``urlsplit``. Binding it also documents that the access is deliberate — a
+        # tidy-up that "removed an unused variable" would silently delete the port check.
+        port = parts.port
+    except ValueError as error:
+        # Both of these already raised ValueError without this clause, so the gate was never open.
+        # What the re-raise buys is the two things the stdlib messages do not give: they do not name
+        # the variable an operator has to go and fix ("Invalid IPv6 URL" on its own is a puzzle at
+        # boot), and ``Port could not be cast to integer value as 'notaport'`` QUOTES PART OF THE
+        # CONFIGURED VALUE — which is exactly what every refusal in this module refuses to do.
+        raise refuse("could not be parsed as a URL") from error
+    if not parts.hostname:
+        raise refuse("names no host")
+    # ``"@" in netloc`` rather than ``parts.username or parts.password``. ``netloc`` IS the
+    # authority, so an ``@`` in a path or query is not in scope here and the simpler test is also
+    # the more precise one; and unlike the parsed accessors it refuses an EMPTY userinfo
+    # (``https://@host/commit``), where ``username`` is ``""`` and falsy. No operator means to set
+    # that, and its ``@`` invites a reader to misjudge where the host begins.
+    if "@" in parts.netloc:
+        raise refuse("embeds credentials in its authority")
+    # ``urlsplit`` accepts port 0; no service listens there, so an advertised URL carrying it names
+    # a resource that cannot be fetched.
+    if port == 0:
+        raise refuse("names port 0")
+
+
 def load_x402_settings(env: Mapping[str, str], *, is_production: bool | None = None) -> X402Settings:
     """Resolve x402 settings from ``env``, failing closed in production.
 
@@ -234,6 +357,12 @@ def load_x402_settings(env: Mapping[str, str], *, is_production: bool | None = N
     enabled = env.get("X402_ENABLED", "false").strip().casefold() in _TRUTHY
     pay_to = env.get("PAY_TO_ADDRESS", "").strip()
     price = env.get("SIGNAL_TRIALS_COMMIT_PRICE", "").strip() or DEFAULT_COMMIT_PRICE
+    # Blank falls back to the canonical default, matching ``price`` exactly rather than
+    # ``pay_to``. That choice is what makes the fix hold: an unset value yields the correct
+    # absolute HTTPS URL, so no configuration reachable from here can serve a challenge with no
+    # ``resource`` at all. A value that is PRESENT but malformed is a different situation and is
+    # refused below — falling back would mask an operator's typo behind a URL they did not set.
+    resource_url = env.get("SIGNAL_TRIALS_COMMIT_RESOURCE_URL", "").strip() or DEFAULT_COMMIT_RESOURCE_URL
 
     if is_production:
         if not enabled:
@@ -246,8 +375,13 @@ def load_x402_settings(env: Mapping[str, str], *, is_production: bool | None = N
 
     # Only when the price can actually be charged. A disabled development config
     # mounts no gate, so a junk price there is inert and must not block startup.
+    #
+    # The resource URL is gated on the SAME condition and for the same reason: a config that
+    # mounts no paywall advertises nothing, so a malformed value there is inert. Whenever a
+    # challenge CAN be served, a malformed URL refuses the boot.
     if enabled or is_production:
         _validate_commit_price(price)
+        _validate_commit_resource_url(resource_url)
 
     return X402Settings(
         enabled=enabled,
@@ -257,6 +391,7 @@ def load_x402_settings(env: Mapping[str, str], *, is_production: bool | None = N
         # Settle before responding so the commit receipt carries a real tx hash;
         # settling asynchronously would let an unsettled commit return 200.
         sync_settle=True,
+        resource_url=resource_url,
     )
 
 
@@ -276,6 +411,24 @@ def build_commit_price(settings: X402Settings) -> PaymentOption:
         network=settings.network,
         max_timeout_seconds=COMMIT_MAX_TIMEOUT_SECONDS,
     )
+
+
+def build_resource_info(settings: X402Settings) -> ResourceInfo:
+    """Build the x402 v2 ``resource`` object the commit challenge advertises.
+
+    ``url`` ONLY. ``ResourceInfo`` also carries optional ``description`` and ``mime_type``, and
+    both are left unset: the gap being closed is the absent ``resource`` object, and every byte
+    added to a challenge is a byte a payer's client may key behaviour on. Adding them later is an
+    additive change; retracting them would not be.
+
+    Raises:
+        ValueError: ``settings.resource_url`` is not an absolute, HTTPS, hosted,
+            credential-free URL. Re-checked here rather than trusted from the loader, for the
+            same reason :func:`build_commit_price` re-checks the price: a directly constructed
+            :class:`X402Settings` never went through :func:`load_x402_settings`.
+    """
+    _validate_commit_resource_url(settings.resource_url)
+    return ResourceInfo(url=settings.resource_url)
 
 
 class FakeFacilitator:
@@ -629,6 +782,13 @@ class SignalTrialsPaymentASGI:
         self.live_trials = live_trials
         self._now_ms = now_ms if now_ms is not None else (lambda: int(time.time() * 1000))
         self._requirements: list[Any] | None = None
+        # EAGER, unlike ``_requirements``. The requirements are lazy because ``server.initialize``
+        # interrogates the facilitator, so building them at mount time would make composing an app
+        # depend on a facilitator being reachable. The resource object needs nothing but the
+        # settings, so there is no reason to defer it — and one reason not to: deferring would turn
+        # a malformed hand-built ``resource_url`` into a per-request exception on the money path,
+        # where the loader's whole design is to refuse at startup instead.
+        self._resource = build_resource_info(settings)
 
     # ------------------------------------------------------------------ ASGI plumbing
 
@@ -711,9 +871,15 @@ class SignalTrialsPaymentASGI:
         echoed — not the trial id, not the body — because this is the one response an
         unauthenticated caller can provoke at will, and it is where an echoed value would end up
         in somebody else's logs.
+
+        ``resource`` comes from the CONFIGURED URL resolved at construction, and the ``scope`` is
+        deliberately not a parameter of this method: there is nothing in a request this response
+        may be built from. Deriving the URL from the ``Host`` header would let the same
+        unauthenticated caller choose the resource URL advertised to paying agents; see
+        :data:`DEFAULT_COMMIT_RESOURCE_URL`.
         """
         requirements = self._payment_requirements()
-        challenge = self.server.create_payment_required_response(requirements, error=error)
+        challenge = self.server.create_payment_required_response(requirements, resource=self._resource, error=error)
         await self._send_json(
             send,
             402,

@@ -55,6 +55,7 @@ from x402.http.utils import (  # type: ignore[import-untyped]
     decode_payment_response_header,
     encode_payment_signature_header,
 )
+from x402.mechanisms.evm.constants import NETWORK_CONFIGS  # type: ignore[import-untyped]
 from x402.mechanisms.evm.exact.server import ExactEvmScheme  # type: ignore[import-untyped]
 from x402.schemas.payments import PaymentPayload  # type: ignore[import-untyped]
 
@@ -100,6 +101,13 @@ PAY_TO_B = "0x" + "d4" * 20
 #: Not a credential and not shaped like one — a tagged marker string. Its only job is to be
 #: searched for in rendered output, so a guard that leaks a configured value fails loudly.
 SENTINEL_SECRET = "SENTINEL-NEVER-RENDER-0000"
+
+#: The canonical, absolute, HTTPS URL of the gated commit route — the x402 v2 ``resource.url``
+#: every challenge in this module must advertise. Written out rather than imported from the
+#: module under test, and deliberately NOT concatenated from ``COMMIT_PATH`` either: both forms
+#: would agree with a wrong value by construction, which is this file's ``PKT-DEC-C22`` hazard.
+#: See the resource-object section at the end of this module for the full argument.
+CANONICAL_COMMIT_RESOURCE_URL = "https://api.proofarena.xyz/signal-trials/commit"
 
 
 class SimulatedCrash(BaseException):
@@ -202,14 +210,27 @@ class _FaultInjectingStore(ReceiptStore):
         return super().finalize_from_journal(staging_id)
 
 
-def _settings(*, pay_to: str = PAY_TO_A, price: str = "$0.01", sync_settle: bool = True) -> X402Settings:
-    """Directly constructed settings — the path that never sees the loader."""
+def _settings(
+    *,
+    pay_to: str = PAY_TO_A,
+    price: str = "$0.01",
+    sync_settle: bool = True,
+    resource_url: str = CANONICAL_COMMIT_RESOURCE_URL,
+) -> X402Settings:
+    """Directly constructed settings — the path that never sees the loader.
+
+    ``resource_url`` is a PARAMETER rather than a fixed field, for the reason ``pay_to`` is one:
+    a suite that held it constant could not distinguish a wrapper that advertises the configured
+    URL from one that hard-codes the canonical string. The mutation control that varies it is
+    ``test_a_configured_resource_url_is_what_reaches_the_wire``.
+    """
     return X402Settings(
         enabled=True,
         pay_to=pay_to,
         price=price,
         network=X_LAYER_MAINNET,
         sync_settle=sync_settle,
+        resource_url=resource_url,
     )
 
 
@@ -262,6 +283,7 @@ def x402_app_factory(tmp_path: Path) -> Any:
         transient_journal_failures: int = 0,
         pay_to: str = PAY_TO_A,
         sync_settle: bool = True,
+        resource_url: str = CANONICAL_COMMIT_RESOURCE_URL,
         trial: LiveTrial | None = None,
     ) -> tuple[SignalTrialsPaymentASGI, ReceiptStore, FakeFacilitator]:
         store = _FaultInjectingStore(
@@ -271,7 +293,7 @@ def x402_app_factory(tmp_path: Path) -> Any:
             crash_before_journal=crash_before_journal,
             transient_journal_failures=transient_journal_failures,
         )
-        settings = _settings(pay_to=pay_to, sync_settle=sync_settle)
+        settings = _settings(pay_to=pay_to, sync_settle=sync_settle, resource_url=resource_url)
         resolved = trial if trial is not None else open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
         app = _build_app(facilitator=facilitator, store=store, trial=resolved, settings=settings)
         return app, store, facilitator
@@ -1657,3 +1679,152 @@ async def test_M1_the_replay_guard_RETAINS_the_finalized_idempotency_pointer():
     assert facilitator.settle_calls == 1
     assert store.slot_state(FAKE_PAYER, LIVE_TRIAL_ID) == "finalized"
     assert len(store.public_records(FAKE_PAYER)) == 1
+
+
+# ----------------------------------------------------------------------------------------
+# The x402 v2 ``resource`` object on the challenge.
+#
+# A LOCAL CONFORMANCE GAP ENABLED BY A PERMISSIVE SDK, which is the only honest framing. The
+# pinned SDK declares ``resource: ResourceInfo | None = None`` (``x402/schemas/payments.py:54``)
+# and requires only ``accepts``, so omitting it raises nothing and breaks no request; the
+# canonical x402 v2 contract nevertheless carries it, and the frozen plan expects
+# ``resource.url`` to be an absolute ``https://`` URL. Nothing was outaged by its absence —
+# the challenge was simply less than the protocol describes.
+#
+# Why the expected URL is a LITERAL (:data:`CANONICAL_COMMIT_RESOURCE_URL`) and not the constant
+# under test: this module already names that hazard (``PKT-DEC-C22``, "both sides carry the same
+# defect"). Importing ``DEFAULT_COMMIT_RESOURCE_URL`` here would make the assertion agree with any
+# value the module happens to hold, including a wrong one, so the wire format is pinned by writing
+# out the bytes the payer must receive.
+# ----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", GATED_METHODS)
+async def test_the_challenge_names_the_canonical_resource_url_on_every_gated_method(x402_app_factory, method):
+    """Every unpaid gated request is answered with a challenge carrying ``resource.url``.
+
+    Parametrized over :data:`GATED_METHODS` rather than asserting on POST alone, because GET is
+    the method the OKX review probe issues: a fix applied on the body-bearing path only would
+    leave the probe's challenge non-conformant while every POST test passed.
+
+    The ``is not None`` assertion is separate from the URL comparison on purpose. The SDK
+    encoder drops ``None`` fields (``model_dump_json(exclude_none=True)``), so a missing resource
+    is ABSENT from the JSON rather than null, and an ``AttributeError`` on ``.url`` would report
+    this as a crash instead of as the unmet property it is.
+    """
+    app, _store, _fac = x402_app_factory(facilitator=FakeFacilitator())
+    async with _client(app) as client:
+        challenge = await _challenge(client, _body(0.6), method=method)
+
+    assert challenge.status_code == 402, challenge.text
+    required = decode_payment_required_header(challenge.headers["payment-required"])
+    assert required.resource is not None, (
+        f"the {method} challenge carries no x402 v2 resource object at all; "
+        "the pinned SDK permits the omission, the protocol does not"
+    )
+    assert required.resource.url == CANONICAL_COMMIT_RESOURCE_URL
+    # Asserted independently of the equality above so the two failure modes stay separable: a
+    # relative or plaintext URL that happens to differ from the literal reports WHICH rule broke.
+    assert required.resource.url.startswith("https://"), (
+        f"resource.url must be absolute and HTTPS; got {required.resource.url!r}"
+    )
+
+
+@pytest.mark.parametrize("method", GATED_METHODS)
+async def test_adding_the_resource_object_moves_no_other_advertised_field(x402_app_factory, method):
+    """The priced terms of the challenge are byte-for-byte what they were, on GET and POST alike.
+
+    A PIN, not a RED: every assertion here held before ``resource`` was added, and that is
+    exactly its value. The resource object is metadata attached to a challenge whose payment
+    terms decide where real money goes, so the risk of the change is not that ``resource`` is
+    wrong but that something adjacent moved with it. Literal expected values throughout — a
+    comparison recomputed through the same settings the wrapper read would agree with a drifted
+    configuration by construction.
+    """
+    app, _store, _fac = x402_app_factory(facilitator=FakeFacilitator())
+    async with _client(app) as client:
+        challenge = await _challenge(client, _body(0.6), method=method)
+
+    decoded = decode_payment_required_header(challenge.headers["payment-required"])
+    assert decoded.x402_version == 2
+    assert len(decoded.accepts) == 1
+    advertised = decoded.accepts[0]
+    assert advertised.network == X_LAYER_MAINNET == "eip155:196"
+    assert advertised.amount == "10000"  # $0.01 at six decimals
+    assert advertised.pay_to == PAY_TO_A
+    assert advertised.max_timeout_seconds == 300
+    assert advertised.scheme == "exact"
+    # The asset the payer actually transfers, cross-checked against the SDK's OWN network config
+    # rather than against a literal pasted here. That is an independent source, not a circular
+    # one: nothing in this repo chooses the asset — ``ExactEvmScheme`` resolves it from
+    # ``NETWORK_CONFIGS`` — so this asserts the wrapper still lets the scheme decide, and it
+    # keeps a token contract address out of the diff.
+    assert advertised.asset == NETWORK_CONFIGS[X_LAYER_MAINNET]["default_asset"]["address"]
+
+    # THE BODY, unchanged: a stable machine-readable code and nothing else. The resource URL is
+    # advertised in the header only, so a caller parsing the body sees no new field.
+    assert challenge.json() == {"error": "payment_required"}
+
+
+async def test_a_configured_resource_url_is_what_reaches_the_wire(x402_app_factory):
+    """The advertised URL FOLLOWS the configuration instead of being a constant in the wrapper.
+
+    The companion to :func:`test_the_challenge_names_the_canonical_resource_url_on_every_gated_method`,
+    and the one that makes it mean something. That test configures the canonical URL and asserts
+    the canonical URL, so a wrapper that ignored ``settings.resource_url`` and passed the literal
+    ``DEFAULT_COMMIT_RESOURCE_URL`` straight to the SDK would satisfy it completely — a vector
+    equal to the constant under test cannot detect that constant, the same trap
+    ``test_the_default_price_reaches_the_wire_through_the_H1_1_validated_path`` documents for
+    ``price``.
+
+    A second HTTPS host, so the only thing distinguishing it from the default is that it was
+    configured. Synthetic and unroutable: nothing resolves ``configured.invalid``.
+    """
+    configured = "https://configured.invalid/some/other/commit"
+    app, _store, _fac = x402_app_factory(facilitator=FakeFacilitator(), resource_url=configured)
+    async with _client(app) as client:
+        challenge = await _challenge(client, _body(0.6))
+
+    required = decode_payment_required_header(challenge.headers["payment-required"])
+    assert required.resource is not None
+    assert required.resource.url == configured, (
+        "the wrapper advertised a URL other than the configured one, so resource.url is "
+        "hard-coded rather than read from the settings"
+    )
+
+
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        "",  # a hand-built settings that simply omitted the value
+        "http://api.proofarena.xyz/signal-trials/commit",  # plaintext
+        "HTTPS://api.proofarena.xyz/signal-trials/commit",  # the bytes the payer gets are not https://
+        "/signal-trials/commit",  # relative: names no origin at all
+        "api.proofarena.xyz/signal-trials/commit",  # bare host, no scheme
+        "https://",  # https-prefixed and hostless
+        "https://user:token@api.proofarena.xyz/signal-trials/commit",  # credentials in the authority
+        "https://api.proofarena.xyz/signal trials/commit",  # embedded whitespace
+    ],
+)
+def test_a_gate_refuses_to_MOUNT_on_a_malformed_resource_url(tmp_path, rejected):
+    """A malformed resource URL fails at CONSTRUCTION, before the wrapper can serve one 402.
+
+    Fail-closed in the direction that matters. The alternative outcomes are both worse than a
+    refusal: advertising a plaintext or attacker-shaped URL to paying agents, or discovering the
+    problem as a per-request exception once the route is already answering challenges. The
+    wrapper's ``sync_settle`` guard already establishes that this class refuses to mount rather
+    than mount something that can lie; this is the same rule applied to the one field whose only
+    consumer is the challenge itself, so nothing else would ever surface a bad value.
+
+    Note this is the CONSTRUCTION path — a directly built ``X402Settings`` that never saw the
+    loader. The loader's own refusals are pinned in ``test_payments.py``.
+    """
+    store = ReceiptStore(tmp_path / f"store-{uuid.uuid4().hex}")
+    trial = open_live_trial(_sig(), now_ms=T0, trial_id=LIVE_TRIAL_ID)
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_RESOURCE_URL"):
+        _build_app(
+            facilitator=FakeFacilitator(),
+            store=store,
+            trial=trial,
+            settings=_settings(resource_url=rejected),
+        )

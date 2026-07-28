@@ -23,6 +23,7 @@ from veridex.signal_trials.payments import (
     VerifiedPayment,
     X402Settings,
     build_commit_price,
+    build_resource_info,
     build_resource_server,
     load_x402_settings,
 )
@@ -50,11 +51,23 @@ LITERAL_AT_CEILING = "$1000000"
 LITERAL_JUST_ABOVE_CEILING = "$1000000.000001"
 # The shape that produced a 407-digit atomic amount from the stock middleware.
 OVERSIZED_PRICE = "$" + "9" * 400
+# The canonical resource URL the challenge advertises, written out rather than imported from the
+# module under test: an expectation taken from the constant it is checking agrees with a wrong
+# value by construction. The loader's default is pinned against these bytes by
+# ``test_the_default_resource_url_is_the_canonical_commit_url``.
+CANONICAL_RESOURCE_URL = "https://api.proofarena.xyz/signal-trials/commit"
 
 
 def _settings_priced(price):
     """A directly constructed X402Settings — the path that never sees the loader."""
-    return X402Settings(enabled=True, pay_to="0x" + "a" * 40, price=price, network=X_LAYER_MAINNET, sync_settle=True)
+    return X402Settings(
+        enabled=True,
+        pay_to="0x" + "a" * 40,
+        price=price,
+        network=X_LAYER_MAINNET,
+        sync_settle=True,
+        resource_url=CANONICAL_RESOURCE_URL,
+    )
 
 
 def _must_not_raise(build):
@@ -201,7 +214,14 @@ def test_production_rejects_fake_facilitator_on_any_network():
     unsupported-network guard alone satisfied this, so it could not detect the
     weakening it is named for.
     """
-    s = X402Settings(enabled=True, pay_to="0x" + "a" * 40, price="$0.01", network="eip155:1952", sync_settle=True)
+    s = X402Settings(
+        enabled=True,
+        pay_to="0x" + "a" * 40,
+        price="$0.01",
+        network="eip155:1952",
+        sync_settle=True,
+        resource_url=CANONICAL_RESOURCE_URL,
+    )
     with pytest.raises(ValueError, match="FakeFacilitator"):
         build_resource_server(s, FakeFacilitator())
 
@@ -218,7 +238,14 @@ def test_rejected_pay_to_value_is_never_echoed():
 
 
 def test_unsupported_network_is_refused():
-    s = X402Settings(enabled=True, pay_to="0x" + "a" * 40, price="$0.01", network="eip155:1952", sync_settle=True)
+    s = X402Settings(
+        enabled=True,
+        pay_to="0x" + "a" * 40,
+        price="$0.01",
+        network="eip155:1952",
+        sync_settle=True,
+        resource_url=CANONICAL_RESOURCE_URL,
+    )
     with pytest.raises(ValueError, match="X402"):
         build_resource_server(s, facilitator=None)
 
@@ -262,7 +289,7 @@ def test_unset_or_blank_commit_price_falls_back_to_the_default():
 @pytest.mark.parametrize("price", ["$0", "", "1e9", "$0.0000001", "-1"])
 def test_directly_constructed_settings_cannot_bypass_price_validation(price):
     """The loader is not the only way in: build_commit_price re-checks."""
-    s = X402Settings(enabled=True, pay_to="0x" + "a" * 40, price=price, network=X_LAYER_MAINNET, sync_settle=True)
+    s = _settings_priced(price)
     with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_PRICE"):
         build_commit_price(s)
 
@@ -283,6 +310,185 @@ def test_disabled_development_config_tolerates_an_unusable_price():
     """No gate mounts, so a junk price is inert and must not block startup."""
     s = load_x402_settings({"APP_ENV": "development", "X402_ENABLED": "false", "SIGNAL_TRIALS_COMMIT_PRICE": "free"})
     assert s.enabled is False and s.price == "free"
+
+
+# --- the x402 v2 resource URL: a challenge that misdescribes what is being bought ---
+#
+# The gap these close is a LOCAL CONFORMANCE GAP ENABLED BY A PERMISSIVE SDK, not an outage. The
+# pinned SDK types ``PaymentRequired.resource`` as ``ResourceInfo | None = None`` and requires
+# only ``accepts``, so a challenge without it raised nothing and broke no payment. The canonical
+# x402 v2 contract carries it, and the frozen plan expects an absolute ``https://`` URL.
+#
+# The security property under test is NOT merely "the field is populated". It is that the value
+# comes from configuration validated at startup and never from the request — a URL derived from
+# a ``Host`` header would let any unauthenticated caller choose the resource URL advertised to
+# paying agents, since the 402 is the one response anyone can provoke at will. The loader takes
+# a plain mapping and no request object, so that property is structural here; the wrapper-side
+# pin that the advertised URL follows configuration lives in ``test_x402_integration.py``.
+
+
+def test_the_default_resource_url_is_the_canonical_commit_url():
+    """An unset value yields the canonical absolute HTTPS URL, not a blank or a relative one.
+
+    Compared against locally written bytes rather than the module's own
+    ``DEFAULT_COMMIT_RESOURCE_URL``: importing that constant would make this assertion agree with
+    whatever the module holds, which is the one thing it exists to check.
+    """
+    resolved = load_x402_settings(PROD_ENV).resource_url
+    assert resolved == CANONICAL_RESOURCE_URL
+    assert resolved.startswith("https://")
+
+
+def test_unset_or_blank_resource_url_falls_back_to_the_default():
+    """Blank means unset, and the fallback is what guarantees a challenge always has a resource.
+
+    Deliberately UNLIKE ``PAY_TO_ADDRESS``, which refuses to boot when absent. A payout address
+    is deployment-specific and there is no correct value to guess; the canonical route URL has
+    exactly one, and its absence is the defect being fixed — so defaulting is what makes "no
+    reachable configuration serves a challenge without a resource" true rather than hoped for.
+    """
+    for blank in ("", "   "):
+        s = load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": blank})
+        assert s.resource_url == CANONICAL_RESOURCE_URL
+
+
+def test_a_configured_resource_url_overrides_the_default():
+    """The loader READS the variable rather than always returning the constant.
+
+    Without this, a loader that ignored the environment entirely would satisfy every other test
+    in this section, because they all expect the canonical value.
+    """
+    configured = "https://alt.example.test/signal-trials/commit"
+    assert load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": configured}).resource_url == configured
+
+
+def test_a_configured_resource_url_is_stripped_of_surrounding_whitespace():
+    """Surrounding whitespace is an operator artifact; whitespace INSIDE the URL is refused."""
+    padded = f"  {CANONICAL_RESOURCE_URL}  "
+    assert load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": padded}).resource_url == (
+        CANONICAL_RESOURCE_URL
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "why"),
+    [
+        ("http://api.proofarena.xyz/signal-trials/commit", "plaintext"),
+        # urlsplit normalizes this scheme to "https", but the CONFIGURED BYTES are what reach the
+        # payer, and they do not start with "https://". A scheme-only check would accept it.
+        ("HTTPS://api.proofarena.xyz/signal-trials/commit", "uppercase scheme is not the https:// prefix"),
+        ("//api.proofarena.xyz/signal-trials/commit", "protocol-relative"),
+        ("/signal-trials/commit", "relative path, no origin"),
+        ("signal-trials/commit", "bare relative"),
+        ("api.proofarena.xyz/signal-trials/commit", "host with no scheme"),
+        ("https://", "https-prefixed and hostless"),
+        ("https:///signal-trials/commit", "empty authority"),
+        ("ftp://api.proofarena.xyz/commit", "wrong scheme entirely"),
+        ("https://user:token@api.proofarena.xyz/commit", "credentials embedded in the authority"),
+        ("https://api.proofarena.xyz/signal trials/commit", "embedded space"),
+        ("https://api.proofarena.xyz/commit\nX-Injected: 1", "embedded newline"),
+        # EMPTY userinfo. ``parts.username`` is "" here, which is falsy, so a
+        # ``username or password`` test would have ACCEPTED this and advertised the stray "@".
+        ("https://@api.proofarena.xyz/commit", "empty userinfo"),
+        # The three below already refused before the authority clause existed, because urlsplit and
+        # ``parts.port`` raise ValueError themselves. They are pinned so the REFUSAL SHAPE is owned:
+        # the message must name SIGNAL_TRIALS_COMMIT_RESOURCE_URL and must not quote the value, and
+        # the stdlib's own text does neither (see test_a_bad_port_refusal_does_not_quote_the_port).
+        ("https://[::1/commit", "unterminated IPv6 literal"),
+        ("https://api.proofarena.xyz:notaport/commit", "non-numeric port"),
+        ("https://api.proofarena.xyz:99999/commit", "out-of-range port"),
+        # urlsplit ACCEPTS port 0 and reports it as an int, so nothing raised on its own here.
+        ("https://api.proofarena.xyz:0/commit", "port 0"),
+    ],
+)
+def test_a_malformed_resource_url_refuses_to_start(url, why):
+    """Every malformed shape refuses the boot rather than advertising itself to a payer.
+
+    A PRESENT-but-malformed value is a different case from a blank one and must not fall back:
+    silently substituting the canonical URL for an operator's typo would advertise a URL nobody
+    configured, and the operator would never learn their value was discarded.
+
+    ``why`` is carried only so a parametrized id names the shape it was meant to reject.
+    """
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_RESOURCE_URL") as exc:
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": url})
+    assert "withheld" in str(exc.value), f"the refusal of a {why} URL must not echo the value"
+
+
+def test_rejected_resource_url_is_never_echoed():
+    """A rejected value stays out of the exception, exactly as the price and payout address do.
+
+    The URL field is as plausible a mispaste target as any other, and a startup ValueError lands
+    in logs and crash reports. Diagnosability is preserved by naming the RULE that failed — the
+    operator holds their own value already.
+    """
+    mispasted = "https://api.proofarena.xyz/commit?token=SUPERSECRET-DO-NOT-LOG&x=1 2"
+    with pytest.raises(ValueError) as exc:
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": mispasted})
+    message = str(exc.value)
+    assert "SUPERSECRET" not in message and mispasted not in message
+    assert "SIGNAL_TRIALS_COMMIT_RESOURCE_URL" in message and "whitespace" in message
+
+
+def test_a_bad_port_refusal_does_not_quote_the_port():
+    """The refusal for an unparseable authority is OURS, not the standard library's.
+
+    This is the whole reason the authority clause exists, and it is worth stating precisely: the
+    gate was never open. ``urlsplit`` and ``parts.port`` already raised ``ValueError`` on these
+    inputs, so a malformed authority always refused to boot.
+
+    What they got wrong is the message. ``parts.port`` raises "Port could not be cast to integer
+    value as 'SUPERSECRET'" — it QUOTES PART OF THE CONFIGURED VALUE, which is the one thing every
+    refusal in this module is built not to do — and it never names the variable an operator has to
+    go and fix. Both properties are asserted here, so a later simplification that drops the
+    re-raise and lets the stdlib error escape is caught.
+    """
+    with pytest.raises(ValueError) as exc:
+        load_x402_settings({**PROD_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": "https://host:SUPERSECRET/commit"})
+    message = str(exc.value)
+    assert "SUPERSECRET" not in message, f"the refusal quoted the configured value: {message}"
+    assert "SIGNAL_TRIALS_COMMIT_RESOURCE_URL" in message and "withheld" in message
+
+
+def test_enabled_development_config_still_validates_the_resource_url():
+    """Enabled-and-not-production can serve a challenge, so it is validated like production."""
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_RESOURCE_URL"):
+        load_x402_settings({**DEV_ENV, "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": "not-a-url"})
+
+
+def test_disabled_development_config_tolerates_an_unusable_resource_url():
+    """No gate mounts, so no challenge is served and a junk URL is inert — matching the price."""
+    s = load_x402_settings(
+        {"APP_ENV": "development", "X402_ENABLED": "false", "SIGNAL_TRIALS_COMMIT_RESOURCE_URL": "not-a-url"}
+    )
+    assert s.enabled is False and s.resource_url == "not-a-url"
+
+
+@pytest.mark.parametrize("url", ["", "http://api.proofarena.xyz/commit", "/commit", "https://", "not-a-url"])
+def test_directly_constructed_settings_cannot_bypass_resource_url_validation(url):
+    """The loader is not the only way in: build_resource_info re-checks, as build_commit_price does."""
+    s = X402Settings(
+        enabled=True,
+        pay_to="0x" + "a" * 40,
+        price="$0.01",
+        network=X_LAYER_MAINNET,
+        sync_settle=True,
+        resource_url=url,
+    )
+    with pytest.raises(ValueError, match="SIGNAL_TRIALS_COMMIT_RESOURCE_URL"):
+        build_resource_info(s)
+
+
+def test_build_resource_info_advertises_the_url_and_nothing_else():
+    """Only ``url`` is populated: ``description`` and ``mime_type`` stay unset.
+
+    Not cosmetic. The SDK encoder drops ``None`` fields, so leaving them unset keeps them off the
+    wire entirely — the challenge gains the resource object the protocol describes and no extra
+    surface a payer's client might key behaviour on.
+    """
+    info = build_resource_info(load_x402_settings(PROD_ENV))
+    assert info.url == CANONICAL_RESOURCE_URL
+    assert info.description is None and info.mime_type is None
 
 
 # --- magnitude bound: an amount the EVM gate cannot represent must never be advertised ---
