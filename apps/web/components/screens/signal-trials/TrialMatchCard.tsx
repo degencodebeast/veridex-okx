@@ -304,6 +304,15 @@ function TrialBody({ state, onRetry }: { state: TrialState; onRetry: () => void 
           <h1 className={styles.stateTitle}>Trial not found</h1>
           <p className={styles.stateBody}>No trial exists for this id. Nothing was published under it.</p>
           <Link className={styles.back} href="/trials">← BACK TO ARENA</Link>
+          {/* PROOFARENA-EXACT-COPY.md §4 `not found`. The behaviour above was already correct; this
+              line is what makes it LEGIBLE. An absent retry button is invisible — a judge cannot
+              distinguish a deliberate refusal from a forgotten affordance by looking at nothing —
+              so the reason is stated rather than merely enacted. It appears on this state ONLY:
+              `unavailable` IS a transport failure and DOES offer a retry, so borrowing the line
+              there would state the exact opposite of the truth about that state. */}
+          <p className={styles.stateSub} data-testid="trial-not-found-sub">
+            404 is not a transport failure — retry is not offered.
+          </p>
         </>
       );
     case 'unavailable':

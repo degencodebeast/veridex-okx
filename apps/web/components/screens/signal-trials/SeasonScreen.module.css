@@ -8,6 +8,38 @@
 .lead { margin: 0; font-size: 11px; color: var(--text-2); }
 .leadSub { margin: 0; font-size: 11px; color: var(--text-3); }
 
+/* The route's identity copy, under the h1. Mono descriptor, sans thesis — the same pairing the
+   prototype uses, and the reason it reads as a product statement rather than as more table
+   commentary. */
+.descriptor { margin: 0; font-family: var(--font-mono), monospace; font-size: 12px; color: var(--text-2); }
+.thesis { margin: 0; max-width: 620px; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--text-2); text-wrap: pretty; }
+
+/* The header's right column: the state badge with its sample counter, and the two actions. */
+.headSide { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; }
+.statusRow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.actionRow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* `N = 61 settled trials`, or `N —` when no season document exists to count from. Tabular figures
+   so the number does not shift the badge beside it as the season grows. */
+.sampleCounter {
+  font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600;
+  color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+.headAction {
+  display: inline-flex; align-items: center;
+  /* ≥ 34px here, ≥ 44px at the narrow breakpoint (handoff §7). */
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border); background: var(--panel);
+  font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.04em;
+  color: var(--text-2); text-decoration: none; white-space: nowrap;
+}
+.headAction:hover, .headAction:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
+/* The featured card is the one action that leads INTO the benchmark, so it carries the accent. */
+.headActionPrimary { border-color: var(--accent); background: var(--accent-bg); color: var(--accent-hi); }
+
 /* Season status chip. Deliberately NOT the shared <Badge> component: none of the season states is
    an existing BadgeVariant, and `verified` — the one that looks closest — is a legacy variant whose
    meaning (a per-artifact check) must never be stretched into an aggregate claim over a season. */
@@ -91,3 +123,11 @@
 .retry:hover, .retry:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
 
 .skeletonRow { height: 11px; border-radius: 3px; background: var(--panel-2); }
+
+/* Narrow (handoff §7). The header's right column stops being a right rail and becomes a normal
+   block, so nothing is pushed off a phone's edge, and every action reaches the 44px tap target. */
+@media (max-width: 760px) {
+  .headSide { align-items: flex-start; width: 100%; }
+  .statusRow, .actionRow { justify-content: flex-start; }
+  .headAction { min-height: 44px; }
+}

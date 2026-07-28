@@ -1,6 +1,7 @@
 'use client';
 import { useCallback, useEffect, useState } from 'react';
-import { getSignalTrialsSeason, SIGNAL_TRIALS_MARKOUT_LABEL } from '@/lib/signal-trials-api';
+import Link from 'next/link';
+import { getOpenTrial, getSignalTrialsSeason, SIGNAL_TRIALS_MARKOUT_LABEL } from '@/lib/signal-trials-api';
 import type { SeasonViewState, SignalTrialsRow, SignalTrialsSeason } from '@/lib/contracts';
 import styles from './SeasonScreen.module.css';
 
@@ -38,10 +39,21 @@ const STATE_CHIP: Record<ScreenState, string> = {
   unavailable: 'unavailable',
 };
 
+// PROOFARENA-EXACT-COPY.md §1/§3 — frozen identity copy for this route. Constants rather than inline
+// JSX text so the exact bytes are greppable and immune to JSX whitespace collapsing.
+const DESCRIPTOR = 'Reproducible benchmarks for financial agents.';
+const THESIS = 'Same sealed evidence. Different agent probabilities. One scoring law.';
+
 export function SeasonScreen() {
   const [season, setSeason] = useState<SignalTrialsSeason | null>(null);
   const [state, setState] = useState<ScreenState>('loading');
   const [attempt, setAttempt] = useState(0);
+  // The featured match card's target, resolved from GET /signal-trials/open-trial. `null` means "no
+  // featured action is offered" and covers BOTH honest answers — the route's `404 no_open_trial`
+  // (nothing is open right now) and any failure. Neither may produce a link: the brief's §6
+  // resolution path is resolve-or-hide, and a FEATURED MATCH CARD → that 404s the judge is worse
+  // than no featured card at all.
+  const [featuredTrialId, setFeaturedTrialId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -63,6 +75,20 @@ export function SeasonScreen() {
     return () => { alive = false; };
   }, [attempt]);
 
+  // A SEPARATE read from the season, and separate on purpose. The featured action is a NAVIGATION
+  // affordance and the season is the page's subject: folding this fetch into the season effect
+  // would let an open-trial failure decide the season's state, blanking real standings over a
+  // missing header link. So it resolves independently and fails silently into "no action offered".
+  // Not retried with `attempt` either — the retry button is the SEASON's retry, and re-running this
+  // read would not change what that button is for.
+  useEffect(() => {
+    let alive = true;
+    getOpenTrial()
+      .then((t) => { if (alive) setFeaturedTrialId(t === null ? null : t.trialId); })
+      .catch(() => { if (alive) setFeaturedTrialId(null); });
+    return () => { alive = false; };
+  }, []);
+
   const retry = useCallback(() => setAttempt((n) => n + 1), []);
 
   return (
@@ -70,14 +96,51 @@ export function SeasonScreen() {
       <header className={styles.head}>
         <div className={styles.headText}>
           <h1 className={styles.title}>ProofArena</h1>
+          {/* Identity first, and in EVERY state: a judge who lands on a `not_built` season must
+              still be told what this page is. Neither line carries data, so rendering them under an
+              empty state fabricates nothing. */}
+          <p className={styles.descriptor} data-testid="season-descriptor">{DESCRIPTOR}</p>
+          <p className={styles.thesis} data-testid="season-thesis">{THESIS}</p>
           <p className={styles.lead}>paper markout after modeled costs vs. predeclared baselines</p>
           <p className={styles.leadSub}>
             Official ranking is Brier-first. Markout is a legibility metric, not a trading result.
           </p>
         </div>
-        <span className={styles.chip} data-state={state} data-testid="season-status-chip">
-          {STATE_CHIP[state]}
-        </span>
+        <div className={styles.headSide}>
+          <div className={styles.statusRow}>
+            <span className={styles.chip} data-state={state} data-testid="season-status-chip">
+              {STATE_CHIP[state]}
+            </span>
+            {/* The counter beside the badge. `N —` when there is no season document to report a
+                count from — NOT `N = 0`, which would assert a season that sampled zero settled
+                trials. Same rule as every other nullable value on this screen: null is not zero. */}
+            <span className={styles.sampleCounter} data-testid="season-sample-counter">
+              {season === null || season.sampleSize === null
+                ? 'N —'
+                : `N = ${season.sampleSize} settled trials`}
+            </span>
+          </div>
+          <div className={styles.actionRow}>
+            <a
+              className={styles.headAction}
+              href="/SKILL.md"
+              target="_blank"
+              rel="noreferrer"
+              data-testid="season-header-skill-md"
+            >READ SKILL.md ↗</a>
+            {/* Rendered ONLY once an open trial resolves. There is no featured-trial field in the
+                frozen schema and no build-time constant is invented for one: `getOpenTrial()` is
+                the resolution path §6 of the brief names, and when it answers "nothing is open" the
+                action is simply absent. */}
+            {featuredTrialId === null ? null : (
+              <Link
+                className={`${styles.headAction} ${styles.headActionPrimary}`}
+                href={`/trials/${featuredTrialId}`}
+                data-testid="season-featured-trial"
+              >FEATURED MATCH CARD →</Link>
+            )}
+          </div>
+        </div>
       </header>
 
       <div className={styles.statePanel} data-state={state} data-testid="season-panel">

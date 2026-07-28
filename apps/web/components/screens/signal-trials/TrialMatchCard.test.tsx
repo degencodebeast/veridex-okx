@@ -43,7 +43,10 @@ import {
 } from '@/lib/signal-trials-api';
 import type * as W from '@/lib/wire';
 import { TrialMatchCard, TRIAL_SETTLEMENT_HORIZON_MS } from './TrialMatchCard';
-import TrialPage from '@/app/(app)/trials/[trialId]/page';
+// The route moved OUT of the `(app)` group so it could stop inheriting the legacy Veridex shell.
+// Route groups are URL-transparent, so `/trials/[trialId]` is unchanged; only this import path is.
+// See app/(proofarena)/route-scope.test.ts.
+import TrialPage from '@/app/(proofarena)/trials/[trialId]/page';
 
 // next/navigation is globally mocked in vitest.setup.ts WITHOUT `useParams`, which the route page
 // needs. Re-mocked here rather than widened globally: the trial id this page reads is the one thing
@@ -808,6 +811,36 @@ describe('H5.3 trial section states', () => {
     expect(screen.queryByTestId('trial-retry')).toBeNull();
     // Non-echo: the addendum forbids reflecting the requested id back from a 404.
     expect(panel.textContent).not.toContain(TRIAL_ID);
+  });
+
+  it('SAYS why there is no retry, in the required words', async () => {
+    // PROOFARENA-EXACT-COPY.md §4 `not found` gives this state a fourth line, and it is the line
+    // that turns a design choice into a stated one: the ABSENCE of a retry button is invisible, so
+    // a judge cannot tell a deliberate refusal from a forgotten affordance without the sub. The
+    // behaviour was already right; the explanation was missing.
+    stubRoutes({ trial: () => errorResponse(404, 'trial_not_found'), receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    const panel = await screen.findByTestId('trial-panel');
+    await waitFor(() => expect(panel).toHaveAttribute('data-state', 'not_found'));
+    // Exact node text, em dash included. `toHaveTextContent` matches substrings and normalises
+    // whitespace, so it would pass on copy the exact-copy sheet forbids.
+    expect(screen.getByTestId('trial-not-found-sub').textContent)
+      .toBe('404 is not a transport failure — retry is not offered.');
+    // The behaviour the copy describes must still hold: saying it is not a substitute for it.
+    expect(screen.queryByTestId('trial-retry')).toBeNull();
+  });
+
+  it('does NOT put the 404 sub on the transport-failure state', async () => {
+    // The discrimination control, and it is a claim about meaning rather than about layout: the
+    // `unavailable` state IS a transport failure and DOES offer a retry, so borrowing this line
+    // there would state the exact opposite of the truth about that state.
+    stubRoutes({ trial: () => jsonResponse({ error: 'boom' }, 500), receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    const panel = await screen.findByTestId('trial-panel');
+    await waitFor(() => expect(panel).toHaveAttribute('data-state', 'unavailable'));
+    expect(screen.queryByTestId('trial-not-found-sub')).toBeNull();
+    expect(panel.textContent).not.toContain('404 is not a transport failure');
+    expect(screen.getByTestId('trial-retry')).toBeInTheDocument();
   });
 
   it('a 500 renders "trial data unavailable" WITH a retry, and never as "not found"', async () => {
