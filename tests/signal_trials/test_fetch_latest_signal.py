@@ -319,6 +319,122 @@ def test_producer_reuses_run_preflight_credential_loader_without_a_local_duplica
     assert json.loads(capsys.readouterr().out) == REST
 
 
+_SUCCESS_REFLECTION_CREDENTIALS = _assigned(
+    ('API"\\\n雪', "SECRET\t\r☃", "PASS\b\f/猫")
+)
+_VALUE_FREE_REFUSAL = "refused: selected signal contains configured credential material\n"
+
+
+@pytest.mark.parametrize("credential_name", _CREDENTIAL_FIELDS)
+@pytest.mark.parametrize("location", ("nested-key", "nested-value"))
+def test_success_refuses_each_configured_credential_in_any_nested_string_key_or_value(
+    capsys: pytest.CaptureFixture[str],
+    credential_name: str,
+    location: str,
+) -> None:
+    producer = _load_producer()
+    credential = _SUCCESS_REFLECTION_CREDENTIALS[credential_name]
+    reflected = dict(REST, timestamp="1753400000001")
+    if location == "nested-key":
+        reflected["arbitraryUpstream"] = {
+            "outer": [{"prefix-" + credential + "-suffix": {"safe": True}}]
+        }
+    else:
+        reflected["arbitraryUpstream"] = {
+            "outer": [{"echo": ["prefix-" + credential + "-suffix"]}]
+        }
+    selected = False
+
+    class FakeClient:
+        async def list_signals(self, _filters):
+            nonlocal selected
+            selected = True
+            return SimpleNamespace(signals=(REST, reflected))
+
+    @contextlib.asynccontextmanager
+    async def client_factory(_credentials):
+        yield FakeClient()
+
+    assert (
+        producer.main(
+            env=_SUCCESS_REFLECTION_CREDENTIALS,
+            client_factory=client_factory,
+        )
+        != 0
+    )
+    captured = capsys.readouterr()
+    assert selected is True
+    assert captured.out == ""
+    assert captured.err == _VALUE_FREE_REFUSAL
+    for configured in _SUCCESS_REFLECTION_CREDENTIALS.values():
+        assert configured not in captured.err
+
+
+@pytest.mark.parametrize("location", ("nested-key", "nested-value"))
+def test_success_refuses_overlapping_configured_credentials_without_echoing_fragments(
+    capsys: pytest.CaptureFixture[str],
+    location: str,
+) -> None:
+    producer = _load_producer()
+    credentials = _assigned(("ABCDE", "CDEFG", "UNIQUE"))
+    reflected = dict(REST, timestamp="1753400000001")
+    if location == "nested-key":
+        reflected["arbitraryUpstream"] = {"outer": [{"prefix-ABCDEFG-suffix": True}]}
+    else:
+        reflected["arbitraryUpstream"] = {"outer": [{"echo": ["prefix-ABCDEFG-suffix"]}]}
+
+    class FakeClient:
+        async def list_signals(self, _filters):
+            return SimpleNamespace(signals=(REST, reflected))
+
+    @contextlib.asynccontextmanager
+    async def client_factory(_credentials):
+        yield FakeClient()
+
+    assert producer.main(env=credentials, client_factory=client_factory) != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _VALUE_FREE_REFUSAL
+    assert not any(fragment in captured.err for fragment in ("AB", "FG", "UNIQUE"))
+
+
+def test_clean_success_preserves_the_selected_json_bytes_without_rewriting_escaped_spellings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    producer = _load_producer()
+    clean = dict(REST, timestamp="1753400000001")
+    clean["arbitraryUpstream"] = {
+        "escapedSpellings": [
+            json.dumps(value)[1:-1]
+            for value in _SUCCESS_REFLECTION_CREDENTIALS.values()
+        ],
+        "credentialFragments": ["API", "SECRET", "PASS"],
+    }
+
+    class FakeClient:
+        async def list_signals(self, _filters):
+            return SimpleNamespace(signals=(REST, clean))
+
+    @contextlib.asynccontextmanager
+    async def client_factory(_credentials):
+        yield FakeClient()
+
+    assert (
+        producer.main(
+            env=_SUCCESS_REFLECTION_CREDENTIALS,
+            client_factory=client_factory,
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert captured.out == json.dumps(
+        clean,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+    assert captured.err == "selected one REST signal for chain 196\n"
+
+
 def test_success_writes_exactly_one_raw_json_object_to_stdout(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

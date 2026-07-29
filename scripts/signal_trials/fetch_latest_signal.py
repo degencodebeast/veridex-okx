@@ -23,6 +23,9 @@ from veridex.signal_trials.okx_client import (
 DEFAULT_CHAIN_INDEX = "196"
 REQUEST_TIMEOUT_SECONDS = 20.0
 _REDACTED = "<redacted>"
+_CREDENTIAL_REFLECTION_REFUSAL = (
+    "refused: selected signal contains configured credential material"
+)
 
 
 class SignalSelectionError(ValueError):
@@ -95,6 +98,35 @@ def redact(text: str, credentials: OKXCredentials | None) -> str:
     return "".join(rendered)
 
 
+def contains_loaded_credential(
+    value: object,
+    credentials: OKXCredentials,
+) -> bool:
+    """Return whether a nested JSON string key or value contains a loaded credential."""
+
+    configured = tuple(
+        credential
+        for credential in (
+            credentials.api_key,
+            credentials.secret_key,
+            credentials.passphrase,
+        )
+        if credential.strip()
+    )
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if any(credential in current for credential in configured):
+                return True
+        elif isinstance(current, Mapping):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, Sequence):
+            pending.extend(current)
+    return False
+
+
 def run_preflight_seam() -> Any:
     """Load the reviewed sibling credential and HTTP seams without relying on repository sys.path."""
     path = Path(__file__).with_name("run_preflight.py")
@@ -165,6 +197,9 @@ def main(
                 client_factory=client_factory,
             )
         )
+        if contains_loaded_credential(signal, credentials):
+            print(_CREDENTIAL_REFLECTION_REFUSAL, file=sys.stderr)
+            return 1
         rendered = json.dumps(signal, separators=(",", ":"), sort_keys=True)
     except Exception as error:
         print(f"refused: {redact(str(error), credentials)}", file=sys.stderr)
