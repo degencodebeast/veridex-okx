@@ -57,6 +57,11 @@ const STATE_CHIP: Record<ScreenState, string> = {
 const DESCRIPTOR = 'Reproducible benchmarks for financial agents.';
 const THESIS = 'Same sealed evidence. Different agent probabilities. One scoring law.';
 
+// A backend trial id is DATA, never URL syntax. Encode it once at the navigation boundary so
+// literal `%`, `?`, `#`, Unicode, controls, and markup remain one route segment. The destination
+// route then decodes that segment once, and its API path builders encode the decoded subject once.
+const trialHref = (trialId: string): string => `/trials/${encodeURIComponent(trialId)}`;
+
 export function SeasonScreen() {
   const [season, setSeason] = useState<SignalTrialsSeason | null>(null);
   const [state, setState] = useState<ScreenState>('loading');
@@ -171,7 +176,7 @@ export function SeasonScreen() {
             {featuredTrialId === null ? null : (
               <Link
                 className={`${styles.headAction} ${styles.headActionPrimary}`}
-                href={`/trials/${featuredTrialId}`}
+                href={trialHref(featuredTrialId)}
                 data-testid="season-featured-trial"
               >FEATURED MATCH CARD →</Link>
             )}
@@ -463,7 +468,7 @@ function SeasonRow({
       <td>
         <span data-testid="season-agent">
           {featuredTrialId === null ? row.agentId : (
-            <Link data-testid="season-row-link" href={`/trials/${featuredTrialId}`}>{row.agentId}</Link>
+            <Link data-testid="season-row-link" href={trialHref(featuredTrialId)}>{row.agentId}</Link>
           )}
         </span>
         {agentSubcaption(row) === null ? null : (
@@ -556,7 +561,7 @@ function SeasonCard({
   ) : (
     <Link
       className={`${styles.seasonCard} ${styles.seasonCardAction}`}
-      href={`/trials/${featuredTrialId}`}
+      href={trialHref(featuredTrialId)}
     >{content}</Link>
   );
 }

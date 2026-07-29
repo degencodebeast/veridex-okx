@@ -24,7 +24,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { resolve } from 'node:path';
-import { chromium, type Browser } from '@playwright/test';
+import { chromium, type Browser, type Page, type Route } from '@playwright/test';
 
 const WEB = resolve(__dirname, '../..');
 const NEXT = resolve(WEB, 'node_modules/.bin/next');
@@ -93,12 +93,7 @@ afterAll(async () => {
   server?.kill('SIGTERM');
 });
 
-/**
- * Load the real production document, let React hydrate, and record the two public API paths the
- * client card actually requests. Only those API calls are intercepted; the document and bundles
- * still cross `next start` over HTTP.
- */
-const hydratedTrialRequests = async (documentPath: string): Promise<string[]> => {
+const getBrowser = async (): Promise<Browser> => {
   if (!browser) {
     const bundled = chromium.executablePath();
     const systemChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -107,8 +102,16 @@ const hydratedTrialRequests = async (documentPath: string): Promise<string[]> =>
       executablePath: existsSync(bundled) ? bundled : systemChrome,
     });
   }
+  return browser;
+};
 
-  const page = await browser.newPage();
+/**
+ * Load the real production document, let React hydrate, and record the two public API paths the
+ * client card actually requests. Only those API calls are intercepted; the document and bundles
+ * still cross `next start` over HTTP.
+ */
+const hydratedTrialRequests = async (documentPath: string): Promise<string[]> => {
+  const page = await (await getBrowser()).newPage();
   const observed: string[] = [];
   await page.route('**/signal-trials/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -132,6 +135,120 @@ const hydratedTrialRequests = async (documentPath: string): Promise<string[]> =>
   await page.close();
   return observed.sort();
 };
+
+const navigationEvidence = {
+  t0_ms: 1700000000000,
+  chain_index: '501',
+  token_address: '0x1111111111111111111111111111111111111111',
+  symbol: 'AAA',
+  name: 'Asset A',
+  market_cap_usd: 1234567.5,
+  holders: 842,
+  top10_holder_percent: 31.5,
+  trigger_price: 0.0041732,
+  wallet_type: 'smart money',
+  trigger_wallet_count: 3,
+  trigger_wallet_address: '0x2222222222222222222222222222222222222222',
+  amount_usd: 25000,
+};
+
+const navigationSeason = {
+  season_id: 'season-link-transport',
+  season_status: 'qualified',
+  combo: { chain_index: '501', bar: '1m' },
+  sample_size: 61,
+  rows: [
+    {
+      agent_id: 'agent-signal-01',
+      qualified: true,
+      avg_brier: 0.184,
+      capped_avg_markout_bps: 12,
+      active_decisions: 44,
+      active_coverage: 0.91,
+      unscored: 2,
+      is_control: false,
+    },
+  ],
+};
+
+const navigationTrial = (trialId: string) => ({
+  trial_id: trialId,
+  trial_mode: 'live',
+  t0_ms: navigationEvidence.t0_ms,
+  commit_deadline_ms: navigationEvidence.t0_ms + 300000,
+  evidence: navigationEvidence,
+  evidence_hash: '3f1c8a5e0b47d29c6ea1b3f85d0c47921e6ab8d35c0f4172e9b6d84a3c15f072',
+  outcome: null,
+});
+
+const json = (route: Route, body: unknown, status = 200) =>
+  route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+
+async function openSeasonWithTrial(trialId: string, width: number) {
+  const page = await (await getBrowser()).newPage({ viewport: { width, height: 1000 } });
+  const observed: string[] = [];
+  const trial = navigationTrial(trialId);
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    observed.push(path);
+    if (path === '/signal-trials/season') return json(route, navigationSeason);
+    if (path === '/signal-trials/open-trial') {
+      const { outcome: _omitted, ...open } = trial;
+      return json(route, open);
+    }
+    if (path.endsWith('/receipts')) return json(route, []);
+    if (path.startsWith('/signal-trials/trials/')) return json(route, trial);
+    return json(route, { error: 'not_found' }, 404);
+  });
+  await page.goto(`${origin}/trials`, { waitUntil: 'networkidle' });
+  await page.locator('[data-testid="season-featured-trial"]').waitFor();
+  return { page, observed };
+}
+
+async function waitForTitle(page: Page, title: string) {
+  const deadline = Date.now() + 10_000;
+  while (await page.title() !== title) {
+    if (Date.now() > deadline) throw new Error(`title never became ${JSON.stringify(title)}`);
+    await page.waitForTimeout(50);
+  }
+}
+
+async function assertAllSeasonLinksAndClick(
+  trialId: string,
+  width: number,
+  clicked: 'header' | 'row' | 'card',
+) {
+  const encoded = encodeURIComponent(trialId);
+  const expectedHref = `/trials/${encoded}`;
+  const { page, observed } = await openSeasonWithTrial(trialId, width);
+
+  const header = page.locator('[data-testid="season-featured-trial"]');
+  const row = page.locator('[data-testid="season-row-link"]').first();
+  const card = page.locator('[data-testid="season-cards"] a').first();
+  expect(await header.getAttribute('href'), 'header featured action').toBe(expectedHref);
+  expect(await row.getAttribute('href'), 'desktop standings row').toBe(expectedHref);
+  expect(await card.getAttribute('href'), 'narrow standings card').toBe(expectedHref);
+
+  observed.length = 0;
+  const target = clicked === 'header' ? header : clicked === 'row' ? row : card;
+  await target.click();
+  await waitForTitle(page, `${trialId} — Fair-Play trial · ProofArena`);
+
+  const expectedRequests = [
+    `/signal-trials/trials/${encoded}`,
+    `/signal-trials/trials/${encoded}/receipts`,
+  ].sort();
+  const deadline = Date.now() + 10_000;
+  while (observed.filter((path) => path.startsWith('/signal-trials/trials/')).length < 2) {
+    if (Date.now() > deadline) break;
+    await page.waitForTimeout(50);
+  }
+  expect(
+    observed.filter((path) => path.startsWith('/signal-trials/trials/')).sort(),
+    `clicked ${clicked}; observed ${JSON.stringify(observed)}`,
+  ).toEqual(expectedRequests);
+  await page.close();
+}
 
 describe('/trials/[trialId] names the id the URL names, through the built transport', () => {
   // THE CONTROL. An id with no percent-encoding in it, which was already correct before the fix.
@@ -222,5 +339,29 @@ describe('/trials/[trialId] requests the same decoded id after hydration', () =>
   it('decodes markup as text while preserving one encoded request boundary', async () => {
     expect(await hydratedTrialRequests('/trials/%3Cscript%3Ealert(1)%3C%2Fscript%3E'))
       .toEqual(expectedPair('%3Cscript%3Ealert(1)%3C%2Fscript%3E'));
+  });
+});
+
+describe('/trials preserves the backend trial id through every Match Card link', () => {
+  it('passes the ordinary ASCII control through the visible header action', async () => {
+    await assertAllSeasonLinksAndClick('trial-0k9f2c', 1440, 'header');
+  });
+
+  it('encodes a literal percent before the visible desktop-row click', async () => {
+    await assertAllSeasonLinksAndClick('trial%20x', 1440, 'row');
+  });
+
+  it('encodes a literal query delimiter before the visible mobile-card click', async () => {
+    await assertAllSeasonLinksAndClick('trial?x', 390, 'card');
+  });
+
+  it('encodes a literal fragment delimiter before the visible header click', async () => {
+    await assertAllSeasonLinksAndClick('trial#x', 390, 'header');
+  });
+
+  it('preserves plus, Unicode, dot, and long publisher-permitted ids', async () => {
+    for (const id of ['release+1', 'épreuve-1', 'trial.release-1', `trial-${'z'.repeat(80)}`]) {
+      await assertAllSeasonLinksAndClick(id, 1440, 'header');
+    }
   });
 });
