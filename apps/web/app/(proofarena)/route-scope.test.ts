@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import ts from 'typescript';
 import { cssDeclaration } from '@/lib/css-source';
 
 const WEB = resolve(__dirname, '../..');
@@ -24,6 +25,94 @@ const read = (...seg: string[]) => readFileSync(p(...seg), 'utf8');
 // restated in PROOFARENA-OKX-DELTA-HANDOFF §7:232. Named once so no assertion can quietly move to a
 // different one.
 const NARROW = { media: '(max-width: 760px)' } as const;
+
+function namedImportBinding(
+  source: ts.SourceFile,
+  moduleName: string,
+  importedName: string,
+): string | null {
+  for (const statement of source.statements) {
+    if (!ts.isImportDeclaration(statement)
+      || !ts.isStringLiteral(statement.moduleSpecifier)
+      || statement.moduleSpecifier.text !== moduleName) continue;
+    const bindings = statement.importClause?.namedBindings;
+    if (!bindings || !ts.isNamedImports(bindings)) return null;
+    const match = bindings.elements.find((element) =>
+      (element.propertyName?.text ?? element.name.text) === importedName,
+    );
+    return match?.name.text ?? null;
+  }
+  return null;
+}
+
+function defaultLayoutReturn(source: ts.SourceFile): ts.Expression | null {
+  const layout = source.statements.find((statement): statement is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(statement)
+      && statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)
+      === true,
+  );
+  if (!layout?.body) return null;
+  const returns = layout.body.statements.filter(ts.isReturnStatement);
+  if (returns.length !== 1 || !returns[0].expression) return null;
+  let expression = returns[0].expression;
+  while (ts.isParenthesizedExpression(expression)) expression = expression.expression;
+  return expression;
+}
+
+function tagName(element: ts.JsxElement): string | null {
+  const name = element.openingElement.tagName;
+  return ts.isIdentifier(name) ? name.text : null;
+}
+
+function meaningfulJsxChildren(element: ts.JsxElement): readonly ts.JsxChild[] {
+  return element.children.filter((child) => {
+    if (ts.isJsxText(child)) return child.text.trim().length > 0;
+    // A JSX comment is an expression node with no expression. It is not rendered composition.
+    if (ts.isJsxExpression(child)) return child.expression !== undefined;
+    return true;
+  });
+}
+
+function legacyLayoutCompositionErrors(text: string): string[] {
+  const source = ts.createSourceFile('app-layout.tsx', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const appShellBinding = namedImportBinding(
+    source,
+    '@/components/layout/AppShell',
+    'AppShell',
+  );
+  const providerBinding = namedImportBinding(
+    source,
+    '@/components/layout/StatusBarContext',
+    'StatusBarProvider',
+  );
+  const errors: string[] = [];
+  if (appShellBinding !== 'AppShell') errors.push('missing real AppShell named import');
+  if (providerBinding !== 'StatusBarProvider') {
+    errors.push('missing real StatusBarProvider named import');
+  }
+
+  const returned = defaultLayoutReturn(source);
+  if (!returned || !ts.isJsxElement(returned) || tagName(returned) !== providerBinding) {
+    errors.push('layout does not return StatusBarProvider as the outer wrapper');
+    return errors;
+  }
+  const providerChildren = meaningfulJsxChildren(returned);
+  if (providerChildren.length !== 1
+    || !ts.isJsxElement(providerChildren[0])
+    || tagName(providerChildren[0]) !== appShellBinding) {
+    errors.push('StatusBarProvider does not directly wrap AppShell');
+    return errors;
+  }
+  const shellChildren = meaningfulJsxChildren(providerChildren[0]);
+  if (shellChildren.length !== 1
+    || !ts.isJsxExpression(shellChildren[0])
+    || !shellChildren[0].expression
+    || !ts.isIdentifier(shellChildren[0].expression)
+    || shellChildren[0].expression.text !== 'children') {
+    errors.push('AppShell does not directly wrap the children binding');
+  }
+  return errors;
+}
 
 describe('the ProofArena routes live outside the legacy (app) shell group', () => {
   it('serves both routes from the (proofarena) group', () => {
@@ -69,8 +158,58 @@ describe('the scope boundary — the legacy chrome is untouched and still used',
 
   it('still renders every OTHER route inside the legacy AppShell', () => {
     const appLayout = read('app/(app)/layout.tsx');
-    expect(appLayout).toContain('AppShell');
-    expect(appLayout).toContain('StatusBarProvider');
+    expect(legacyLayoutCompositionErrors(appLayout)).toEqual([]);
+  });
+
+  it.each([
+    [
+      'comments and strings',
+      `
+        import type { ReactNode } from 'react';
+        // StatusBarProvider and AppShell used to wrap this layout.
+        const labels = ['StatusBarProvider', 'AppShell'];
+        export default function Layout({ children }: { children: ReactNode }) {
+          return <>{children}</>;
+        }
+      `,
+    ],
+    [
+      'unrelated JSX elements',
+      `
+        import type { ReactNode } from 'react';
+        import { AppShell } from '@/components/layout/AppShell';
+        import { StatusBarProvider } from '@/components/layout/StatusBarContext';
+        export default function Layout({ children }: { children: ReactNode }) {
+          return <main><StatusBarProvider /><AppShell />{children}</main>;
+        }
+      `,
+    ],
+    [
+      'reversed wrapper nesting',
+      `
+        import type { ReactNode } from 'react';
+        import { AppShell } from '@/components/layout/AppShell';
+        import { StatusBarProvider } from '@/components/layout/StatusBarContext';
+        export default function Layout({ children }: { children: ReactNode }) {
+          return <AppShell><StatusBarProvider>{children}</StatusBarProvider></AppShell>;
+        }
+      `,
+    ],
+    [
+      'aliased imports plus unbound lookalike JSX names',
+      `
+        import type { ReactNode } from 'react';
+        import { AppShell as LegacyShell } from '@/components/layout/AppShell';
+        import {
+          StatusBarProvider as LegacyStatus,
+        } from '@/components/layout/StatusBarContext';
+        export default function Layout({ children }: { children: ReactNode }) {
+          return <StatusBarProvider><AppShell>{children}</AppShell></StatusBarProvider>;
+        }
+      `,
+    ],
+  ])('cannot be satisfied by %s', (_case, mutatedLayout) => {
+    expect(legacyLayoutCompositionErrors(mutatedLayout)).not.toEqual([]);
   });
 
   it('leaves the other product routes in the (app) group', () => {
