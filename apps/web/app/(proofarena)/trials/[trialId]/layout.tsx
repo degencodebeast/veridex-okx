@@ -77,7 +77,7 @@ export async function generateMetadata(
   // trial this page is about — and claims nothing about it: no result, no settlement, no score.
   // The page BODY owns the distinction between a real trial, `trial_not_found`, and a transport
   // failure (`TrialMatchCard` keeps those apart deliberately), and the router's non-echo rule
-  // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
+  // (`veridex/api/signal_trials_router.py:321-322`) governs REFUSAL BODIES, not this template.
   // Nothing here does I/O: resolving the id would put a server→API dependency on a public route.
   return {
     title: `${decodeTrialRouteSegment(trialId)} — ${TITLE_TAIL}`,

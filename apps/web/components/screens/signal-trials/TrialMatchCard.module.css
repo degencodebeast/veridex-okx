@@ -93,6 +93,13 @@
    prose-contrast.test.ts asserts BOTH directions, so a change to either rule fails on its own. */
 .panelLabel { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.1em; color: var(--text-3); }
 .panelSub { margin: 0; font-size: 10px; color: var(--text-2); }
+.panelHead {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.participantContext {
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
 
 .hashChip { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .hashLabel { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em; color: var(--text-3); }
@@ -136,6 +143,10 @@
 .table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
 .table th { text-align: left; padding: 9px; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); white-space: nowrap; }
 .table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); white-space: nowrap; }
+.table td::before {
+  content: attr(data-label); display: none; margin-bottom: 2px;
+  color: var(--text-3); font-size: 9px; letter-spacing: .06em; text-transform: uppercase;
+}
 .row:hover { background: var(--panel-2); }
 .r { text-align: right; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -254,6 +265,7 @@
   .table thead { display: none; }
   .table tr { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 10px; border-bottom: 1px solid var(--border); }
   .table td { display: block; padding: 2px; white-space: normal; overflow-wrap: anywhere; }
+  .table td::before { display: block; }
   .checkTierHead { grid-template-columns: 1fr 1fr; }
   .checkTierHead strong { grid-column: 1 / -1; text-align: left; }
 }

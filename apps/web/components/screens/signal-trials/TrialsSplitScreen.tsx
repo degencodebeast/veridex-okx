@@ -31,6 +31,7 @@ function Side({ receipt }: { receipt: CommitReceipt }) {
   return (
     <article className={`${styles.splitSide} split-side`} data-testid="split-agent">
       <code className={styles.payer}>{receipt.payer}</code>
+      <p className={styles.role} data-testid="split-agent-role">external payer</p>
       <dl className={styles.metrics}>
         <div><dt>p_follow_profitable</dt><dd>{receipt.pFollowProfitable.toFixed(2)}</dd></div>
         <div><dt>DERIVED ACTION</dt><dd>{receipt.action}</dd></div>

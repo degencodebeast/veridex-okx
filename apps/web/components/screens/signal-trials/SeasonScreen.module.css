@@ -186,6 +186,7 @@
   .headSide { align-items: flex-start; width: 100%; }
   .statusRow, .actionRow { justify-content: flex-start; }
   .headAction { min-height: 44px; }
+  .probeSummary { display: inline-flex; align-items: center; min-height: 44px; }
   /* The retry offered on a transport failure is a real tap target and was not one: 10px type with
      5px of vertical padding measured ~25px at 390px. The same control is authored again in
      TrialMatchCard.module.css and is fixed at THIS breakpoint there too — a judge moves between

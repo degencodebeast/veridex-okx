@@ -181,6 +181,50 @@ const navigationTrial = (trialId: string) => ({
   outcome: null,
 });
 
+const navigationSettledOutcome = (trialId: string) => ({
+  trial_id: trialId,
+  status: 'settled',
+  entry: navigationEvidence.trigger_price,
+  future: navigationEvidence.trigger_price * 1.01,
+  close_ts_ms: navigationEvidence.t0_ms + 3_600_000,
+  observation_lag_ms: 1_500,
+  follow_markout_bps: 75,
+  fade_markout_bps: -125,
+  follow_profitable: true,
+});
+
+const navigationReceipt = (trialId: string) => ({
+  receipt_id: 'rcpt_transport_1',
+  trial_id: trialId,
+  payer: '0x1111111111111111111111111111111111111111',
+  p_follow_profitable: 0.72,
+  methodology_version: 'sig_trials@1.0.0',
+  action: 'FOLLOW',
+  status: 'settled',
+  brier: 0.08,
+  chosen_markout_bps: 75,
+  committed_at_ms: navigationEvidence.t0_ms + 100_000,
+  commit_deadline_ms: navigationEvidence.t0_ms + 300_000,
+  trial_mode: 'live',
+  body_hash: 'bh_transport_1',
+  payment_tx_hash: 'tx_transport_1',
+});
+
+const navigationVerify = (trialId: string) => ({
+  receipt_id: 'rcpt_transport_1',
+  checks: {
+    body_hash: 'pass',
+    manifest: 'pass',
+    deadline_respected: 'pass',
+    live_mode: 'pass',
+    bar_version: 'pass',
+    law_version: 'pass',
+    evidence_equality: 'pass',
+    outcome_source: 'pass',
+  },
+  receipt: navigationReceipt(trialId),
+});
+
 const json = (route: Route, body: unknown, status = 200) =>
   route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
@@ -203,6 +247,63 @@ async function openSeasonWithTrial(trialId: string, width: number) {
   await page.goto(`${origin}/trials`, { waitUntil: 'networkidle' });
   await page.locator('[data-testid="season-featured-trial"]').waitFor();
   return { page, observed };
+}
+
+async function openSettledTrialWithTables(width: number) {
+  const trialId = 'trial-mobile-labels';
+  const encoded = encodeURIComponent(trialId);
+  const page = await (await getBrowser()).newPage({ viewport: { width, height: 1200 } });
+  const trial = {
+    ...navigationTrial(trialId),
+    outcome: navigationSettledOutcome(trialId),
+  };
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === `/signal-trials/trials/${encoded}/receipts`) {
+      return json(route, [navigationReceipt(trialId)]);
+    }
+    if (path === '/signal-trials/receipts/rcpt_transport_1/verify') {
+      return json(route, navigationVerify(trialId));
+    }
+    if (path === `/signal-trials/trials/${encoded}`) return json(route, trial);
+    return json(route, { error: 'not_found' }, 404);
+  });
+  await page.goto(`${origin}/trials/${encoded}`, { waitUntil: 'networkidle' });
+  await page.locator('[data-testid="participant-row"]').waitFor();
+  await page.locator('[data-testid="markout-row"]').first().waitFor();
+  return page;
+}
+
+async function openNoSeason(width: number) {
+  const page = await (await getBrowser()).newPage({ viewport: { width, height: 1000 } });
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/signal-trials/season') {
+      return json(route, { error: 'no_season_published' }, 404);
+    }
+    if (path === '/signal-trials/health') {
+      return json(route, { ok: true, season_state: 'no_season' });
+    }
+    if (path === '/signal-trials/open-trial') {
+      return json(route, { error: 'no_open_trial' }, 404);
+    }
+    return json(route, { error: 'not_found' }, 404);
+  });
+  await page.goto(`${origin}/trials`, { waitUntil: 'networkidle' });
+  await page.locator('[data-testid="season-probe-counts"]').waitFor();
+  await page.locator('[data-testid="season-skill-md"]').waitFor();
+  return page;
+}
+
+async function mobileCellLabels(
+  row: ReturnType<Page['locator']>,
+) {
+  return row.locator('td').evaluateAll((cells) => cells.map((cell) => ({
+    dataLabel: cell.getAttribute('data-label'),
+    ariaLabel: cell.getAttribute('aria-label'),
+    beforeContent: getComputedStyle(cell, '::before').content.replace(/^["']|["']$/g, ''),
+    beforeDisplay: getComputedStyle(cell, '::before').display,
+  })));
 }
 
 async function waitForTitle(page: Page, title: string) {
@@ -491,6 +592,77 @@ describe.each([390, 392])(
         MOBILE_REFLOW_ID,
         `Match Card heading at ${width}px`,
       );
+      await page.close();
+    });
+  },
+);
+
+describe.each([390, 392])(
+  '/trials mobile data tables preserve visible and accessible labels at %dpx',
+  (width) => {
+    it('labels all seven Agent Decisions values after the desktop headers are hidden', async () => {
+      const page = await openSettledTrialWithTables(width);
+      const panel = page.locator('[data-testid="participants-panel"]');
+      const table = panel.locator('table');
+      expect(await table.locator('thead').evaluate((head) => getComputedStyle(head).display))
+        .toBe('none');
+
+      const expected = [
+        'AGENT',
+        'ROLE',
+        'p_follow_profitable',
+        'DERIVED ACTION',
+        'BRIER',
+        'chosen paper markout (bps, after modeled costs)',
+        'STATUS',
+      ];
+      const labels = await mobileCellLabels(table.locator('tbody tr').first());
+      expect(labels.map((label) => label.dataLabel)).toEqual(expected);
+      expect(labels.map((label) => label.ariaLabel)).toEqual(expected);
+      expect(labels.map((label) => label.beforeContent)).toEqual(expected);
+      expect(labels.every((label) => label.beforeDisplay !== 'none')).toBe(true);
+      await page.close();
+    });
+
+    it('labels all four Cost Sensitivity values after the desktop headers are hidden', async () => {
+      const page = await openSettledTrialWithTables(width);
+      const table = page.locator('[data-testid="markout-table"] table');
+      expect(await table.locator('thead').evaluate((head) => getComputedStyle(head).display))
+        .toBe('none');
+
+      const expected = [
+        'DECLARED COST',
+        'FOLLOW MARKOUT (BPS)',
+        'FADE MARKOUT (BPS)',
+        'BASIS',
+      ];
+      const labels = await mobileCellLabels(table.locator('tbody tr').first());
+      expect(labels.map((label) => label.dataLabel)).toEqual(expected);
+      expect(labels.map((label) => label.ariaLabel)).toEqual(expected);
+      expect(labels.map((label) => label.beforeContent)).toEqual(expected);
+      expect(labels.every((label) => label.beforeDisplay !== 'none')).toBe(true);
+      await page.close();
+    });
+  },
+);
+
+describe.each([390, 392])(
+  '/trials no-season actions meet the narrow tap-target floor at %dpx',
+  (width) => {
+    it('gives VIEW PROBE COUNTS and READ SKILL.md at least 44px of height', async () => {
+      const page = await openNoSeason(width);
+      const heights = {
+        probeCounts: await page
+          .locator('[data-testid="season-probe-counts"] summary')
+          .evaluate((element) => element.getBoundingClientRect().height),
+        skill: await page
+          .locator('[data-testid="season-skill-md"]')
+          .evaluate((element) => element.getBoundingClientRect().height),
+      };
+      expect({
+        probeCounts: heights.probeCounts >= 44,
+        skill: heights.skill >= 44,
+      }).toEqual({ probeCounts: true, skill: true });
       await page.close();
     });
   },

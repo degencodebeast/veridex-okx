@@ -34,7 +34,7 @@ import { resolve } from 'node:path';
 // U+00B7 MIDDLE DOT. Those two characters have near-identical-looking neighbours that an editor,
 // a paste through a smart-quote filter, or a well-meaning "fix the dashes" pass will substitute:
 // U+2013 EN DASH, an ASCII hyphen, U+2022 BULLET, U+2027 HYPHENATION POINT. Read as glyphs they are
-// indistinguishable in a diff, so `assertsCodepoints` below pins them by number.
+// indistinguishable in a diff, so `nonAsciiCodepoints` below pins them by number.
 // ---------------------------------------------------------------------------
 const SEASON_TITLE = 'ProofArena — Reproducible benchmarks for financial agents';
 const SEASON_DESCRIPTION =
@@ -148,10 +148,11 @@ describe('/trials/[trialId] serves trial-specific metadata exactly as §4:113-11
     expect(titleA).not.toContain(b);
   });
 
-  it('accepts every id shape the store actually mints', async () => {
-    // `veridex/signal_trials/live.py:183` derives ids as `trial_{hex}`; the fixtures in this tree
-    // use `trial-0k9f2c` and `trial-zzz999`. All must pass through verbatim — a shape gate that
-    // rejected a real id would blank the title on a working page.
+  it('accepts the derived default and the existing explicit fixture ids', async () => {
+    // `veridex/signal_trials/live.py:183` derives the default as
+    // `trial_{evidence_hash[:24]}_{now_ms}`; the fixtures in this tree also use explicit ids such as
+    // `trial-0k9f2c` and `trial-zzz999`. All must pass through verbatim — a shape gate that rejected
+    // a real id would blank the title on a working page.
     for (const id of ['trial_a1b2c3d4e5f6', 'trial-0k9f2c', 'trial-zzz999', 'season001', 'A']) {
       expect(String((await trialMetadata(id)).title)).toBe(trialTitle(id));
     }
@@ -207,7 +208,7 @@ describe('/trials/[trialId] serves trial-specific metadata exactly as §4:113-11
   // The division of responsibility that replaces it: the TITLE names the route's SUBJECT and
   // asserts nothing about it — no result, no settlement, no score, which is all §4:119 asks of
   // metadata. The page BODY states whether the trial exists, and the router's non-echo rule
-  // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
+  // (`veridex/api/signal_trials_router.py:321-322`) governs REFUSAL BODIES, not this template.
   // -------------------------------------------------------------------------
   it('names whatever subject the route names, with no shape judgement of its own', async () => {
     for (const segment of [

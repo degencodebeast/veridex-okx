@@ -206,6 +206,13 @@ const MICRO = [
       + 'uppercase-literal-or-`.upper` construction (TrialMatchCard.tsx:692-702, :888-895)',
   },
   {
+    file: 'TrialMatchCard.module.css',
+    selector: '.table td::before',
+    role: 'The same participant and cost-sweep column labels repeated at narrow widths after the '
+      + 'real table headers are hidden: 9px, letter-spacing 0.06em, uppercase presentation, with '
+      + 'content sourced from each cell data-label (TrialMatchCard.tsx participant and markout rows)',
+  },
+  {
     file: 'SeasonScreen.module.css',
     selector: '.secondary',
     role: 'THE STYLESHEET CANNOT BE READ ALONE HERE EITHER: its only call site is the markout '

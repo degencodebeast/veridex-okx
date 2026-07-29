@@ -359,6 +359,44 @@ describe('H5.3 participants — the action is on the wire and is never re-derive
     expect(within(rows[0]).getByTestId('participant-p')).toHaveTextContent('0.72');
   });
 
+  it('labels the live participant surface as paid external commitments without inventing roles', async () => {
+    const panel = await participants();
+    expect(within(panel).getByTestId('participants-context'))
+      .toHaveTextContent('paid commits · live-only · 300s window');
+    expect(within(panel).getByRole('columnheader', { name: 'ROLE' })).toBeInTheDocument();
+
+    const roles = within(panel).getAllByTestId('participant-role');
+    expect(roles).toHaveLength(RECEIPTS.length);
+    expect(roles.map((role) => role.textContent)).toEqual(
+      RECEIPTS.map(() => 'external payer'),
+    );
+    const participantLabels = Array.from(
+      within(panel).getAllByTestId('participant-row')[0].querySelectorAll('td'),
+      (cell) => ({
+        dataLabel: cell.getAttribute('data-label'),
+        ariaLabel: cell.getAttribute('aria-label'),
+      }),
+    );
+    const expectedLabels = [
+      'AGENT',
+      'ROLE',
+      'p_follow_profitable',
+      'DERIVED ACTION',
+      'BRIER',
+      `chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`,
+      'STATUS',
+    ];
+    expect(participantLabels.map((label) => label.dataLabel)).toEqual(expectedLabels);
+    expect(participantLabels.map((label) => label.ariaLabel)).toEqual(expectedLabels);
+
+    const splitRoles = screen.getAllByTestId('split-agent-role');
+    expect(splitRoles).toHaveLength(2);
+    expect(splitRoles.map((role) => role.textContent)).toEqual([
+      'external payer',
+      'external payer',
+    ]);
+  });
+
   it('renders ABSTAIN for a receipt whose p is 0.91 — the wire action, not a client-side band', async () => {
     const panel = await participants();
     const row = within(panel).getAllByTestId('participant-row')[2];
@@ -783,6 +821,18 @@ describe('H5.3 markout table', () => {
     await card();
     const rows = screen.getAllByTestId('markout-row');
     expect(rows.map((r) => r.getAttribute('data-cost-bps'))).toEqual(['0', '10', '25', '50']);
+    const expectedLabels = [
+      'DECLARED COST',
+      'FOLLOW MARKOUT (BPS)',
+      'FADE MARKOUT (BPS)',
+      'BASIS',
+    ];
+    const labels = Array.from(rows[0].querySelectorAll('td'), (cell) => ({
+      dataLabel: cell.getAttribute('data-label'),
+      ariaLabel: cell.getAttribute('aria-label'),
+    }));
+    expect(labels.map((label) => label.dataLabel)).toEqual(expectedLabels);
+    expect(labels.map((label) => label.ariaLabel)).toEqual(expectedLabels);
     const official = rows.filter((r) => r.getAttribute('data-basis') === 'official');
     expect(official).toHaveLength(1);
     expect(official[0]).toHaveAttribute('data-cost-bps', '25');
@@ -1040,11 +1090,16 @@ describe('SPEC-R1 complete live Match Card surfaces', () => {
     expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
   });
 
-  it('invents no sides when the served participant set is empty', async () => {
+  it('does not mount a two-side comparison when the served participant set is empty', async () => {
     await participants({ receipts: () => jsonResponse([]) });
-    expect(screen.getByTestId('trials-split')).toHaveAttribute('data-state', 'empty');
+    expect(screen.queryByTestId('trials-split')).not.toBeInTheDocument();
     expect(screen.queryByTestId('split-agent')).not.toBeInTheDocument();
     expect(screen.queryByTestId('split-agent-absent')).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(
+      'two agents · one snapshot · one hash · one t0 · one deadline · one law',
+    );
+    expect(document.body.textContent).not.toContain('NO INDEPENDENT EVIDENCE PER SIDE');
+    expect(document.body.textContent).not.toContain('ONE SHARED OUTCOME BENEATH BOTH AGENTS');
   });
 
   it('shows Fair-Play phase tiers and an independent verdict tally without an aggregate badge', async () => {

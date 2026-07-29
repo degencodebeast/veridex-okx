@@ -199,6 +199,48 @@ describe('getSignalTrialsSeason composes season + health', () => {
     expect(s.rows).toEqual([]);
   });
 
+  it.each(['qualified', 'exploratory'] as const)(
+    '404 + health %s re-reads the published season once instead of fabricating a positive empty season',
+    async (state) => {
+      let seasonReads = 0;
+      const published = { ...seasonWire, season_status: state };
+      stubFetch(async (input) => {
+        const url = String(input);
+        if (url.includes('/season')) {
+          seasonReads += 1;
+          return seasonReads === 1
+            ? errorResponse(404, 'no_season_published')
+            : new Response(JSON.stringify(published), { status: 200 });
+        }
+        if (url.includes('/health')) {
+          return new Response(JSON.stringify({ ok: true, season_state: state }), { status: 200 });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+      const s = await getSignalTrialsSeason();
+      expect(s.seasonStatus).toBe(state);
+      expect(s.seasonId).toBe(published.season_id);
+      expect(s.sampleSize).toBe(published.sample_size);
+      expect(s.rows).toHaveLength(published.rows.length);
+      expect(calls()).toHaveLength(3);
+    },
+  );
+
+  it('404 + positive health + one more 404 fails closed after one bounded re-read', async () => {
+    stubFetch(async (input) => {
+      const url = String(input);
+      if (url.includes('/season')) return errorResponse(404, 'no_season_published');
+      if (url.includes('/health')) {
+        return new Response(JSON.stringify({ ok: true, season_state: 'qualified' }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    await expect(getSignalTrialsSeason()).rejects.toBeInstanceOf(ApiError);
+    expect(calls()).toHaveLength(3);
+  });
+
   it('a 500 on /season THROWS and never collapses into a season state', async () => {
     stubFetch(async (input) => {
       const url = String(input);

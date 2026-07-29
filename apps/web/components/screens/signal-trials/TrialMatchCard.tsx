@@ -285,7 +285,7 @@ export function TrialMatchCard({ trialId }: { trialId: string }) {
               agents={people.kind === 'list' ? people.entries.map((entry) => entry.receipt) : []}
             />
             <SignalStatePanel trial={trial.trial} />
-            {people.kind === 'list' ? (
+            {people.kind === 'list' && people.entries.length > 0 ? (
               <TrialsSplitScreen
                 trial={trial.trial}
                 receipts={people.entries.map((entry) => entry.receipt)}
@@ -559,7 +559,12 @@ function ParticipantsSection({ state }: { state: ParticipantsState }) {
   const attr = state.kind === 'list' ? (state.entries.length === 0 ? 'empty' : 'list') : state.kind;
   return (
     <div className={styles.panel} data-testid="participants-panel" data-state={attr}>
-      <p className={styles.panelLabel}>AGENT DECISIONS</p>
+      <div className={styles.panelHead}>
+        <p className={styles.panelLabel}>AGENT DECISIONS</p>
+        <span className={styles.participantContext} data-testid="participants-context">
+          paid commits · live-only · 300s window
+        </span>
+      </div>
       <p className={styles.panelSub}>one probability per agent · action is derived, never submitted</p>
       <ParticipantsBody state={state} />
     </div>
@@ -632,6 +637,7 @@ function ParticipantsBody({ state }: { state: ParticipantsState }) {
               <thead>
                 <tr>
                   <th className={styles.upper}>AGENT</th>
+                  <th className={styles.upper}>ROLE</th>
                   <th className={`${styles.upper} ${styles.r}`}>p_follow_profitable</th>
                   <th className={styles.upper}>DERIVED ACTION</th>
                   <th className={`${styles.upper} ${styles.r}`}>BRIER</th>
@@ -691,18 +697,51 @@ function ParticipantRow({ entry }: { entry: ParticipantEntry }) {
   const r = entry.receipt;
   return (
     <tr className={styles.row} data-testid="participant-row">
-      <td className="mono" data-testid="participant-payer">{r.payer}</td>
-      <td className={styles.num} data-testid="participant-p">{r.pFollowProfitable.toFixed(2)}</td>
+      <td
+        className="mono"
+        data-testid="participant-payer"
+        data-label="AGENT"
+        aria-label="AGENT"
+      >
+        {r.payer}
+      </td>
+      <td data-testid="participant-role" data-label="ROLE" aria-label="ROLE">
+        external payer
+      </td>
+      <td
+        className={styles.num}
+        data-testid="participant-p"
+        data-label="p_follow_profitable"
+        aria-label="p_follow_profitable"
+      >
+        {r.pFollowProfitable.toFixed(2)}
+      </td>
       {/* RELAYED, NOT RE-DERIVED. The backend derived this action at commit time and recorded it;
           re-deriving the bands here would let a client-side rule silently overrule the record. */}
-      <td data-testid="participant-action">
+      <td data-testid="participant-action" data-label="DERIVED ACTION" aria-label="DERIVED ACTION">
         <span className={styles.actionChip} data-action={r.action}>{r.action}</span>
       </td>
-      <td className={styles.num} data-testid="participant-brier">{brierText(r.brier)}</td>
-      <td className={styles.num} data-testid="participant-markout">{bps(r.chosenMarkoutBps)}</td>
+      <td
+        className={styles.num}
+        data-testid="participant-brier"
+        data-label="BRIER"
+        aria-label="BRIER"
+      >
+        {brierText(r.brier)}
+      </td>
+      <td
+        className={styles.num}
+        data-testid="participant-markout"
+        data-label={`chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`}
+        aria-label={`chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`}
+      >
+        {bps(r.chosenMarkoutBps)}
+      </td>
       {/* C26 at the participant surface: `pending` and `UNSCORED` rows carry identical null
           metrics, so this cell is the only thing that separates them. */}
-      <td data-testid="participant-status">{r.status}</td>
+      <td data-testid="participant-status" data-label="STATUS" aria-label="STATUS">
+        {r.status}
+      </td>
     </tr>
   );
 }
@@ -866,18 +905,36 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                     data-cost-bps={cost}
                     data-basis={official ? 'official' : 'diagnostic'}
                   >
-                    <td className={styles.num}>{cost} bps</td>
+                    <td
+                      className={styles.num}
+                      data-label="DECLARED COST"
+                      aria-label="DECLARED COST"
+                    >
+                      {cost} bps
+                    </td>
                     {/* ONLY the official row has served values. The other three rows are declared
                         by the published sweep and are NOT carried by the frozen wire, so they
                         render as not served. Computing them from the 25 bps pair would be this
                         client recomputing the settlement law — see the note below the table. */}
-                    <td className={styles.num} data-testid="markout-follow">
+                    <td
+                      className={styles.num}
+                      data-testid="markout-follow"
+                      data-label="FOLLOW MARKOUT (BPS)"
+                      aria-label="FOLLOW MARKOUT (BPS)"
+                    >
                       {official ? bps(outcome.followMarkoutBps) : DASH}
                     </td>
-                    <td className={styles.num} data-testid="markout-fade">
+                    <td
+                      className={styles.num}
+                      data-testid="markout-fade"
+                      data-label="FADE MARKOUT (BPS)"
+                      aria-label="FADE MARKOUT (BPS)"
+                    >
                       {official ? bps(outcome.fadeMarkoutBps) : DASH}
                     </td>
-                    <td>{official ? 'official rank basis' : 'diagnostic'}</td>
+                    <td data-label="BASIS" aria-label="BASIS">
+                      {official ? 'official rank basis' : 'diagnostic'}
+                    </td>
                   </tr>
                 ))}
               </tbody>

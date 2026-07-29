@@ -396,6 +396,20 @@ export async function getSignalTrialsSeason(): Promise<SignalTrialsSeason> {
   // 404 `no_season_published` — the honest empty state. Which of the two it is comes from health,
   // and if health cannot be read either, that throws too rather than guessing a state.
   const health = await getSeasonHealth();
+  if (health.seasonState === 'qualified' || health.seasonState === 'exploratory') {
+    // `/health` and `/season` are separate reads. A publisher can commit the season between them,
+    // so one initial 404 followed by a positive health state is a race, not an empty positive
+    // season. Re-read exactly once: the bounded retry recovers the published document without
+    // polling, while a second non-200 fails closed instead of inventing ids, sample sizes or rows.
+    const published = await signalTrialsGet(path);
+    if (published.ok) {
+      return adaptSignalTrialsSeason((await published.json()) as W.SignalTrialsSeasonWire);
+    }
+    throw new ApiError(
+      published.status,
+      `GET ${path} remained unavailable after health reported ${health.seasonState}: ${published.status}`,
+    );
+  }
   return {
     seasonStatus: health.seasonState,
     seasonId: null,
