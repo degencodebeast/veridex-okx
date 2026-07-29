@@ -250,6 +250,77 @@ async function assertAllSeasonLinksAndClick(
   await page.close();
 }
 
+type TextReflowMetrics = {
+  text: string;
+  fragments: Array<{ left: number; right: number; top: number; bottom: number }>;
+  visible: { left: number; right: number; top: number; bottom: number };
+  documentWidth: number;
+  viewportWidth: number;
+};
+
+/**
+ * Measure the painted text fragments rather than trusting the document width.
+ *
+ * A shell-level `overflow-x: clip` can keep `documentElement.scrollWidth` equal to the viewport
+ * while hundreds of pixels of an unbroken identity sit outside its own box. Range client rects
+ * expose those painted fragments. `visibleBox: 'parent'` is used for the compact inline metadata
+ * whose visible allocation is the flex row containing it; the block Match Card heading owns its
+ * own visible box.
+ */
+async function textReflowMetrics(
+  locator: ReturnType<Page['locator']>,
+  visibleBox: 'self' | 'parent',
+): Promise<TextReflowMetrics> {
+  return locator.evaluate((element, box) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const fragments = Array.from(range.getClientRects(), (rect) => ({
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom,
+    }));
+    const visibleElement = box === 'parent' ? element.parentElement : element;
+    if (visibleElement === null) throw new Error('identity surface has no visible box');
+    const visible = visibleElement.getBoundingClientRect();
+    return {
+      text: element.textContent ?? '',
+      fragments,
+      visible: {
+        left: visible.left,
+        right: visible.right,
+        top: visible.top,
+        bottom: visible.bottom,
+      },
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+    };
+  }, visibleBox);
+}
+
+function expectIdentityReflows(
+  metrics: TextReflowMetrics,
+  expectedText: string,
+  label: string,
+) {
+  expect(metrics.text, `${label}: the full identity text changed`).toBe(expectedText);
+  expect(metrics.fragments.length, `${label}: the long identity did not wrap`).toBeGreaterThan(1);
+  for (const [index, fragment] of metrics.fragments.entries()) {
+    expect(
+      fragment.left,
+      `${label}: fragment ${index} starts outside its visible box`,
+    ).toBeGreaterThanOrEqual(metrics.visible.left - 0.5);
+    expect(
+      fragment.right,
+      `${label}: fragment ${index} ends outside its visible box`,
+    ).toBeLessThanOrEqual(metrics.visible.right + 0.5);
+  }
+  // Secondary shell-level control only. The fragment assertions above are the load-bearing proof.
+  expect(metrics.documentWidth, `${label}: document still overflows`).toBe(metrics.viewportWidth);
+}
+
+const MOBILE_REFLOW_ID = `trial%20?#é+.${'z'.repeat(70)}`;
+
 describe('/trials/[trialId] names the id the URL names, through the built transport', () => {
   // THE CONTROL. An id with no percent-encoding in it, which was already correct before the fix.
   // Its job is to prove the harness can PASS: if the two decoding cases below were the only tests
@@ -365,3 +436,62 @@ describe('/trials preserves the backend trial id through every Match Card link',
     }
   });
 });
+
+describe.each([390, 392])(
+  '/trials keeps publisher-controlled identity visible at %dpx',
+  (width) => {
+    it('reflows the compact featured-trial identity inside its rail', async () => {
+      const encoded = encodeURIComponent(MOBILE_REFLOW_ID);
+      const { page } = await openSeasonWithTrial(MOBILE_REFLOW_ID, width);
+      const expectedHref = `/trials/${encoded}`;
+      expect(
+        await page.locator('[data-testid="season-featured-trial"]').getAttribute('href'),
+        'route encoding control',
+      ).toBe(expectedHref);
+
+      const rail = page.locator('[data-testid="season-shared-evidence-rail"]');
+      const identity = rail.locator('span').filter({
+        hasText: `FEATURED TRIAL · ${MOBILE_REFLOW_ID}`,
+      });
+      expect(await identity.count(), 'compact identity locator').toBe(1);
+      expectIdentityReflows(
+        await textReflowMetrics(identity, 'parent'),
+        `FEATURED TRIAL · ${MOBILE_REFLOW_ID}`,
+        `compact featured-trial identity at ${width}px`,
+      );
+      await page.close();
+    });
+
+    it('reflows the Match Card heading without changing title or API identity', async () => {
+      const encoded = encodeURIComponent(MOBILE_REFLOW_ID);
+      const { page, observed } = await openSeasonWithTrial(MOBILE_REFLOW_ID, width);
+      observed.length = 0;
+      await page.locator('[data-testid="season-featured-trial"]').click();
+      await waitForTitle(page, trialTitle(MOBILE_REFLOW_ID));
+      expect(await page.title(), 'served title identity control').toBe(trialTitle(MOBILE_REFLOW_ID));
+
+      const expectedRequests = [
+        `/signal-trials/trials/${encoded}`,
+        `/signal-trials/trials/${encoded}/receipts`,
+      ].sort();
+      const deadline = Date.now() + 10_000;
+      while (observed.filter((path) => path.startsWith('/signal-trials/trials/')).length < 2) {
+        if (Date.now() > deadline) break;
+        await page.waitForTimeout(50);
+      }
+      expect(
+        observed.filter((path) => path.startsWith('/signal-trials/trials/')).sort(),
+        'API identity controls',
+      ).toEqual(expectedRequests);
+
+      const heading = page.getByRole('heading', { level: 1, name: MOBILE_REFLOW_ID });
+      expect(await heading.count(), 'Match Card heading locator').toBe(1);
+      expectIdentityReflows(
+        await textReflowMetrics(heading, 'self'),
+        MOBILE_REFLOW_ID,
+        `Match Card heading at ${width}px`,
+      );
+      await page.close();
+    });
+  },
+);

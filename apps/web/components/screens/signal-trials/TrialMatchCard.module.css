@@ -21,7 +21,10 @@
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
 .headText { display: flex; flex-direction: column; gap: 4px; min-width: 240px; }
 .headChips { display: flex; gap: 6px; flex-wrap: wrap; }
-.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; font-family: var(--font-mono), monospace; }
+.title {
+  margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em;
+  font-family: var(--font-mono), monospace; overflow-wrap: anywhere;
+}
 .lead { margin: 0; font-size: 11px; color: var(--text-2); max-width: 62ch; }
 
 .back {

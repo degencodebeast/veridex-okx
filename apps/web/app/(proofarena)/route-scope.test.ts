@@ -113,10 +113,12 @@ describe('the metadata scope is per ROUTE, which is a fact about file placement'
 // The narrow-viewport contract.
 //
 // HONEST LIMITATION, stated rather than papered over: jsdom performs no layout and applies no CSS
-// module, so NO test in this suite can measure a document width. The real evidence for the 390px
-// overflow is a browser measurement of `documentElement.scrollWidth`, recorded outside the suite.
-// What these assertions ARE is a source contract: they fail if the wrapping rules that make the
-// shell reflowable are removed, which is the regression a future edit would actually introduce.
+// module, so NO test in this suite can measure whether descendant text reflows. A viewport-width
+// document is insufficient too: root clipping can hide hundreds of pixels outside a descendant's
+// own box while `documentElement.scrollWidth` still equals `innerWidth`. The production-build
+// browser cases in `route-metadata.transport.test.ts` measure the painted text fragments of both
+// publisher-controlled identity surfaces against their own visible boxes. What these assertions ARE
+// is the narrower shell source contract.
 // ---------------------------------------------------------------------------
 describe('the shell cannot force a min-content width wider than a phone', () => {
   const css = () => read('components/layout/ProofArenaShell.module.css');
@@ -136,10 +138,10 @@ describe('the shell cannot force a min-content width wider than a phone', () => 
     expect(css()).toMatch(/\.footerBand\b[^}]*flex-wrap:\s*wrap/s);
   });
 
-  it('caps the shell at the viewport and clips nothing horizontally', () => {
-    // `max-width: 100%` + `overflow-x: clip` on the shell root is the belt to the wrapping
-    // braces: if any DESCENDANT (a table, a hash chip) is wider than the viewport, the page body
-    // still must not scroll sideways — the offending element scrolls inside its own container.
+  it('keeps the defensive shell cap without treating it as descendant reflow proof', () => {
+    // `max-width: 100%` + `overflow-x: clip` remains a defensive page-level constraint. It is NOT
+    // evidence that a descendant is visible; the element-level production-browser assertions named
+    // above are load-bearing for that claim.
     expect(css()).toMatch(/\.shell\b[^}]*max-width:\s*100%/s);
     expect(css()).toMatch(/\.shell\b[^}]*overflow-x:\s*clip/s);
   });

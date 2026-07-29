@@ -6,7 +6,10 @@
 .railHead { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .label { margin: 0; color: var(--text-3); font: 10px/1.4 var(--font-mono), monospace; letter-spacing: .1em; }
 .sub, .meta, .note { margin: 0; color: var(--text-2); font-size: 10px; }
-.meta { font-family: var(--font-mono), monospace; color: var(--accent-hi); }
+.meta {
+  min-width: 0; max-width: 100%; overflow-wrap: anywhere;
+  font-family: var(--font-mono), monospace; color: var(--accent-hi);
+}
 .railNodes { display: grid; gap: 8px; }
 .railNode {
   display: grid; gap: 3px; min-width: 0; padding: 10px;
