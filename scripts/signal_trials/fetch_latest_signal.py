@@ -63,17 +63,36 @@ def select_unique_latest(rows: Sequence[object]) -> dict[str, Any]:
 def redact(text: str, credentials: OKXCredentials | None) -> str:
     """Replace loaded credential values while leaving missing-variable diagnostics readable."""
 
-    redacted = text
     if credentials is None:
-        return redacted
+        return text
     distinct_nonblank = dict.fromkeys(
         value
         for value in (credentials.api_key, credentials.secret_key, credentials.passphrase)
         if value.strip()
     )
-    for value in sorted(distinct_nonblank, key=len, reverse=True):
-        redacted = redacted.replace(value, _REDACTED)
-    return redacted
+    intervals: list[tuple[int, int]] = []
+    for value in distinct_nonblank:
+        start = 0
+        while (match := text.find(value, start)) >= 0:
+            intervals.append((match, match + len(value)))
+            start = match + 1
+    if not intervals:
+        return text
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+
+    rendered: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        rendered.extend((text[cursor:start], _REDACTED))
+        cursor = end
+    rendered.append(text[cursor:])
+    return "".join(rendered)
 
 
 def run_preflight_seam() -> Any:

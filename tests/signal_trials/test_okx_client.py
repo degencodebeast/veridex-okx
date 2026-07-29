@@ -14,6 +14,7 @@ import sys
 import time
 from importlib import util as importlib_util
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -156,19 +157,21 @@ class _IntSubclass(int):
     pass
 
 
-class _SecretKeyTripwire(str):
-    """Non-secret credential value that records real signer access to its key bytes."""
+class _CountingCredentials:
+    """Structural credential double that records access to the configured signing secret."""
 
-    encode_calls: int
+    api_key = "NONSECRET-API-KEY"
+    passphrase = "NONSECRET-PASSPHRASE"
+    base_url = "https://example.invalid"
+    configured_secret = "SIGNER-KEY-MATERIAL-SENTINEL"
 
-    def __new__(cls, value: str) -> "_SecretKeyTripwire":
-        instance = super().__new__(cls, value)
-        instance.encode_calls = 0
-        return instance
+    def __init__(self) -> None:
+        self.secret_key_reads = 0
 
-    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
-        self.encode_calls += 1
-        return super().encode(encoding, errors)
+    @property
+    def secret_key(self) -> str:
+        self.secret_key_reads += 1
+        return self.configured_secret
 
 
 @pytest.mark.parametrize(
@@ -238,7 +241,7 @@ async def test_signal_list_refuses_invalid_runtime_input_before_transport(
         values[field] = invalid_value
     filters = SignalFilters(**values)  # type: ignore[arg-type]
 
-    secret_key = _SecretKeyTripwire("SIGNER-KEY-MATERIAL-SENTINEL")
+    credential_double = _CountingCredentials()
 
     captured: list[httpx.Request] = []
 
@@ -261,16 +264,16 @@ async def test_signal_list_refuses_invalid_runtime_input_before_transport(
         with pytest.raises(ValueError) as raised:
             await OKXMarketClient(
                 seam.HttpxTransport(http),
-                OKXCredentials("k", secret_key, "p"),
+                cast(OKXCredentials, credential_double),
             ).list_signals(
                 filters,
                 cursor=cursor,  # type: ignore[arg-type]
             )
 
-    assert secret_key.encode_calls == 0
     assert captured == []
+    assert credential_double.secret_key_reads == 0
     assert "SECRET-SENTINEL" not in str(raised.value)
-    assert secret_key not in str(raised.value)
+    assert credential_double.configured_secret not in str(raised.value)
 
 
 async def test_signal_list_accepts_zero_thresholds_all_wallet_codes_and_non_ascii_cursor() -> None:

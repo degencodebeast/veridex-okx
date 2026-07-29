@@ -1,4 +1,5 @@
 import contextlib
+import itertools
 import json
 import os
 import shutil
@@ -91,50 +92,102 @@ def test_missing_credentials_stop_before_client_construction(
     )
 
 
-@pytest.mark.parametrize(
-    ("sentinels", "residual_fragments"),
-    [
+_CREDENTIAL_FIELDS = ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
+
+
+def _assigned(values: tuple[str, str, str]) -> dict[str, str]:
+    return dict(zip(_CREDENTIAL_FIELDS, values, strict=True))
+
+
+_REDACTION_CASES = [
+    *[
         pytest.param(
-            {
-                "OKX_API_KEY": "API-PREFIX",
-                "OKX_SECRET_KEY": "API-PREFIX-SECRET-DISTINCTIVE-SUFFIX",
-                "OKX_PASSPHRASE": "PASSPHRASE-NONOVERLAP",
-            },
-            ("-SECRET-DISTINCTIVE-SUFFIX",),
-            id="api-key-prefix-of-secret",
-        ),
-        pytest.param(
-            {
-                "OKX_API_KEY": "API-NONOVERLAP",
-                "OKX_SECRET_KEY": "SECRET-PREFIX",
-                "OKX_PASSPHRASE": "SECRET-PREFIX-PASSPHRASE-DISTINCTIVE-SUFFIX",
-            },
-            ("-PASSPHRASE-DISTINCTIVE-SUFFIX",),
-            id="secret-prefix-of-passphrase",
-        ),
-        pytest.param(
-            {
-                "OKX_API_KEY": "EQUAL-DUPLICATE-VALUE",
-                "OKX_SECRET_KEY": "EQUAL-DUPLICATE-VALUE",
-                "OKX_PASSPHRASE": "PASSPHRASE-UNIQUE",
-            },
-            (),
-            id="equal-duplicate-values",
-        ),
-        pytest.param(
-            {
-                "OKX_API_KEY": "API-UNIQUE",
-                "OKX_SECRET_KEY": "SECRET-UNIQUE",
-                "OKX_PASSPHRASE": "PASSPHRASE-UNIQUE",
-            },
-            (),
-            id="non-overlap-control",
-        ),
+            _assigned(assignment),
+            message,
+            "refused: <redacted>|<redacted>\n",
+            ("AB", "FG"),
+            id=f"partial-overlap-{text_order}-field-order-{index}",
+        )
+        for index, assignment in enumerate(itertools.permutations(("ABCDE", "CDEFG", "UNIQUE")))
+        for text_order, message in (
+            ("forward", "ABCDEFG|UNIQUE"),
+            ("reversed", "UNIQUE|ABCDEFG"),
+        )
     ],
+    *[
+        pytest.param(
+            _assigned(assignment),
+            "GFEDCBA|UNIQUE",
+            "refused: <redacted>|<redacted>\n",
+            ("GF", "BA"),
+            id=f"partial-overlap-reversed-patterns-field-order-{index}",
+        )
+        for index, assignment in enumerate(itertools.permutations(("EDCBA", "GFEDC", "UNIQUE")))
+    ],
+    *[
+        pytest.param(
+            _assigned(assignment),
+            "PREFIX-LONG|OTHER",
+            "refused: <redacted>|<redacted>\n",
+            ("-LONG",),
+            id=f"strict-prefix-field-order-{index}",
+        )
+        for index, assignment in enumerate(itertools.permutations(("PREFIX", "PREFIX-LONG", "OTHER")))
+    ],
+    pytest.param(
+        _assigned(("INNER", "XXINNERYY", "OTHER")),
+        "XXINNERYY|OTHER",
+        "refused: <redacted>|<redacted>\n",
+        ("XX", "YY"),
+        id="interior-containment",
+    ),
+    pytest.param(
+        _assigned(("DUPLICATE", "DUPLICATE", "OTHER")),
+        "DUPLICATE|OTHER",
+        "refused: <redacted>|<redacted>\n",
+        (),
+        id="equal-duplicates",
+    ),
+    pytest.param(
+        _assigned(("AAA", "BBB", "CCC")),
+        "AAAAAABBBCCC",
+        "refused: <redacted>\n",
+        (),
+        id="overlapping-repeated-and-adjacent-echoes",
+    ),
+    pytest.param(
+        _assigned(("秘密", "A|\nB", "\tC\r")),
+        "prefix秘密/A|\nB/\tC\rsuffix",
+        "refused: prefix<redacted>/<redacted>/<redacted>suffix\n",
+        (),
+        id="unicode-delimiters-and-control-characters",
+    ),
+    pytest.param(
+        _assigned(("KEY<redacted>TAIL", "<redacted>", "OTHER")),
+        "KEY<redacted>TAIL|<redacted>|OTHER",
+        "refused: <redacted>|<redacted>|<redacted>\n",
+        ("KEY", "TAIL"),
+        id="credential-containing-literal-placeholder",
+    ),
+    pytest.param(
+        _assigned(("API-UNIQUE", "SECRET-UNIQUE", "PASSPHRASE-UNIQUE")),
+        "API-UNIQUE|SECRET-UNIQUE|PASSPHRASE-UNIQUE",
+        "refused: <redacted>|<redacted>|<redacted>\n",
+        (),
+        id="non-overlap-control",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sentinels", "message", "expected_stderr", "residual_fragments"),
+    _REDACTION_CASES,
 )
-def test_exception_diagnostics_redact_distinct_credentials_longest_first_through_main(
+def test_exception_diagnostics_redact_original_text_occurrence_union_through_main(
     capsys: pytest.CaptureFixture[str],
     sentinels: dict[str, str],
+    message: str,
+    expected_stderr: str,
     residual_fragments: tuple[str, ...],
 ) -> None:
     producer = _load_producer()
@@ -142,16 +195,7 @@ def test_exception_diagnostics_redact_distinct_credentials_longest_first_through
 
     class ExplodingClient:
         async def list_signals(self, _filters):
-            raise RuntimeError(
-                "upstream echoed "
-                + " / ".join(
-                    (
-                        sentinels["OKX_API_KEY"],
-                        sentinels["OKX_SECRET_KEY"],
-                        sentinels["OKX_PASSPHRASE"],
-                    )
-                )
-            )
+            raise RuntimeError(message)
 
     @contextlib.asynccontextmanager
     async def client_factory(_credentials):
@@ -160,11 +204,56 @@ def test_exception_diagnostics_redact_distinct_credentials_longest_first_through
     assert producer.main(env=sentinels, client_factory=client_factory) != 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "<redacted>" in captured.err
+    assert captured.err == expected_stderr
     for sentinel in set(sentinels.values()):
-        assert sentinel not in captured.err
+        if sentinel != "<redacted>":
+            assert sentinel not in captured.err
     for fragment in residual_fragments:
         assert fragment not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("sentinels", "missing_names"),
+    [
+        pytest.param(
+            _assigned(("", "SECRET", "PASSPHRASE")),
+            "OKX_API_KEY",
+            id="blank-api-key",
+        ),
+        pytest.param(
+            _assigned(("API", "   ", "PASSPHRASE")),
+            "OKX_SECRET_KEY",
+            id="whitespace-secret-key",
+        ),
+        pytest.param(
+            _assigned(("API", "SECRET", "\t")),
+            "OKX_PASSPHRASE",
+            id="whitespace-passphrase",
+        ),
+    ],
+)
+def test_blank_credentials_keep_real_main_missing_variable_diagnostic_byte_exact(
+    capsys: pytest.CaptureFixture[str],
+    sentinels: dict[str, str],
+    missing_names: str,
+) -> None:
+    producer = _load_producer()
+    constructed = False
+
+    @contextlib.asynccontextmanager
+    async def client_factory(_credentials):
+        nonlocal constructed
+        constructed = True
+        yield None
+
+    assert producer.main(env=sentinels, client_factory=client_factory) == 1
+    captured = capsys.readouterr()
+    assert constructed is False
+    assert captured.out == ""
+    assert captured.err == (
+        "refused: missing or blank OKX credentials in the environment: "
+        f"{missing_names}\n"
+    )
 
 
 def test_redaction_ignores_blank_values_without_rewriting_diagnostics() -> None:
