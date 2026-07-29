@@ -148,6 +148,165 @@ async def test_signal_list_hmac_covers_the_exact_utf8_bytes_emitted_by_real_http
     assert request.headers["OK-ACCESS-SIGN"] == expected_signature
 
 
+@pytest.mark.parametrize(
+    "invalid_threshold",
+    [
+        pytest.param(True, id="boolean"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+    ],
+)
+async def test_invalid_threshold_never_reaches_real_httpx_transport_or_hmac(
+    invalid_threshold: object,
+) -> None:
+    """Runtime-invalid numeric values must stop before the authenticated transport boundary."""
+    import httpx
+
+    captured: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"code": "0", "data": []})
+
+    seam_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    )
+    spec = importlib_util.spec_from_file_location("invalid_input_real_http_seam", seam_path)
+    assert spec is not None and spec.loader is not None
+    seam = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(seam)
+
+    filters = SignalFilters(chain_index="196", min_amount_usd=invalid_threshold)  # type: ignore[arg-type]
+    refused: ValueError | None = None
+    async with httpx.AsyncClient(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http:
+        try:
+            await OKXMarketClient(
+                seam.HttpxTransport(http),
+                OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel"),
+            ).list_signals(filters)
+        except ValueError as error:
+            refused = error
+
+    signed = bool(captured and "OK-ACCESS-SIGN" in captured[0].headers)
+    emitted = None if not captured else captured[0].content
+    assert captured == [], f"invalid threshold reached real HttpxTransport: signed={signed}, body={emitted!r}"
+    assert refused is not None
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("chain_index", "", id="chain-empty"),
+        pytest.param("chain_index", "abc", id="chain-non-decimal"),
+        pytest.param("chain_index", "١", id="chain-non-ascii-decimal"),
+        pytest.param("chain_index", 196, id="chain-int"),
+        pytest.param("chain_index", True, id="chain-bool"),
+        pytest.param("chain_index", _StringSubclass("196"), id="chain-str-subclass"),
+        pytest.param("wallet_type", "", id="wallet-empty"),
+        pytest.param("wallet_type", "4", id="wallet-undocumented"),
+        pytest.param("wallet_type", "1,", id="wallet-empty-tail"),
+        pytest.param("wallet_type", ",1", id="wallet-empty-head"),
+        pytest.param("wallet_type", "1,,2", id="wallet-empty-middle"),
+        pytest.param("wallet_type", "1, 2", id="wallet-whitespace"),
+        pytest.param("wallet_type", 1, id="wallet-int"),
+        pytest.param("wallet_type", _StringSubclass("1"), id="wallet-str-subclass"),
+        pytest.param("wallet_type", "SECRET-SENTINEL", id="wallet-value-not-logged"),
+        *[
+            pytest.param(field, value, id=f"{field}-{case}")
+            for field in (
+                "min_address_count",
+                "min_amount_usd",
+                "min_market_cap_usd",
+                "min_liquidity_usd",
+            )
+            for case, value in (
+                ("boolean", True),
+                ("negative", -1),
+                ("float", 1.0),
+                ("string", "1"),
+                ("none", None),
+            )
+        ],
+        pytest.param("min_amount_usd", float("nan"), id="amount-nan"),
+        pytest.param("min_amount_usd", float("inf"), id="amount-infinity"),
+        pytest.param("min_amount_usd", float("-inf"), id="amount-negative-infinity"),
+        pytest.param("min_amount_usd", _IntSubclass(1), id="amount-int-subclass"),
+        pytest.param("cursor", "", id="cursor-empty"),
+        pytest.param("cursor", 1, id="cursor-int"),
+        pytest.param("cursor", True, id="cursor-bool"),
+        pytest.param("cursor", _StringSubclass("next"), id="cursor-str-subclass"),
+    ],
+)
+async def test_signal_list_refuses_invalid_runtime_input_before_transport(
+    field: str,
+    invalid_value: object,
+) -> None:
+    values: dict[str, object] = {
+        "chain_index": "196",
+        "wallet_type": "1",
+        "min_address_count": 2,
+        "min_amount_usd": 1000,
+        "min_market_cap_usd": 100_000,
+        "min_liquidity_usd": 20_000,
+    }
+    cursor: object | None = None
+    if field == "cursor":
+        cursor = invalid_value
+    else:
+        values[field] = invalid_value
+    filters = SignalFilters(**values)  # type: ignore[arg-type]
+    transport = RecordingFake({"code": "0", "data": []})
+
+    with pytest.raises(ValueError) as raised:
+        await OKXMarketClient(transport, OKXCredentials("k", "s", "p")).list_signals(
+            filters,
+            cursor=cursor,  # type: ignore[arg-type]
+        )
+
+    assert transport.calls == []
+    assert "SECRET-SENTINEL" not in str(raised.value)
+
+
+async def test_signal_list_accepts_zero_thresholds_all_wallet_codes_and_non_ascii_cursor() -> None:
+    transport = RecordingFake({"code": "0", "data": []})
+    filters = SignalFilters(
+        chain_index="0",
+        wallet_type="3,1,2",
+        min_address_count=0,
+        min_amount_usd=0,
+        min_market_cap_usd=0,
+        min_liquidity_usd=0,
+    )
+
+    await OKXMarketClient(transport, OKXCredentials("k", "s", "p")).list_signals(
+        filters,
+        cursor="café",
+    )
+
+    assert transport.calls[0][3] == [
+        {
+            "chainIndex": "0",
+            "walletType": "3,1,2",
+            "minAddressCount": "0",
+            "minAmountUsd": "0",
+            "minMarketCapUsd": "0",
+            "minLiquidityUsd": "0",
+            "cursor": "café",
+        }
+    ]
+
+
 async def test_list_signals_posts_array_body_and_parses_cursor():
     fake = RecordingFake({"code": "0", "data": [{"timestamp": "1753400000000", "price": "0.042",
         "chainIndex": "501", "amountUsd": "1500", "triggerWalletCount": "3", "walletType": "1",

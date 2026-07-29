@@ -7,6 +7,11 @@ FROM python:3.11-slim AS base
 
 WORKDIR /app
 
+# The baked Signal-trial operator runbook invokes both tools inside this API container.
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install the package with the extras the serving import path needs:
 #   api           — FastAPI + uvicorn + PyJWT[crypto] (the Privy ES256 auth boundary the app imports)
 #   postgres      — psycopg[binary] + psycopg-pool (the durable pooled PostgresStore)

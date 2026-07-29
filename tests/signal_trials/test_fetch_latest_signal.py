@@ -345,28 +345,31 @@ args = sys.argv[1:]
 out = args[args.index("-o") + 1]
 Path(out).write_text(os.environ["FAKE_BODY"], encoding="utf-8")
 sys.stdout.write(os.environ["FAKE_STATUS"])
+raise SystemExit(int(os.environ.get("FAKE_CURL_EXIT", "0")))
 """,
         encoding="utf-8",
     )
     fake_curl.chmod(0o755)
 
     cases = [
-        ("404", '{"error":"no_open_trial"}', 0, "expected safe"),
-        ("404", '{"error":"no_open_trial","unexpected":true}', 1, "unexpected"),
-        ("404", "{}", 1, "unexpected"),
-        ("200", '{"trial_id":"already-open"}', 1, "already open"),
-        ("404", '{"error":"different"}', 1, "unexpected"),
-        ("404", "[]", 1, "unexpected"),
-        ("404", "{invalid-json", 1, "unexpected"),
-        ("500", '{"error":"no_open_trial"}', 1, "unexpected"),
+        ("404", '{"error":"no_open_trial"}', 0, 0, "expected safe"),
+        ("404", '{"error":"no_open_trial"}', 7, 1, "unexpected"),
+        ("404", '{"error":"no_open_trial","unexpected":true}', 0, 1, "unexpected"),
+        ("404", "{}", 0, 1, "unexpected"),
+        ("200", '{"trial_id":"already-open"}', 0, 1, "already open"),
+        ("404", '{"error":"different"}', 0, 1, "unexpected"),
+        ("404", "[]", 0, 1, "unexpected"),
+        ("404", "{invalid-json", 0, 1, "unexpected"),
+        ("500", '{"error":"no_open_trial"}', 0, 1, "unexpected"),
     ]
-    for status, body, expected_exit, expected_diagnostic in cases:
+    for status, body, curl_exit, expected_exit, expected_diagnostic in cases:
         env = dict(os.environ)
         env.update(
             {
                 "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                 "FAKE_STATUS": status,
                 "FAKE_BODY": body,
+                "FAKE_CURL_EXIT": str(curl_exit),
             }
         )
         result = subprocess.run(
@@ -384,6 +387,279 @@ sys.stdout.write(os.environ["FAKE_STATUS"])
     assert "curl -fsS https://api.proofarena.xyz/signal-trials/open-trial" not in qa
     assert "QA_OPEN_STATUS" in qa
     assert "closed trial" in qa.lower()
+
+
+_LOCAL_TRIAL_ID = f"trial_{'a' * 24}_1753400000000"
+_LOCAL_EVIDENCE_HASH = "b" * 64
+_LOCAL_OPEN_SUMMARY = {
+    "trial_id": _LOCAL_TRIAL_ID,
+    "trial_mode": "live",
+    "t0_ms": 1_753_400_000_000,
+    "commit_deadline_ms": 1_753_400_300_000,
+    "decision_window_ms": 300_000,
+    "evidence_hash": _LOCAL_EVIDENCE_HASH,
+    "evidence_fields": ["symbol"],
+    "published": True,
+}
+_PUBLIC_LOCAL_TRIAL = {
+    "trial_id": _LOCAL_TRIAL_ID,
+    "trial_mode": "live",
+    "t0_ms": 1_753_400_000_000,
+    "commit_deadline_ms": 1_753_400_300_000,
+    "evidence": {"symbol": "TKN"},
+    "evidence_hash": _LOCAL_EVIDENCE_HASH,
+    "outcome": None,
+}
+
+
+def _extract_live_open_shell() -> str:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    section = text.split("## 4. Dry-run and open", 1)[1].split(
+        "## 5. Explicit single payment",
+        1,
+    )[0]
+    shell_blocks = section.split("```sh")[1:]
+    assert len(shell_blocks) >= 2, "Step 4 must contain separate dry-run and live-open commands"
+    return shell_blocks[-1].split("```", 1)[0].strip()
+
+
+def _run_live_open_shell(
+    tmp_path: Path,
+    *,
+    open_exit: int = 0,
+    local_summary: dict[str, object] | None = _LOCAL_OPEN_SUMMARY,
+    preopen_exit: int = 0,
+    preopen_status: str = "404",
+    preopen_body: str = '{"error":"no_open_trial"}',
+    public_exit: int = 0,
+    public_status: str = "200",
+    public_body: dict[str, object] = _PUBLIC_LOCAL_TRIAL,
+    prehold_lock: bool = False,
+) -> SimpleNamespace:
+    assert shutil.which("jq") is not None, "the executable open workflow requires real jq"
+    data_dir = tmp_path / "signal-trials-data"
+    data_dir.mkdir()
+    temp_dir = tmp_path / "temporary-files"
+    temp_dir.mkdir()
+    lock_dir = data_dir / ".rest-signal-open.lock"
+    if prehold_lock:
+        lock_dir.mkdir()
+
+    open_marker = tmp_path / "open-command-called"
+    curl_log = tmp_path / "curl-urls"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["FAKE_OPEN_MARKER"]).write_text("called", encoding="utf-8")
+summary = os.environ.get("FAKE_LOCAL_SUMMARY", "")
+if summary:
+    sys.stdout.write(summary)
+sys.stderr.write(os.environ.get("FAKE_OPEN_STDERR", ""))
+raise SystemExit(int(os.environ["FAKE_OPEN_EXIT"]))
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+url = args[-1]
+with Path(os.environ["FAKE_CURL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(url + "\\n")
+if "-o" not in args:
+    sys.stdout.write(os.environ["FAKE_PUBLIC_BODY"])
+    raise SystemExit(int(os.environ["FAKE_PUBLIC_EXIT"]))
+out = args[args.index("-o") + 1]
+if url.endswith("/open-trial"):
+    body = os.environ["FAKE_PREOPEN_BODY"]
+    status = os.environ["FAKE_PREOPEN_STATUS"]
+    exit_code = int(os.environ["FAKE_PREOPEN_EXIT"])
+else:
+    body = os.environ["FAKE_PUBLIC_BODY"]
+    status = os.environ["FAKE_PUBLIC_STATUS"]
+    exit_code = int(os.environ["FAKE_PUBLIC_EXIT"])
+Path(out).write_text(body, encoding="utf-8")
+sys.stdout.write(status)
+raise SystemExit(exit_code)
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+
+    shell = _extract_live_open_shell().replace(
+        "/var/lib/veridex/signal-trials",
+        str(data_dir),
+    )
+    env = dict(os.environ)
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "SIGNAL_TRIALS_DATA_DIR": str(data_dir),
+            "TMPDIR": f"{temp_dir}{os.sep}",
+            "FAKE_OPEN_MARKER": str(open_marker),
+            "FAKE_OPEN_EXIT": str(open_exit),
+            "FAKE_OPEN_STDERR": "simulated open refusal\n" if open_exit else "",
+            "FAKE_LOCAL_SUMMARY": "" if local_summary is None else json.dumps(local_summary),
+            "FAKE_CURL_LOG": str(curl_log),
+            "FAKE_PREOPEN_EXIT": str(preopen_exit),
+            "FAKE_PREOPEN_STATUS": preopen_status,
+            "FAKE_PREOPEN_BODY": preopen_body,
+            "FAKE_PUBLIC_EXIT": str(public_exit),
+            "FAKE_PUBLIC_STATUS": public_status,
+            "FAKE_PUBLIC_BODY": json.dumps(public_body),
+        }
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", shell],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    urls = curl_log.read_text(encoding="utf-8").splitlines() if curl_log.is_file() else []
+    return SimpleNamespace(
+        result=result,
+        open_marker=open_marker,
+        lock_dir=lock_dir,
+        temp_dir=temp_dir,
+        urls=urls,
+    )
+
+
+def test_live_open_refuses_failed_open_even_if_foreign_public_read_succeeds(
+    tmp_path: Path,
+) -> None:
+    foreign = {
+        **_PUBLIC_LOCAL_TRIAL,
+        "trial_id": f"trial_{'f' * 24}_1753400000001",
+        "evidence_hash": "f" * 64,
+    }
+    execution = _run_live_open_shell(
+        tmp_path,
+        open_exit=17,
+        local_summary=None,
+        public_body=foreign,
+    )
+
+    assert execution.result.returncode != 0
+    assert foreign["trial_id"] not in execution.result.stdout
+    assert "TRIAL_ID=" not in execution.result.stdout
+
+
+def test_live_open_atomic_lock_excludes_a_second_reviewed_opener_before_mutation(
+    tmp_path: Path,
+) -> None:
+    execution = _run_live_open_shell(tmp_path, prehold_lock=True)
+
+    assert execution.result.returncode != 0
+    assert not execution.open_marker.exists(), "second opener reached the mutation command"
+    assert execution.lock_dir.is_dir(), "refusing contender removed the first opener's lock"
+
+
+@pytest.mark.parametrize(
+    ("preopen_exit", "preopen_status", "preopen_body"),
+    [
+        pytest.param(7, "404", '{"error":"no_open_trial"}', id="curl-failure"),
+        pytest.param(0, "200", '{"trial_id":"already-open"}', id="already-open"),
+        pytest.param(
+            0,
+            "404",
+            '{"error":"no_open_trial","unexpected":true}',
+            id="schema-mismatch",
+        ),
+    ],
+)
+def test_live_open_immediate_precheck_refusal_prevents_mutation(
+    tmp_path: Path,
+    preopen_exit: int,
+    preopen_status: str,
+    preopen_body: str,
+) -> None:
+    execution = _run_live_open_shell(
+        tmp_path,
+        preopen_exit=preopen_exit,
+        preopen_status=preopen_status,
+        preopen_body=preopen_body,
+    )
+
+    assert execution.result.returncode != 0
+    assert not execution.open_marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatched_value"),
+    [
+        pytest.param(
+            "trial_id",
+            f"trial_{'c' * 24}_1753400000002",
+            id="trial-id",
+        ),
+        pytest.param("evidence_hash", "c" * 64, id="evidence-hash"),
+        pytest.param("commit_deadline_ms", 1_753_400_300_001, id="deadline"),
+    ],
+)
+def test_live_open_refuses_public_trial_mismatch_before_payment_handoff(
+    tmp_path: Path,
+    field: str,
+    mismatched_value: object,
+) -> None:
+    public = {**_PUBLIC_LOCAL_TRIAL, field: mismatched_value}
+    execution = _run_live_open_shell(tmp_path, public_body=public)
+
+    assert execution.result.returncode != 0
+    assert "TRIAL_ID=" not in execution.result.stdout
+    assert not execution.lock_dir.exists()
+    assert list(execution.temp_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("published", False, id="not-published"),
+        pytest.param("trial_id", "unsafe/trial", id="unsafe-trial-id"),
+        pytest.param("decision_window_ms", 299_999, id="wrong-window"),
+        pytest.param("evidence_hash", "not-a-hash", id="bad-evidence-hash"),
+        pytest.param("commit_deadline_ms", "not-an-integer", id="bad-deadline"),
+    ],
+)
+def test_live_open_refuses_invalid_local_summary_before_payment_handoff(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    local = {**_LOCAL_OPEN_SUMMARY, field: invalid_value}
+    execution = _run_live_open_shell(tmp_path, local_summary=local)
+
+    assert execution.result.returncode != 0
+    assert "TRIAL_ID=" not in execution.result.stdout
+
+
+def test_live_open_honest_single_writer_binds_direct_read_and_emits_only_local_id(
+    tmp_path: Path,
+) -> None:
+    execution = _run_live_open_shell(tmp_path)
+
+    assert execution.result.returncode == 0, execution.result.stderr
+    assert execution.result.stdout == f"TRIAL_ID={_LOCAL_TRIAL_ID}\n"
+    assert execution.open_marker.is_file()
+    assert execution.urls == [
+        "https://api.proofarena.xyz/signal-trials/open-trial",
+        f"https://api.proofarena.xyz/signal-trials/trials/{_LOCAL_TRIAL_ID}",
+    ]
+    assert not execution.lock_dir.exists()
+    assert list(execution.temp_dir.iterdir()) == []
 
 
 def test_demo_runbook_pins_order_hosts_boundaries_windows_and_authority() -> None:

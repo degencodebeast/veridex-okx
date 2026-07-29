@@ -28,8 +28,11 @@ a refusal:
 ```sh
 PREOPEN_BODY="$(mktemp)"
 trap 'rm -f "$PREOPEN_BODY"' EXIT
-PREOPEN_STATUS="$(curl -sS -o "$PREOPEN_BODY" -w '%{http_code}' \
-  https://api.proofarena.xyz/signal-trials/open-trial)"
+if ! PREOPEN_STATUS="$(curl -sS -o "$PREOPEN_BODY" -w '%{http_code}' \
+  https://api.proofarena.xyz/signal-trials/open-trial)"; then
+  echo "STOP: unexpected pre-open curl failure; status/body artifacts are untrusted" >&2
+  exit 1
+fi
 if [ "$PREOPEN_STATUS" = "404" ] && \
   jq -e 'type == "object" and keys == ["error"] and .error == "no_open_trial"' \
     "$PREOPEN_BODY" >/dev/null; then
@@ -105,18 +108,110 @@ jq -e '.published == false' /tmp/proofarena-open-dry-run.json
 
 The dry-run must say `published=false`; it makes no durable write. Compare its evidence hash and
 fields with the reviewed raw signal. Only after a named human approves that exact dry-run may the
-container operator perform the single open:
+container operator perform the single open.
+
+Every operator using this reviewed workflow must use the atomic lock below. Bypassing the lock is
+unsupported. The lock coordinates reviewed operators; it does not add repository compare-and-swap
+and cannot exclude an arbitrary writer that bypasses the workflow.
 
 ```sh
-python /app/scripts/signal_trials/open_live_trial.py \
+SIGNAL_TRIALS_DATA_DIR="${SIGNAL_TRIALS_DATA_DIR:-/var/lib/veridex/signal-trials}"
+OPEN_LOCK="$SIGNAL_TRIALS_DATA_DIR/.rest-signal-open.lock"
+OPEN_LOCK_HELD=0
+OPEN_PRECHECK_BODY="$(mktemp)"
+OPEN_SUMMARY="$(mktemp)"
+PUBLIC_TRIAL_BODY="$(mktemp)"
+cleanup_open_workflow() {
+  cleanup_status=0
+  rm -f "$OPEN_PRECHECK_BODY" "$OPEN_SUMMARY" "$PUBLIC_TRIAL_BODY" || cleanup_status=1
+  if [ "$OPEN_LOCK_HELD" = "1" ]; then
+    if rmdir "$OPEN_LOCK"; then
+      OPEN_LOCK_HELD=0
+    else
+      cleanup_status=1
+    fi
+  fi
+  return "$cleanup_status"
+}
+trap 'cleanup_open_workflow' EXIT
+trap 'exit 1' HUP INT TERM
+
+if ! mkdir "$OPEN_LOCK"; then
+  echo "STOP: another reviewed opener holds the Signal trial mutation lock" >&2
+  exit 1
+fi
+OPEN_LOCK_HELD=1
+
+if ! OPEN_PRECHECK_STATUS="$(curl -sS -o "$OPEN_PRECHECK_BODY" -w '%{http_code}' \
+  https://api.proofarena.xyz/signal-trials/open-trial)"; then
+  echo "STOP: immediate pre-open curl failed; status/body artifacts are untrusted" >&2
+  exit 1
+fi
+if [ "$OPEN_PRECHECK_STATUS" != "404" ] || \
+  ! jq -e 'type == "object" and keys == ["error"] and .error == "no_open_trial"' \
+    "$OPEN_PRECHECK_BODY" >/dev/null; then
+  echo "STOP: immediate pre-open state is not exact 404 no_open_trial" >&2
+  exit 1
+fi
+
+if ! python /app/scripts/signal_trials/open_live_trial.py \
   --source rest \
   --signal-file /tmp/proofarena-rest-signal.json \
-  --data-dir /var/lib/veridex/signal-trials
-curl -fsS https://api.proofarena.xyz/signal-trials/open-trial
+  --data-dir "$SIGNAL_TRIALS_DATA_DIR" > "$OPEN_SUMMARY"; then
+  echo "STOP: local trial open failed or was indeterminate" >&2
+  exit 1
+fi
+if ! jq -e '
+  type == "object" and
+  .published == true and
+  .trial_mode == "live" and
+  (.trial_id | type == "string" and test("^trial_[0-9a-f]{24}_[0-9]+$")) and
+  .decision_window_ms == 300000 and
+  (.t0_ms | type == "number" and floor == .) and
+  (.commit_deadline_ms | type == "number" and floor == .) and
+  .commit_deadline_ms == (.t0_ms + .decision_window_ms) and
+  (.evidence_hash | type == "string" and test("^[0-9a-f]{64}$"))
+' "$OPEN_SUMMARY" >/dev/null; then
+  echo "STOP: local open summary failed publication, id, window, hash, or deadline validation" >&2
+  exit 1
+fi
+if ! TRIAL_ID="$(jq -er '.trial_id' "$OPEN_SUMMARY")" || \
+  ! LOCAL_EVIDENCE_HASH="$(jq -er '.evidence_hash' "$OPEN_SUMMARY")" || \
+  ! LOCAL_COMMIT_DEADLINE_MS="$(jq -er '.commit_deadline_ms' "$OPEN_SUMMARY")"; then
+  echo "STOP: local open binding could not be extracted" >&2
+  exit 1
+fi
+
+if ! PUBLIC_TRIAL_STATUS="$(curl -sS -o "$PUBLIC_TRIAL_BODY" -w '%{http_code}' \
+  "https://api.proofarena.xyz/signal-trials/trials/$TRIAL_ID")"; then
+  echo "STOP: direct public trial read failed; no payment handoff is allowed" >&2
+  exit 1
+fi
+if [ "$PUBLIC_TRIAL_STATUS" != "200" ] || \
+  ! jq -e \
+    --arg trial_id "$TRIAL_ID" \
+    --arg evidence_hash "$LOCAL_EVIDENCE_HASH" \
+    --argjson commit_deadline_ms "$LOCAL_COMMIT_DEADLINE_MS" '
+      type == "object" and
+      .trial_id == $trial_id and
+      .evidence_hash == $evidence_hash and
+      .commit_deadline_ms == $commit_deadline_ms
+    ' "$PUBLIC_TRIAL_BODY" >/dev/null; then
+  echo "STOP: direct public trial does not match the local id, evidence hash, and deadline" >&2
+  exit 1
+fi
+
+if ! cleanup_open_workflow; then
+  echo "STOP: open workflow cleanup or lock release failed" >&2
+  exit 1
+fi
+trap - EXIT HUP INT TERM
+printf 'TRIAL_ID=%s\n' "$TRIAL_ID"
 ```
 
-Copy only the public `trial_id`. The buyer must act inside the five-minute (`300000` ms) commit
-window. If the window is stale, stop and do not pay.
+Copy only the value after `TRIAL_ID=` from this verified local handoff; never derive payment
+identity from the mutable open-trial pointer. The buyer must act inside the five-minute (`300000`
+ms) commit window. If the window is stale, stop and do not pay.
 
 ## 5. Explicit single payment
 

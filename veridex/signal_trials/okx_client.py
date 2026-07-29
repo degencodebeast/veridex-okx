@@ -411,7 +411,34 @@ class OKXMarketClient:
 
     async def list_signals(self, f: SignalFilters, cursor: str | None = None) -> SignalPage:
         """One page of the Latest Signal List. The body is a JSON ARRAY of one filter object."""
-        filters: dict[str, Any] = {
+        if (
+            type(f.chain_index) is not str
+            or not f.chain_index
+            or not f.chain_index.isascii()
+            or not f.chain_index.isdecimal()
+        ):
+            raise ValueError("invalid Signal List field: chain_index")
+
+        if type(f.wallet_type) is not str:
+            raise ValueError("invalid Signal List field: wallet_type")
+        wallet_codes = f.wallet_type.split(",")
+        if not wallet_codes or any(code not in {"1", "2", "3"} for code in wallet_codes):
+            raise ValueError("invalid Signal List field: wallet_type")
+
+        thresholds = (
+            ("min_address_count", f.min_address_count),
+            ("min_amount_usd", f.min_amount_usd),
+            ("min_market_cap_usd", f.min_market_cap_usd),
+            ("min_liquidity_usd", f.min_liquidity_usd),
+        )
+        for field_name, value in thresholds:
+            if type(value) is not int or value < 0:
+                raise ValueError(f"invalid Signal List field: {field_name}")
+
+        if cursor is not None and (type(cursor) is not str or not cursor):
+            raise ValueError("invalid Signal List field: cursor")
+
+        filters: dict[str, str] = {
             "chainIndex": f.chain_index,
             "walletType": f.wallet_type,
             "minAddressCount": str(f.min_address_count),
