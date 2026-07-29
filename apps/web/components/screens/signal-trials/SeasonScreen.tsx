@@ -324,6 +324,16 @@ function NotBuiltState() {
 // The standings table — `qualified` and `exploratory`.
 // ---------------------------------------------------------------------------
 
+function formatSeasonCombo(combo: Record<string, unknown> | null): string {
+  if (combo?.chain_index === '196' && combo.bar === '1m') {
+    return 'X Layer (196) · 1m bars';
+  }
+  // The combo wire is an open dictionary. An unknown network, bar, missing field or wrong type
+  // cannot be promoted into a known deployment label, so the screen states only that it cannot
+  // present the combo. Raw keys are not humanized copy and may describe a contract we do not know.
+  return 'combo unavailable';
+}
+
 function Standings({
   season,
   state,
@@ -346,12 +356,11 @@ function Standings({
         <span className={styles.metaLabel}>SEASON</span>
         <span data-testid="season-combo">
           {season.seasonId ?? '—'}
-          {season.combo
-            ? Object.entries(season.combo).map(([k, v]) => ` · ${k} ${String(v)}`).join('')
-            : ''}
+          {' · '}
+          {formatSeasonCombo(season.combo)}
           {/* PROOFARENA-EXACT-COPY.md:51 — the exploratory combo line appends this suffix. It is a
-              plain copy string gated on the state and needs no data the screen lacks, so unlike the
-              design's humanized combo rendering there is nothing here to invent. */}
+              plain copy string gated on the state and needs no additional served data. The combo
+              immediately before it is client-formatted only for the one recognized deployment. */}
           {state === 'exploratory' ? ' · below the 40-trial gate' : ''}
         </span>
       </div>

@@ -223,24 +223,37 @@ describe('H5.2 qualified season — Brier is the rank key and the metrics are ho
     expect(within(row).getByTestId('season-agent')).toHaveTextContent('agent-signal-01');
   });
 
-  it('renders the served combo without assuming its keys, and the values VARY with the response', async () => {
-    stubSeason200();
+  it('humanizes the production X Layer one-minute combo with the exact registered copy', async () => {
+    stubSeason200({
+      season_id: 'season-001',
+      combo: { chain_index: '196', bar: '1m' },
+    });
     await panel();
-    const combo = screen.getByTestId('season-combo');
-    expect(combo).toHaveTextContent('501');
-    expect(combo).toHaveTextContent('1m');
-    // `combo` is `dict[str, Any]` on the wire — its keys are NOT frozen fields, so the screen must
-    // render what was served rather than a design-assumed shape. Different combo ⇒ different text.
-    cleanup();
-    vi.unstubAllGlobals();
-    stubSeason200({ combo: { chain_index: '196', bar: '5m' } });
+    expect(screen.getByTestId('season-combo'))
+      .toHaveTextContent('season-001 · X Layer (196) · 1m bars');
+    expect(screen.getByTestId('season-combo')).not.toHaveTextContent('chain_index');
+  });
+
+  it.each([
+    ['unsupported network', { chain_index: '501', bar: '1m' }],
+    ['unsupported bar', { chain_index: '196', bar: '5m' }],
+    ['numeric chain index', { chain_index: 196, bar: '1m' }],
+    ['missing bar', { chain_index: '196' }],
+    ['missing combo', undefined],
+  ] as const)('renders an honest fallback for %s without fabricating X Layer or a bar', async (
+    _case,
+    combo,
+  ) => {
+    stubSeason200({
+      season_id: 'season-fallback',
+      combo,
+    });
     await panel();
-    expect(screen.getByTestId('season-combo')).toHaveTextContent('chain_index 196');
-    expect(screen.getByTestId('season-combo')).toHaveTextContent('bar 5m');
-    // Discriminate on the COMBO ENTRY, not on the bare digits: `season_id` is
-    // "season-2026w30-501-1m" and legitimately still contains "501", so a bare-substring negative
-    // would fail against correct output.
-    expect(screen.getByTestId('season-combo')).not.toHaveTextContent('chain_index 501');
+    const text = screen.getByTestId('season-combo').textContent ?? '';
+    expect(text).toBe('season-fallback · combo unavailable');
+    expect(text).not.toContain('X Layer');
+    expect(text).not.toMatch(/\b\d+m bars\b/);
+    expect(text).not.toContain('chain_index');
   });
 });
 
@@ -278,17 +291,30 @@ describe('H5.2 exploratory season — provisional standings, zero skill claim', 
 
   it('appends the 40-trial-gate suffix to the combo line, and ONLY in the exploratory state', async () => {
     // PROOFARENA-EXACT-COPY.md:51 — verbatim, leading separator included.
-    stubSeason200({ season_status: 'exploratory', rows: exploratoryRows });
+    stubSeason200({
+      season_id: 'season-001',
+      season_status: 'exploratory',
+      combo: { chain_index: '196', bar: '1m' },
+      rows: exploratoryRows,
+    });
     await panel();
-    expect(screen.getByTestId('season-combo')).toHaveTextContent('· below the 40-trial gate');
+    expect(screen.getByTestId('season-combo')).toHaveTextContent(
+      'season-001 · X Layer (196) · 1m bars · below the 40-trial gate',
+    );
 
     // Discrimination control (C52): the suffix is a claim that this season did NOT clear the gate,
     // so a qualified season carrying it would state the opposite of its own status. A screen that
     // appended it unconditionally would pass the assertion above and die here.
     cleanup();
     vi.unstubAllGlobals();
-    stubSeason200();
+    stubSeason200({
+      season_id: 'season-001',
+      combo: { chain_index: '196', bar: '1m' },
+    });
     await panel();
+    expect(screen.getByTestId('season-combo')).toHaveTextContent(
+      'season-001 · X Layer (196) · 1m bars',
+    );
     expect(screen.getByTestId('season-combo')).not.toHaveTextContent('below the 40-trial gate');
   });
 

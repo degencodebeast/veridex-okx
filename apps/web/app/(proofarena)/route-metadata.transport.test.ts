@@ -153,9 +153,9 @@ const navigationEvidence = {
 };
 
 const navigationSeason = {
-  season_id: 'season-link-transport',
+  season_id: 'season-001',
   season_status: 'qualified',
-  combo: { chain_index: '501', bar: '1m' },
+  combo: { chain_index: '196', bar: '1m' },
   sample_size: 61,
   rows: [
     {
@@ -292,6 +292,31 @@ async function openNoSeason(width: number) {
   await page.goto(`${origin}/trials`, { waitUntil: 'networkidle' });
   await page.locator('[data-testid="season-probe-counts"]').waitFor();
   await page.locator('[data-testid="season-skill-md"]').waitFor();
+  return page;
+}
+
+async function openServedSeasonCombo(
+  state: 'qualified' | 'exploratory',
+  width: number,
+) {
+  const page = await (await getBrowser()).newPage({ viewport: { width, height: 1000 } });
+  const season = {
+    ...navigationSeason,
+    season_status: state,
+    rows: state === 'exploratory'
+      ? navigationSeason.rows.map((row) => ({ ...row, qualified: false }))
+      : navigationSeason.rows,
+  };
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/signal-trials/season') return json(route, season);
+    if (path === '/signal-trials/open-trial') {
+      return json(route, { error: 'no_open_trial' }, 404);
+    }
+    return json(route, { error: 'not_found' }, 404);
+  });
+  await page.goto(`${origin}/trials`, { waitUntil: 'networkidle' });
+  await page.locator('[data-testid="season-combo"]').waitFor();
   return page;
 }
 
@@ -592,6 +617,23 @@ describe.each([390, 392])(
         MOBILE_REFLOW_ID,
         `Match Card heading at ${width}px`,
       );
+      await page.close();
+    });
+  },
+);
+
+describe.each([1440, 390, 392])(
+  '/trials serves the registered combo copy at %dpx',
+  (width) => {
+    it.each([
+      ['qualified', 'season-001 · X Layer (196) · 1m bars'],
+      [
+        'exploratory',
+        'season-001 · X Layer (196) · 1m bars · below the 40-trial gate',
+      ],
+    ] as const)('renders the %s season combo exactly', async (state, expected) => {
+      const page = await openServedSeasonCombo(state, width);
+      expect(await page.locator('[data-testid="season-combo"]').textContent()).toBe(expected);
       await page.close();
     });
   },
