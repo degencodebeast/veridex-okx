@@ -1768,6 +1768,40 @@ def test_scoring_loads_the_exact_approved_pack_reference(
     assert seen == [PackRef(pack_dir, approved_hash)]
 
 
+def test_publish_path_persists_exact_approved_hash_only_in_local_state(
+    tmp_path, full_pack_qualified, monkeypatch
+):
+    """The real writer durably binds the approval without changing the public schema."""
+    import scripts.signal_trials.score_and_publish as script
+    from veridex.api.signal_trials_schemas import SignalTrialsSeasonResponse
+    from veridex.signal_trials.published import read_season, read_state
+
+    pack_dir = tmp_path / "approved-pack"
+    approved_hash = "a17c" * 16
+    monkeypatch.setattr(script, "load_pack", lambda _ref: full_pack_qualified)
+
+    exit_code = script.main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--pack-dir",
+            str(pack_dir),
+            "--expected-content-hash",
+            approved_hash,
+        ]
+    )
+
+    assert exit_code == 0
+    state = read_state(tmp_path)
+    assert state["detail"].get("approved_pack_content_hash") == approved_hash
+
+    public_document = read_season(tmp_path)
+    assert public_document is not None
+    assert set(public_document) == set(SignalTrialsSeasonResponse.model_fields)
+    assert "approved_pack_content_hash" not in public_document
+    SignalTrialsSeasonResponse(**public_document)
+
+
 def test_publish_writes_the_payload_before_the_state(tmp_path, full_pack_qualified):
     """PIN: write ORDER is payload-then-state, which is the writer's half of ``read_season``'s contract.
 
