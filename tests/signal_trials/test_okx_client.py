@@ -103,6 +103,51 @@ async def test_signal_list_serializes_all_six_filters_as_strings_and_signs_the_t
     assert headers["OK-ACCESS-SIGN"] == expected_signature
 
 
+async def test_signal_list_hmac_covers_the_exact_utf8_bytes_emitted_by_real_httpx_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ASCII accepted cursor must not make signed JSON differ from real httpx request bytes."""
+    import httpx
+
+    fixed_timestamp = "2026-07-29T00:00:00.000Z"
+    monkeypatch.setattr(okx_client, "_timestamp", lambda: fixed_timestamp)
+    captured: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"code": "0", "data": []})
+
+    seam_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    )
+    spec = importlib_util.spec_from_file_location("real_run_preflight_http_seam", seam_path)
+    assert spec is not None and spec.loader is not None
+    seam = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(seam)
+
+    creds = OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel")
+    async with httpx.AsyncClient(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http:
+        client = OKXMarketClient(seam.HttpxTransport(http), creds)
+        await client.list_signals(SignalFilters(chain_index="196"), cursor="café")
+
+    assert len(captured) == 1
+    request = captured[0]
+    expected_body = (
+        b'[{"chainIndex":"196","walletType":"1","minAddressCount":"2",'
+        b'"minAmountUsd":"1000","minMarketCapUsd":"100000","minLiquidityUsd":"20000",'
+        b'"cursor":"caf\xc3\xa9"}]'
+    )
+    assert request.content == expected_body
+    prehash = fixed_timestamp.encode() + b"POST" + b"/api/v6/dex/market/signal/list" + request.content
+    expected_signature = base64.b64encode(
+        hmac.new(b"secret-sentinel", prehash, hashlib.sha256).digest()
+    ).decode()
+    assert request.headers["OK-ACCESS-SIGN"] == expected_signature
+
+
 async def test_list_signals_posts_array_body_and_parses_cursor():
     fake = RecordingFake({"code": "0", "data": [{"timestamp": "1753400000000", "price": "0.042",
         "chainIndex": "501", "amountUsd": "1500", "triggerWalletCount": "3", "walletType": "1",

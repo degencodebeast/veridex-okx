@@ -115,6 +115,61 @@ def test_exception_diagnostics_redact_every_credential_value(
         assert sentinel not in captured.err
 
 
+def test_producer_reuses_run_preflight_credential_loader_without_a_local_duplicate(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    producer = _load_producer()
+    duplicate_names = [
+        name
+        for name in ("_CREDENTIAL_VARS", "MissingCredentialError", "credentials_from_env")
+        if hasattr(producer, name)
+    ]
+    assert duplicate_names == [], f"producer-local credential policy duplicates exist: {duplicate_names}"
+    assert hasattr(producer, "run_preflight_seam")
+
+    real_seam = producer.run_preflight_seam()
+    expected_seam_path = SCRIPT.with_name("run_preflight.py").resolve()
+    assert Path(real_seam.credentials_from_env.__code__.co_filename).resolve() == expected_seam_path
+
+    called = False
+
+    class CredentialTripwireSeam:
+        @staticmethod
+        def credentials_from_env(env):
+            nonlocal called
+            called = True
+            assert env["OKX_API_KEY"] == "NOT-A-REAL-API-KEY"
+            return producer.OKXCredentials(
+                env["OKX_API_KEY"],
+                env["OKX_SECRET_KEY"],
+                env["OKX_PASSPHRASE"],
+            )
+
+    class FakeClient:
+        async def list_signals(self, _filters):
+            return SimpleNamespace(signals=(REST,))
+
+    @contextlib.asynccontextmanager
+    async def client_factory(_credentials):
+        yield FakeClient()
+
+    env = {
+        "OKX_API_KEY": "NOT-A-REAL-API-KEY",
+        "OKX_SECRET_KEY": "NOT-A-REAL-SECRET",
+        "OKX_PASSPHRASE": "NOT-A-REAL-PASSPHRASE",
+    }
+    assert (
+        producer.main(
+            env=env,
+            client_factory=client_factory,
+            seam_loader=lambda: CredentialTripwireSeam,
+        )
+        == 0
+    )
+    assert called is True, "main bypassed the existing credentials_from_env seam"
+    assert json.loads(capsys.readouterr().out) == REST
+
+
 def test_success_writes_exactly_one_raw_json_object_to_stdout(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -262,6 +317,80 @@ print("transport-load-ok")
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "transport-load-ok\n"
+
+
+def test_runbook_preopen_check_accepts_only_honest_404_and_final_qa_allows_closed_trial(
+    tmp_path: Path,
+) -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+    start_marker = "<!-- PREOPEN_CHECK_START -->"
+    end_marker = "<!-- PREOPEN_CHECK_END -->"
+    assert start_marker in text and end_marker in text, "runbook must ship an executable pre-open gate"
+    marked = text.split(start_marker, 1)[1].split(end_marker, 1)[0]
+    assert "```sh" in marked
+    shell = marked.split("```sh", 1)[1].split("```", 1)[0].strip()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+out = args[args.index("-o") + 1]
+Path(out).write_text(os.environ["FAKE_BODY"], encoding="utf-8")
+sys.stdout.write(os.environ["FAKE_STATUS"])
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    fake_jq = fake_bin / "jq"
+    fake_jq.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[-1]).read_text(encoding="utf-8"))
+raise SystemExit(0 if payload == {"error": "no_open_trial"} else 1)
+""",
+        encoding="utf-8",
+    )
+    fake_jq.chmod(0o755)
+
+    cases = [
+        ("404", '{"error":"no_open_trial"}', 0, "expected safe"),
+        ("200", '{"trial_id":"already-open"}', 1, "already open"),
+        ("404", '{"error":"different"}', 1, "unexpected"),
+        ("500", '{"error":"no_open_trial"}', 1, "unexpected"),
+    ]
+    for status, body, expected_exit, expected_diagnostic in cases:
+        env = dict(os.environ)
+        env.update(
+            {
+                "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                "FAKE_STATUS": status,
+                "FAKE_BODY": body,
+            }
+        )
+        result = subprocess.run(
+            ["/bin/sh", "-c", shell],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == expected_exit, (status, body, result.stderr)
+        assert expected_diagnostic in (result.stdout + result.stderr).lower()
+
+    qa = text.split("## 8. QA", 1)[1]
+    assert "curl -fsS https://api.proofarena.xyz/signal-trials/open-trial" not in qa
+    assert "QA_OPEN_STATUS" in qa
+    assert "closed trial" in qa.lower()
 
 
 def test_demo_runbook_pins_order_hosts_boundaries_windows_and_authority() -> None:

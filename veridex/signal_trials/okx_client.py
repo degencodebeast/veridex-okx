@@ -112,6 +112,11 @@ class Transport(Protocol):
     The OKX signature covers the request path *including* its query string, so a transport that
     reorders or re-encodes ``params`` would produce a body/URL that no longer matches the
     ``OK-ACCESS-SIGN`` computed here.
+
+    JSON bodies are the same kind of signed wire value: implementations MUST emit compact UTF-8
+    JSON with ``ensure_ascii=False`` and ``allow_nan=False``. These are the locked httpx
+    ``json=`` semantics used by the existing production transport. The client signs those exact
+    bytes before handing the same body object to the transport.
     """
 
     async def request(
@@ -417,7 +422,13 @@ class OKXMarketClient:
         if cursor is not None:
             filters["cursor"] = cursor
         body = [filters]
-        headers = self._headers("POST", SIGNAL_LIST_PATH, json.dumps(body, separators=(",", ":")))
+        serialized_body = json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        headers = self._headers("POST", SIGNAL_LIST_PATH, serialized_body)
         payload = await self._transport.request("POST", SIGNAL_LIST_PATH, params=None, json_body=body, headers=headers)
 
         rows = _rows(payload)

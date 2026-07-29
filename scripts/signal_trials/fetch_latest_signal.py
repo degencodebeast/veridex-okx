@@ -22,16 +22,11 @@ from veridex.signal_trials.okx_client import (
 
 DEFAULT_CHAIN_INDEX = "196"
 REQUEST_TIMEOUT_SECONDS = 20.0
-_CREDENTIAL_VARS = ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
 _REDACTED = "<redacted>"
 
 
 class SignalSelectionError(ValueError):
     """The Signal-list page cannot identify exactly one newest valid row."""
-
-
-class MissingCredentialError(RuntimeError):
-    """One or more required OKX credential variables are missing or blank."""
 
 
 class SignalClient(Protocol):
@@ -65,43 +60,39 @@ def select_unique_latest(rows: Sequence[object]) -> dict[str, Any]:
     return newest[0]
 
 
-def credentials_from_env(env: Mapping[str, str]) -> OKXCredentials:
-    """Build credentials after checking every required variable without echoing any value."""
-
-    missing = [name for name in _CREDENTIAL_VARS if not env.get(name, "").strip()]
-    if missing:
-        raise MissingCredentialError(f"missing or blank OKX credentials: {', '.join(missing)}")
-    return OKXCredentials(
-        api_key=env["OKX_API_KEY"],
-        secret_key=env["OKX_SECRET_KEY"],
-        passphrase=env["OKX_PASSPHRASE"],
-        base_url=env.get("OKX_BASE_URL", "https://web3.okx.com"),
-    )
-
-
-def redact(text: str, env: Mapping[str, str]) -> str:
-    """Replace credential values in a diagnostic while leaving variable names readable."""
+def redact(text: str, credentials: OKXCredentials | None) -> str:
+    """Replace loaded credential values while leaving missing-variable diagnostics readable."""
 
     redacted = text
-    for name in _CREDENTIAL_VARS:
-        value = env.get(name, "")
+    if credentials is None:
+        return redacted
+    for value in (credentials.api_key, credentials.secret_key, credentials.passphrase):
         if value.strip():
             redacted = redacted.replace(value, _REDACTED)
     return redacted
 
 
-def httpx_transport_type() -> type[Any]:
-    """Load the reviewed sibling HTTP seam by file so by-path container execution remains valid."""
-
+def run_preflight_seam() -> Any:
+    """Load the reviewed sibling credential and HTTP seams without relying on repository sys.path."""
     path = Path(__file__).with_name("run_preflight.py")
     spec = importlib_util.spec_from_file_location("_signal_trials_run_preflight", path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load the existing HTTP transport seam from {path}")
+        raise RuntimeError(f"cannot load the existing credential/HTTP seam from {path}")
     module = importlib_util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    transport = getattr(module, "HttpxTransport", None)
-    if not isinstance(transport, type):
+    if not callable(getattr(module, "credentials_from_env", None)):
+        raise RuntimeError(f"existing credential seam is absent from {path}")
+    if not isinstance(getattr(module, "HttpxTransport", None), type):
         raise RuntimeError(f"existing HTTP transport seam is absent from {path}")
+    return module
+
+
+def httpx_transport_type() -> type[Any]:
+    """Resolve the existing HTTP transport from the same production-safe sibling seam."""
+
+    transport = run_preflight_seam().HttpxTransport
+    if not isinstance(transport, type):
+        raise RuntimeError("existing HTTP transport seam is not a type")
     return transport
 
 
@@ -136,12 +127,14 @@ def main(
     env: Mapping[str, str] | None = None,
     chain_index: str = DEFAULT_CHAIN_INDEX,
     client_factory: ClientFactory = live_client,
+    seam_loader: Callable[[], Any] = run_preflight_seam,
 ) -> int:
     """Print one raw JSON signal on success; print only redacted diagnostics on refusal."""
 
     active_env = os.environ if env is None else env
+    credentials: OKXCredentials | None = None
     try:
-        credentials = credentials_from_env(active_env)
+        credentials = seam_loader().credentials_from_env(active_env)
         signal = asyncio.run(
             fetch_latest_signal(
                 credentials,
@@ -151,7 +144,7 @@ def main(
         )
         rendered = json.dumps(signal, separators=(",", ":"), sort_keys=True)
     except Exception as error:
-        print(f"refused: {redact(str(error), active_env)}", file=sys.stderr)
+        print(f"refused: {redact(str(error), credentials)}", file=sys.stderr)
         return 1
 
     print(rendered)

@@ -18,8 +18,29 @@ and durable readiness before any mutation:
 ```sh
 curl -fsS https://api.proofarena.xyz/healthz
 curl -fsS https://api.proofarena.xyz/readyz
-curl -fsS https://api.proofarena.xyz/signal-trials/open-trial
 ```
+
+The safe pre-open state is specifically HTTP `404` with `{"error":"no_open_trial"}`. HTTP `200`
+means a trial is already open and this run must not create another. Every other status/body pair is
+a refusal:
+
+<!-- PREOPEN_CHECK_START -->
+```sh
+PREOPEN_BODY="$(mktemp)"
+trap 'rm -f "$PREOPEN_BODY"' EXIT
+PREOPEN_STATUS="$(curl -sS -o "$PREOPEN_BODY" -w '%{http_code}' \
+  https://api.proofarena.xyz/signal-trials/open-trial)"
+if [ "$PREOPEN_STATUS" = "404" ] && jq -e '.error == "no_open_trial"' "$PREOPEN_BODY" >/dev/null; then
+  echo "expected safe pre-open state: 404 no_open_trial"
+elif [ "$PREOPEN_STATUS" = "200" ]; then
+  echo "STOP: a trial is already open; do not start a new-open sequence" >&2
+  exit 1
+else
+  echo "STOP: unexpected pre-open status/body mismatch (HTTP $PREOPEN_STATUS)" >&2
+  exit 1
+fi
+```
+<!-- PREOPEN_CHECK_END -->
 
 Inside the already deployed API container, use credentials already injected by the deployment
 environment. Do not export or print them:
@@ -150,7 +171,19 @@ receipt, and the public web application:
 ```sh
 curl -fsS https://api.proofarena.xyz/healthz
 curl -fsS https://api.proofarena.xyz/readyz
-curl -fsS https://api.proofarena.xyz/signal-trials/open-trial
+QA_OPEN_BODY="$(mktemp)"
+trap 'rm -f "$QA_OPEN_BODY"' EXIT
+QA_OPEN_STATUS="$(curl -sS -o "$QA_OPEN_BODY" -w '%{http_code}' \
+  https://api.proofarena.xyz/signal-trials/open-trial)"
+if [ "$QA_OPEN_STATUS" = "200" ]; then
+  jq -e '.trial_id | type == "string"' "$QA_OPEN_BODY"
+elif [ "$QA_OPEN_STATUS" = "404" ] && \
+  jq -e '.error == "no_open_trial"' "$QA_OPEN_BODY" >/dev/null; then
+  echo "QA: closed trial is no longer open, as expected"
+else
+  echo "STOP: unexpected QA open-trial status/body mismatch (HTTP $QA_OPEN_STATUS)" >&2
+  exit 1
+fi
 curl -fsS \
   https://api.proofarena.xyz/signal-trials/receipts/<public-receipt-id>/verify
 curl -fsS https://proofarena.xyz/trials
