@@ -26,12 +26,18 @@ def _settlement_block() -> str:
     return match.group(1)
 
 
-def _row(status: str, *, recorded: bool, trial_id: str = TRIAL_ID) -> dict[str, Any]:
+def _row(
+    status: str,
+    *,
+    recorded: bool,
+    settlements_recorded: int = 0,
+    trial_id: str = TRIAL_ID,
+) -> dict[str, Any]:
     return {
         "trial_id": trial_id,
         "status": status,
         "recorded": recorded,
-        "settlements_recorded": 0,
+        "settlements_recorded": settlements_recorded,
     }
 
 
@@ -115,10 +121,26 @@ def test_live_recorded_false_is_refused_independently_of_call_count(tmp_path: Pa
     assert result.returncode != 0, "the workflow unexpectedly accepted recorded=false as terminal evidence"
 
 
+def test_live_terminal_zero_participant_settlements_is_refused(tmp_path: Path) -> None:
+    """An outcome without the paid participant settlement is incomplete demo evidence."""
+    dry = _summary(dry_run=True, eligible=1, rows=[_row("settled", recorded=False)])
+    live = _summary(dry_run=False, eligible=1, rows=[_row("settled", recorded=True)])
+
+    result, _calls = _execute_settlement_block(tmp_path, dry_payload=dry, live_payload=live)
+
+    assert result.returncode != 0, (
+        "the workflow unexpectedly accepted a terminal outcome with zero participant settlements"
+    )
+
+
 def test_settlement_runs_exact_trial_dry_run_then_exact_trial_live_once(tmp_path: Path) -> None:
     """Call sequencing is its own contract, separate from output acceptance."""
     dry = _summary(dry_run=True, eligible=1, rows=[_row("settled", recorded=False)])
-    live = _summary(dry_run=False, eligible=1, rows=[_row("settled", recorded=True)])
+    live = _summary(
+        dry_run=False,
+        eligible=1,
+        rows=[_row("settled", recorded=True, settlements_recorded=1)],
+    )
 
     result, calls = _execute_settlement_block(tmp_path, dry_payload=dry, live_payload=live)
 
@@ -143,7 +165,11 @@ def test_ambiguous_dry_run_refuses_before_a_live_call(tmp_path: Path) -> None:
             _row("settled", recorded=False, trial_id="trial_other"),
         ],
     )
-    live = _summary(dry_run=False, eligible=1, rows=[_row("settled", recorded=True)])
+    live = _summary(
+        dry_run=False,
+        eligible=1,
+        rows=[_row("settled", recorded=True, settlements_recorded=1)],
+    )
 
     result, calls = _execute_settlement_block(tmp_path, dry_payload=dry, live_payload=live)
 

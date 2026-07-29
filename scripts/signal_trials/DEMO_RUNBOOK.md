@@ -324,6 +324,7 @@ if ! jq -e --arg trial_id "$TRIAL_ID" '
   (.trials | type == "array" and length == 1) and
   .trials[0].trial_id == $trial_id and
   .trials[0].recorded == true and
+  .trials[0].settlements_recorded == 1 and
   (.trials[0].status == "settled" or .trials[0].status == "UNSCORED")
 ' "$SETTLEMENT_LIVE_RESULT" >/dev/null; then
   echo "STOP: live run did not record the captured trial as settled or UNSCORED" >&2
