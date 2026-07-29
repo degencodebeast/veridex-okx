@@ -4,15 +4,20 @@ import base64
 import contextlib
 import copy
 import functools
+import gc
 import hashlib
 import hmac
 import inspect
 import io
 import json
 import math
+import pickle
 import subprocess
 import sys
+import threading
 import time
+import uuid
+import weakref
 from importlib import util as importlib_util
 from pathlib import Path
 from typing import cast
@@ -159,14 +164,51 @@ class _IntSubclass(int):
 
 
 class _SecretReadRecorder:
-    """Per-test mutable counter whose identity survives credential copies."""
+    """Per-credential counter shared by copies and in-process reconstructions."""
 
-    def __init__(self) -> None:
-        self.reads = 0
+    def __init__(self, identity: str | None = None, reads: int = 0) -> None:
+        self._identity = identity or uuid.uuid4().hex
+        self._reads = reads
+        self._lock = threading.Lock()
+        with _SECRET_READ_RECORDERS_LOCK:
+            if self._identity in _SECRET_READ_RECORDERS:
+                raise RuntimeError("secret-read recorder identity collision")
+            _SECRET_READ_RECORDERS[self._identity] = self
+
+    @property
+    def reads(self) -> int:
+        with self._lock:
+            return self._reads
+
+    def record_read(self) -> None:
+        with self._lock:
+            self._reads += 1
 
     def __deepcopy__(self, memo: dict[int, object]) -> "_SecretReadRecorder":
         memo[id(self)] = self
         return self
+
+    def __reduce__(
+        self,
+    ) -> tuple[object, tuple[str, int]]:
+        return (_restore_secret_read_recorder, (self._identity, self.reads))
+
+
+_SECRET_READ_RECORDERS: weakref.WeakValueDictionary[str, _SecretReadRecorder] = (
+    weakref.WeakValueDictionary()
+)
+_SECRET_READ_RECORDERS_LOCK = threading.RLock()
+
+
+def _restore_secret_read_recorder(
+    identity: str,
+    reads: int,
+) -> _SecretReadRecorder:
+    with _SECRET_READ_RECORDERS_LOCK:
+        recorder = _SECRET_READ_RECORDERS.get(identity)
+        if recorder is not None:
+            return recorder
+        return _SecretReadRecorder(identity, reads)
 
 
 class _CountingCredentials:
@@ -186,7 +228,7 @@ class _CountingCredentials:
 
     @property
     def secret_key(self) -> str:
-        self._secret_reads.reads += 1
+        self._secret_reads.record_read()
         return self.configured_secret
 
 
@@ -200,6 +242,97 @@ def test_credential_secret_read_recorder_is_shared_across_shallow_and_deep_copie
     assert credentials.secret_key_reads == 1
     assert deep.secret_key == credentials.configured_secret
     assert credentials.secret_key_reads == 2
+
+
+def test_credential_secret_read_recorder_is_shared_across_pickle_reconstruction_and_isolated_between_credentials() -> None:
+    credentials = _CountingCredentials()
+    separate = _CountingCredentials()
+    reconstructed = pickle.loads(
+        pickle.dumps(credentials, protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    mixed_nested = pickle.loads(
+        pickle.dumps(
+            {"credentials": [copy.deepcopy(copy.copy(credentials))]},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )["credentials"][0]
+
+    assert reconstructed._secret_reads is credentials._secret_reads
+    assert mixed_nested._secret_reads is credentials._secret_reads
+    assert separate._secret_reads is not credentials._secret_reads
+    assert reconstructed.secret_key == credentials.configured_secret
+    assert mixed_nested.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 2
+    assert separate.secret_key_reads == 0
+
+
+def test_credential_secret_read_recorders_have_unique_lifecycles_without_sequential_masking() -> None:
+    first = _CountingCredentials()
+    second = _CountingCredentials()
+    first_recorder = weakref.ref(first._secret_reads)
+    second_recorder = weakref.ref(second._secret_reads)
+    serialized = pickle.dumps(first, protocol=pickle.HIGHEST_PROTOCOL)
+    reconstructed = pickle.loads(serialized)
+
+    assert first_recorder() is not second_recorder()
+    assert first._secret_reads._identity != second._secret_reads._identity
+    assert reconstructed._secret_reads is first_recorder()
+    assert first.secret_key == first.configured_secret
+    assert first.secret_key_reads == 1
+    assert second.secret_key_reads == 0
+    detached_payload = pickle.dumps(
+        reconstructed,
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+    del first
+    del reconstructed
+    gc.collect()
+
+    assert first_recorder() is None
+    assert second_recorder() is not None
+    detached = pickle.loads(detached_payload)
+    detached_recorder = weakref.ref(detached._secret_reads)
+    assert detached.secret_key_reads == 1
+    assert detached._secret_reads is not second_recorder()
+    assert detached.secret_key == detached.configured_secret
+    assert detached.secret_key_reads == 2
+    assert second.secret_key_reads == 0
+
+    del detached
+    gc.collect()
+
+    assert detached_recorder() is None
+    sequential = _CountingCredentials()
+    assert sequential._secret_reads is not second_recorder()
+    assert sequential.secret_key_reads == 0
+
+
+async def test_credential_secret_read_recorders_are_isolated_across_async_tasks_and_threads() -> None:
+    first = _CountingCredentials()
+    second = _CountingCredentials()
+    first_worker = pickle.loads(
+        pickle.dumps(copy.deepcopy(first), protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    second_worker = pickle.loads(
+        pickle.dumps(copy.copy(second), protocol=pickle.HIGHEST_PROTOCOL)
+    )
+
+    async def read_in_threads(credentials: _CountingCredentials, count: int) -> None:
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(lambda: credentials.secret_key)
+                for _ in range(count)
+            )
+        )
+
+    await asyncio.gather(
+        read_in_threads(first_worker, 64),
+        read_in_threads(second_worker, 96),
+    )
+
+    assert first.secret_key_reads == 64
+    assert second.secret_key_reads == 96
 
 
 @pytest.mark.parametrize(
