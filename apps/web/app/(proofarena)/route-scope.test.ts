@@ -30,7 +30,7 @@ function namedImportBinding(
   source: ts.SourceFile,
   moduleName: string,
   importedName: string,
-): string | null {
+): ts.ImportSpecifier | null {
   for (const statement of source.statements) {
     if (!ts.isImportDeclaration(statement)
       || !ts.isStringLiteral(statement.moduleSpecifier)
@@ -40,9 +40,39 @@ function namedImportBinding(
     const match = bindings.elements.find((element) =>
       (element.propertyName?.text ?? element.name.text) === importedName,
     );
-    return match?.name.text ?? null;
+    return match ?? null;
   }
   return null;
+}
+
+function parseLayoutWithSymbols(text: string): {
+  source: ts.SourceFile;
+  checker: ts.TypeChecker;
+} {
+  const fileName = '/proofarena-guard/app-layout.tsx';
+  const options: ts.CompilerOptions = {
+    jsx: ts.JsxEmit.Preserve,
+    module: ts.ModuleKind.ESNext,
+    target: ts.ScriptTarget.Latest,
+    noLib: true,
+    noResolve: true,
+  };
+  const source = ts.createSourceFile(
+    fileName,
+    text,
+    options.target ?? ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  const host = ts.createCompilerHost(options, true);
+  host.fileExists = (candidate) => candidate === fileName;
+  host.readFile = (candidate) => candidate === fileName ? text : undefined;
+  host.getSourceFile = (candidate) => candidate === fileName ? source : undefined;
+  const program = ts.createProgram({ rootNames: [fileName], options, host });
+  return {
+    source: program.getSourceFile(fileName) ?? source,
+    checker: program.getTypeChecker(),
+  };
 }
 
 function defaultLayoutReturn(source: ts.SourceFile): ts.Expression | null {
@@ -74,17 +104,19 @@ function meaningfulJsxChildren(element: ts.JsxElement): readonly ts.JsxChild[] {
 }
 
 function legacyLayoutCompositionErrors(text: string): string[] {
-  const source = ts.createSourceFile('app-layout.tsx', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const appShellBinding = namedImportBinding(
+  const { source, checker } = parseLayoutWithSymbols(text);
+  const appShellImport = namedImportBinding(
     source,
     '@/components/layout/AppShell',
     'AppShell',
   );
-  const providerBinding = namedImportBinding(
+  const providerImport = namedImportBinding(
     source,
     '@/components/layout/StatusBarContext',
     'StatusBarProvider',
   );
+  const appShellBinding = appShellImport?.name.text ?? null;
+  const providerBinding = providerImport?.name.text ?? null;
   const errors: string[] = [];
   if (appShellBinding !== 'AppShell') errors.push('missing real AppShell named import');
   if (providerBinding !== 'StatusBarProvider') {
@@ -96,12 +128,28 @@ function legacyLayoutCompositionErrors(text: string): string[] {
     errors.push('layout does not return StatusBarProvider as the outer wrapper');
     return errors;
   }
+  const providerImportSymbol = providerImport
+    ? checker.getSymbolAtLocation(providerImport.name)
+    : undefined;
+  const returnedProviderSymbol = checker.getSymbolAtLocation(returned.openingElement.tagName);
+  if (!providerImportSymbol || returnedProviderSymbol !== providerImportSymbol) {
+    errors.push('returned StatusBarProvider does not resolve to the imported binding');
+  }
   const providerChildren = meaningfulJsxChildren(returned);
   if (providerChildren.length !== 1
     || !ts.isJsxElement(providerChildren[0])
     || tagName(providerChildren[0]) !== appShellBinding) {
     errors.push('StatusBarProvider does not directly wrap AppShell');
     return errors;
+  }
+  const appShellImportSymbol = appShellImport
+    ? checker.getSymbolAtLocation(appShellImport.name)
+    : undefined;
+  const returnedAppShellSymbol = checker.getSymbolAtLocation(
+    providerChildren[0].openingElement.tagName,
+  );
+  if (!appShellImportSymbol || returnedAppShellSymbol !== appShellImportSymbol) {
+    errors.push('returned AppShell does not resolve to the imported binding');
   }
   const shellChildren = meaningfulJsxChildren(providerChildren[0]);
   if (shellChildren.length !== 1
@@ -204,6 +252,34 @@ describe('the scope boundary — the legacy chrome is untouched and still used',
           StatusBarProvider as LegacyStatus,
         } from '@/components/layout/StatusBarContext';
         export default function Layout({ children }: { children: ReactNode }) {
+          return <StatusBarProvider><AppShell>{children}</AppShell></StatusBarProvider>;
+        }
+      `,
+    ],
+    [
+      'lookalike components imported from the wrong modules',
+      `
+        import type { ReactNode } from 'react';
+        import { AppShell } from '@/lookalikes/AppShell';
+        import { StatusBarProvider } from '@/lookalikes/StatusBarContext';
+        export default function Layout({ children }: { children: ReactNode }) {
+          return <StatusBarProvider><AppShell>{children}</AppShell></StatusBarProvider>;
+        }
+      `,
+    ],
+    [
+      'local components shadowing both real imports',
+      `
+        import type { ReactNode } from 'react';
+        import { AppShell } from '@/components/layout/AppShell';
+        import { StatusBarProvider } from '@/components/layout/StatusBarContext';
+        export default function Layout({ children }: { children: ReactNode }) {
+          const AppShell = ({ children: nested }: { children: ReactNode }) => (
+            <main data-fake-shell>{nested}</main>
+          );
+          const StatusBarProvider = ({ children: nested }: { children: ReactNode }) => (
+            <section data-fake-provider>{nested}</section>
+          );
           return <StatusBarProvider><AppShell>{children}</AppShell></StatusBarProvider>;
         }
       `,
