@@ -1107,13 +1107,33 @@ describe('SPEC-R1 complete live Match Card surfaces', () => {
     expect(within(sides[1]).getByText('ABSTAIN')).toBeInTheDocument();
     expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
     expect(screen.getAllByTestId('split-outcome')).toHaveLength(1);
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.60');
   });
 
-  it('shows the exact opposite-actions callout only for two differing recorded actions', async () => {
+  it('shows the exact opposite-actions callout for recorded FOLLOW + FADE', async () => {
     await participants({ receipts: () => jsonResponse([RECEIPTS[0], RECEIPTS[1]]) });
     const callout = screen.getByTestId('split-opposite-actions');
     expect(callout).toHaveTextContent('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
     expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('shows the exact opposite-actions callout for recorded FADE + FOLLOW', async () => {
+    await participants({
+      receipts: () => jsonResponse([
+        { ...RECEIPTS[0], action: 'FADE' },
+        { ...RECEIPTS[1], action: 'FOLLOW' },
+      ]),
+    });
+    const callout = screen.getByTestId('split-opposite-actions');
+    expect(callout).toHaveTextContent('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('keeps disagreement Δ but omits opposite actions for recorded FOLLOW + ABSTAIN', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[0], RECEIPTS[2]]) });
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.19');
   });
 
   it('does not show the opposite-actions callout for a same-action pair', async () => {

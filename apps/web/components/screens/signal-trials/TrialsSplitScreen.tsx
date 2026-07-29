@@ -104,9 +104,12 @@ export function TrialsSplitScreen({
   const delta = pair.length === 2
     ? Math.abs(pair[0].pFollowProfitable - pair[1].pFollowProfitable)
     : null;
-  // Actions are server-derived and recorded on each receipt. The comparison only states whether
-  // those two recorded values differ; it never recomputes action bands from probability.
-  const oppositeActions = pair.length === 2 && pair[0].action !== pair[1].action;
+  // Actions are server-derived and recorded on each receipt. This exact callout describes only
+  // the unordered FADE/FOLLOW pair; ABSTAIN is never relabelled from probability.
+  const oppositeActions = pair.length === 2 && (
+    (pair[0].action === 'FADE' && pair[1].action === 'FOLLOW')
+    || (pair[0].action === 'FOLLOW' && pair[1].action === 'FADE')
+  );
   return (
     <section
       className={styles.panel}
