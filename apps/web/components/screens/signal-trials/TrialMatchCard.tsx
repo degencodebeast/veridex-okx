@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ApiError } from '@/lib/api';
 import {
@@ -69,13 +69,10 @@ import styles from './TrialMatchCard.module.css';
 // exists to avoid. Exported so the test pins the same constant the card counts against.
 export const TRIAL_SETTLEMENT_HORIZON_MS = 3_600_000;
 
-// The official cost basis, and the declared diagnostic sweep around it.
-//
-// ONLY THE 25 bps ROW HAS SERVED VALUES. `TrialOutcomeWire` carries exactly one (follow, fade)
-// pair — the official basis the season ranks on. No 0 / 10 / 50 bps markout exists anywhere on the
-// frozen wire, and synthesising one here (gross − cost, or any other arithmetic) would be this
-// client recomputing the settlement law. The sweep rows therefore render as NOT SERVED rather than
-// as numbers. See the note under the table.
+// The official cost basis, and the declared diagnostic sweep around it. The API carries the 25-bps
+// pair used by ranking. The binding handoff separately classifies 0 / 10 / 50 as presentation
+// derivations: gross = served FOLLOW + 25; follow(c) = gross - c; fade(c) = -gross - c. Those rows
+// never replace or reinterpret the official pair, and the sweep never changes ranking.
 const OFFICIAL_COST_BPS = 25;
 const COST_SWEEP_BPS = [0, 10, 25, 50] as const;
 
@@ -861,11 +858,20 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
 // ---------------------------------------------------------------------------
 
 function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
-  const settled = outcome !== null && outcome.status === 'settled';
-  const rows = useMemo(
-    () => COST_SWEEP_BPS.map((cost) => ({ cost, official: cost === OFFICIAL_COST_BPS })),
-    [],
-  );
+  const followOfficial = outcome?.status === 'settled' ? outcome.followMarkoutBps : null;
+  const fadeOfficial = outcome?.status === 'settled' ? outcome.fadeMarkoutBps : null;
+  const settled = followOfficial !== null && fadeOfficial !== null;
+  const gross = followOfficial === null ? null : followOfficial + OFFICIAL_COST_BPS;
+  const rows = COST_SWEEP_BPS.map((cost) => ({
+    cost,
+    official: cost === OFFICIAL_COST_BPS,
+    follow: cost === OFFICIAL_COST_BPS || gross === null ? followOfficial : gross - cost,
+    fade: cost === OFFICIAL_COST_BPS || gross === null ? fadeOfficial : -gross - cost,
+  }));
+  const officialFormulaFade = gross === null ? null : -gross - OFFICIAL_COST_BPS;
+  const officialPairIsInconsistent = settled
+    && officialFormulaFade !== null
+    && Math.abs(fadeOfficial - officialFormulaFade) > 1e-9;
 
   return (
     <div className={styles.panel} data-testid="markout-table">
@@ -897,7 +903,7 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                 </tr>
               </thead>
               <tbody>
-                {rows.map(({ cost, official }) => (
+                {rows.map(({ cost, official, follow, fade }) => (
                   <tr
                     key={cost}
                     className={styles.row}
@@ -912,17 +918,13 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                     >
                       {cost} bps
                     </td>
-                    {/* ONLY the official row has served values. The other three rows are declared
-                        by the published sweep and are NOT carried by the frozen wire, so they
-                        render as not served. Computing them from the 25 bps pair would be this
-                        client recomputing the settlement law — see the note below the table. */}
                     <td
                       className={styles.num}
                       data-testid="markout-follow"
                       data-label="FOLLOW MARKOUT (BPS)"
                       aria-label="FOLLOW MARKOUT (BPS)"
                     >
-                      {official ? bps(outcome.followMarkoutBps) : DASH}
+                      {bps(follow)}
                     </td>
                     <td
                       className={styles.num}
@@ -930,7 +932,7 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                       data-label="FADE MARKOUT (BPS)"
                       aria-label="FADE MARKOUT (BPS)"
                     >
-                      {official ? bps(outcome.fadeMarkoutBps) : DASH}
+                      {bps(fade)}
                     </td>
                     <td data-label="BASIS" aria-label="BASIS">
                       {official ? 'official rank basis' : 'diagnostic'}
@@ -940,11 +942,17 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
               </tbody>
             </table>
           </div>
+          {officialPairIsInconsistent ? (
+            <p className={styles.fence} data-testid="markout-formula-warning">
+              The served 25 bps pair is inconsistent with the declared diagnostic formula. The
+              official values remain displayed verbatim.
+            </p>
+          ) : null}
           <p className={styles.footNote}>
-            The {OFFICIAL_COST_BPS} bps row is the only basis the season ranks on. The 0, 10 and 50
-            bps rows are declared by the published sweep, but the trial endpoint serves a single
-            markout pair — the official basis — so no value is shown for them. This card does not
-            compute markouts.
+            The {OFFICIAL_COST_BPS} bps row is the only basis the season ranks on and is displayed
+            from the served official pair. The 0, 10 and 50 bps rows are diagnostic presentation
+            derivations from gross = served FOLLOW + {OFFICIAL_COST_BPS}; they do not alter the
+            official evidence.
           </p>
           <p className={styles.footNote}>
             The sweep exists to answer one question: does the ordering survive the cost assumption?

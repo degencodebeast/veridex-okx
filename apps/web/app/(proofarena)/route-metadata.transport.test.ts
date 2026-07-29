@@ -274,6 +274,42 @@ async function openSettledTrialWithTables(width: number) {
   return page;
 }
 
+async function openSettledTrialWithQualityR2Surfaces(width: number) {
+  const trialId = 'trial-quality-r2';
+  const encoded = encodeURIComponent(trialId);
+  const page = await (await getBrowser()).newPage({ viewport: { width, height: 1400 } });
+  const trial = {
+    ...navigationTrial(trialId),
+    outcome: navigationSettledOutcome(trialId),
+  };
+  const follow = navigationReceipt(trialId);
+  const fade = {
+    ...follow,
+    receipt_id: 'rcpt_transport_2',
+    payer: '0x2222222222222222222222222222222222222222',
+    p_follow_profitable: 0.31,
+    action: 'FADE',
+    body_hash: 'bh_transport_2',
+    payment_tx_hash: 'tx_transport_2',
+  };
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === `/signal-trials/trials/${encoded}/receipts`) {
+      return json(route, [follow, fade]);
+    }
+    if (path.startsWith('/signal-trials/receipts/') && path.endsWith('/verify')) {
+      const receipt = path.includes(fade.receipt_id) ? fade : follow;
+      return json(route, { ...navigationVerify(trialId), receipt_id: receipt.receipt_id, receipt });
+    }
+    if (path === `/signal-trials/trials/${encoded}`) return json(route, trial);
+    return json(route, { error: 'not_found' }, 404);
+  });
+  await page.goto(`${origin}/trials/${encoded}`, { waitUntil: 'networkidle' });
+  await page.locator('[data-testid="split-opposite-actions"]').waitFor();
+  await page.locator('[data-testid="markout-row"]').first().waitFor();
+  return page;
+}
+
 async function openNoSeason(width: number) {
   const page = await (await getBrowser()).newPage({ viewport: { width, height: 1000 } });
   await page.route('**/signal-trials/**', async (route) => {
@@ -634,6 +670,32 @@ describe.each([1440, 390, 392])(
     ] as const)('renders the %s season combo exactly', async (state, expected) => {
       const page = await openServedSeasonCombo(state, width);
       expect(await page.locator('[data-testid="season-combo"]').textContent()).toBe(expected);
+      await page.close();
+    });
+  },
+);
+
+describe.each([1440, 390, 392])(
+  '/trials/[trialId] serves the Quality R2 comparison and cost sweep at %dpx',
+  (width) => {
+    it('renders the conditional action conclusion and exact diagnostic values', async () => {
+      const page = await openSettledTrialWithQualityR2Surfaces(width);
+      expect(await page.locator('[data-testid="split-opposite-actions"]').textContent())
+        .toBe('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
+
+      const values = await page.locator('[data-testid="markout-row"]').evaluateAll((rows) =>
+        rows.map((row) => ({
+          cost: row.getAttribute('data-cost-bps'),
+          follow: row.querySelector<HTMLElement>('[data-testid="markout-follow"]')?.textContent,
+          fade: row.querySelector<HTMLElement>('[data-testid="markout-fade"]')?.textContent,
+        })),
+      );
+      expect(values).toEqual([
+        { cost: '0', follow: '+100.0 bps', fade: '-100.0 bps' },
+        { cost: '10', follow: '+90.0 bps', fade: '-110.0 bps' },
+        { cost: '25', follow: '+75.0 bps', fade: '-125.0 bps' },
+        { cost: '50', follow: '+50.0 bps', fade: '-150.0 bps' },
+      ]);
       await page.close();
     });
   },

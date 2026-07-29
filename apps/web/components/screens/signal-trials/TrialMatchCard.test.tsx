@@ -838,27 +838,59 @@ describe('H5.3 markout table', () => {
     expect(official[0]).toHaveAttribute('data-cost-bps', '25');
   });
 
-  it('fills the 25 bps row from the SERVED values and leaves the sweep rows explicitly not-served', async () => {
+  it('derives the declared 0/10/50 diagnostic rows and preserves the SERVED 25 bps pair', async () => {
     await card();
     const rows = screen.getAllByTestId('markout-row');
-    const official = rows.find((r) => r.getAttribute('data-cost-bps') === '25')!;
-    expect(within(official).getByTestId('markout-follow'))
-      .toHaveTextContent(String(settledOutcome.follow_markout_bps));
-    expect(within(official).getByTestId('markout-fade'))
-      .toHaveTextContent(String(settledOutcome.fade_markout_bps));
-    // THE CONTROL AGAINST A DERIVED SWEEP. `TrialOutcomeWire` carries exactly ONE (follow, fade)
-    // pair — the official 25 bps basis. No 0/10/50 bps value is on the wire, and computing one on
-    // the client would be the frontend re-deriving scoring. These cells must hold NO digits.
-    for (const cost of ['0', '10', '50']) {
-      const row = rows.find((r) => r.getAttribute('data-cost-bps') === cost)!;
-      expect(within(row).getByTestId('markout-follow').textContent).not.toMatch(/\d/);
-      expect(within(row).getByTestId('markout-fade').textContent).not.toMatch(/\d/);
-    }
+    const values = Object.fromEntries(rows.map((row) => [
+      row.getAttribute('data-cost-bps'),
+      [
+        within(row).getByTestId('markout-follow').textContent,
+        within(row).getByTestId('markout-fade').textContent,
+      ],
+    ]));
+    // Binding handoff [DER]: gross = served FOLLOW + 25; follow(c) = gross - c;
+    // fade(c) = -gross - c. The 25-bps row is NOT derived: it remains the API pair verbatim.
+    expect(values).toEqual({
+      0: ['+66.0 bps', '-66.0 bps'],
+      10: ['+56.0 bps', '-76.0 bps'],
+      25: ['+41.0 bps', '-41.0 bps'],
+      50: ['+16.0 bps', '-116.0 bps'],
+    });
   });
 
-  it('shows no sweep at all when nothing settled, and says the 25 bps basis is unchanged', async () => {
-    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('pending'))) });
+  it('discloses when the served official pair disagrees with the diagnostic formula', async () => {
+    await card();
+    expect(screen.getByTestId('markout-formula-warning')).toHaveTextContent(
+      'The served 25 bps pair is inconsistent with the declared diagnostic formula. The official values remain displayed verbatim.',
+    );
+  });
+
+  it('does not invent an inconsistency warning when the served official pair matches the formula', async () => {
+    await card({
+      trial: () => jsonResponse(trial({
+        ...settledOutcome,
+        follow_markout_bps: 41.1,
+        fade_markout_bps: -91.1,
+      })),
+    });
+    expect(screen.queryByTestId('markout-formula-warning')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['an absent outcome', null],
+    ['a pending outcome', nullMetricOutcome('pending')],
+    ['an UNSCORED outcome', nullMetricOutcome('UNSCORED')],
+    [
+      'a settled outcome with absent markouts',
+      { ...settledOutcome, follow_markout_bps: null, fade_markout_bps: null },
+    ],
+  ] as const)('shows no sweep for %s and never fabricates diagnostic values', async (
+    _state,
+    outcome,
+  ) => {
+    await card({ trial: () => jsonResponse(trial(outcome)) });
     expect(screen.queryAllByTestId('markout-row')).toHaveLength(0);
+    expect(screen.queryByTestId('markout-formula-warning')).not.toBeInTheDocument();
     expect(screen.getByTestId('markout-table').textContent)
       .toMatch(/no markout exists at any cost assumption/i);
   });
@@ -1077,6 +1109,24 @@ describe('SPEC-R1 complete live Match Card surfaces', () => {
     expect(screen.getAllByTestId('split-outcome')).toHaveLength(1);
   });
 
+  it('shows the exact opposite-actions callout only for two differing recorded actions', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[0], RECEIPTS[1]]) });
+    const callout = screen.getByTestId('split-opposite-actions');
+    expect(callout).toHaveTextContent('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('does not show the opposite-actions callout for a same-action pair', async () => {
+    await participants({
+      receipts: () => jsonResponse([
+        RECEIPTS[0],
+        { ...RECEIPTS[1], action: 'FOLLOW' },
+      ]),
+    });
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
   it('renders the exact one-participant absence branch with dash values and shared evidence intact', async () => {
     await participants({ receipts: () => jsonResponse([RECEIPTS[2]]) });
     const absent = screen.getByTestId('split-agent-absent');
@@ -1088,6 +1138,7 @@ describe('SPEC-R1 complete live Match Card surfaces', () => {
     expect(absent).toHaveTextContent('action —');
     expect(absent).toHaveTextContent('brier —');
     expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
   });
 
   it('does not mount a two-side comparison when the served participant set is empty', async () => {

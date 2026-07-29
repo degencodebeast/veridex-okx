@@ -56,7 +56,15 @@ function AbsentSide() {
   );
 }
 
-function SharedBand({ trial, delta }: { trial: TrialCard; delta: number | null }) {
+function SharedBand({
+  trial,
+  delta,
+  oppositeActions,
+}: {
+  trial: TrialCard;
+  delta: number | null;
+  oppositeActions: boolean;
+}) {
   return (
     <div className={styles.splitEvidence} data-testid="split-evidence">
       <p className={styles.label}>SHARED EVIDENCE</p>
@@ -66,6 +74,11 @@ function SharedBand({ trial, delta }: { trial: TrialCard; delta: number | null }
       <p>SAME DEADLINE · {trial.commitDeadlineMs}</p>
       <p>SAME LAW · FIXED 1H HORIZON</p>
       {delta === null ? null : <p className={styles.delta}>DISAGREEMENT · Δ {delta.toFixed(2)}</p>}
+      {oppositeActions ? (
+        <p className={styles.delta} data-testid="split-opposite-actions">
+          OPPOSITE ACTIONS · FADE ↔ FOLLOW
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -91,6 +104,9 @@ export function TrialsSplitScreen({
   const delta = pair.length === 2
     ? Math.abs(pair[0].pFollowProfitable - pair[1].pFollowProfitable)
     : null;
+  // Actions are server-derived and recorded on each receipt. The comparison only states whether
+  // those two recorded values differ; it never recomputes action bands from probability.
+  const oppositeActions = pair.length === 2 && pair[0].action !== pair[1].action;
   return (
     <section
       className={styles.panel}
@@ -106,7 +122,7 @@ export function TrialsSplitScreen({
       </div>
       <div className={styles.splitGrid}>
         {pair[0] ? <Side receipt={pair[0]} /> : null}
-        <SharedBand trial={trial} delta={delta} />
+        <SharedBand trial={trial} delta={delta} oppositeActions={oppositeActions} />
         {pair[1] ? <Side receipt={pair[1]} /> : receipts.length === 1 ? <AbsentSide /> : null}
       </div>
       <p className={styles.caption}>
