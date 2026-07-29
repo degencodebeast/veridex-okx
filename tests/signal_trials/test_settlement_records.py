@@ -61,7 +61,8 @@ import socket
 from dataclasses import dataclass, fields, replace
 from importlib import util as importlib_util
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -2703,6 +2704,7 @@ def test_main_REDACTS_credentials_out_of_the_failure_report(
     """
     _publish_selection(tmp_path)
     _set_sentinel_credentials(monkeypatch)
+    LiveTrialRepository(tmp_path / settle_operator.LIVE_SUBDIR).publish(_trial())
 
     async def exploding_settle_all(trials: Any, store: Any, creds: Any, args: Any, *, now_ms: int) -> Any:
         raise RuntimeError(
@@ -2792,6 +2794,265 @@ def test_only_trials_PAST_their_horizon_and_NOT_already_terminal_are_settled(
     # The `--trial-id` selector narrows the same set rather than bypassing either filter.
     assert settle_operator._eligible(trials, store, now_ms=now_ms, trial_id="trial_pending") == [still_pending]
     assert settle_operator._eligible(trials, store, now_ms=now_ms, trial_id="trial_settled") == []
+
+
+def _crash_after_terminal_outcome(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    terminal_status: str,
+    trial_id: str = TRIAL_ID,
+    receipt_id: str = "rcpt_terminal_crash",
+) -> tuple[LiveTrial, CommitRecord, bytes]:
+    """Create the real outcome-written/settlement-missing crash state.
+
+    The trial and finalized commitment both use their production writers.  The only injected
+    failure is the first participant-settlement write, after :func:`_record_one` has durably
+    recorded the terminal outcome.  That is the exact non-transactional boundary this regression
+    exists to recover, not a hand-authored approximation of it.
+    """
+    trial = _trial(trial_id=trial_id)
+    LiveTrialRepository(tmp_path / settle_operator.LIVE_SUBDIR).publish(trial)
+    store = ReceiptStore(tmp_path)
+    commit = _commit(store, trial, staging_id=f"staging_{receipt_id}")
+    series = _series() if terminal_status == "settled" else _covering_series()
+    now_ms = T + 60_000 + FETCH_GRACE_MS
+    args = SimpleNamespace(cost_bps=DECLARED_COST_BPS, dry_run=False)
+    calls = 0
+
+    def crash_on_first_settlement(settlement: ParticipantSettlement) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("injected crash after the terminal outcome write")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(store, "record_settlement", crash_on_first_settlement)
+        with pytest.raises(OSError, match="injected crash"):
+            settle_operator._record_one(
+                trial,
+                series,
+                store,
+                args,
+                now_ms=now_ms,
+                source_endpoint=SOURCE_ENDPOINT,
+            )
+
+    assert calls == 1, "the injected crash did not occur at the participant-settlement boundary"
+    outcome = store.outcome(trial_id)
+    assert outcome is not None and outcome.status == terminal_status
+    assert store.settlement(commit.receipt_id) is None
+    outcome_path = tmp_path / _OUTCOMES_DIRNAME / f"{trial_id}.json"
+    return trial, commit, outcome_path.read_bytes()
+
+
+def _run_terminal_retry(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    trial_id: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run the exact-trial operator path with a provider-call tripwire."""
+    _publish_selection(tmp_path)
+    _set_sentinel_credentials(monkeypatch)
+
+    class _ProviderCallForbidden:
+        def __init__(self, transport: Any, creds: Any) -> None:
+            raise AssertionError("a terminal reconciliation entered the provider client path")
+
+        async def get_candles(self, *args: Any, **kwargs: Any) -> CandleSeries:
+            raise AssertionError("a terminal reconciliation attempted to refetch settlement candles")
+
+    monkeypatch.setattr(settle_operator, "OKXMarketClient", _ProviderCallForbidden)
+    argv = [
+        "--data-dir",
+        str(tmp_path),
+        "--chain-index",
+        CHAIN_INDEX,
+        "--bar",
+        "1m",
+        "--trial-id",
+        trial_id,
+        "--now-ms",
+        str(T + 60_000 + FETCH_GRACE_MS),
+    ]
+    if dry_run:
+        argv.append("--dry-run")
+    exit_code = settle_operator.main(argv)
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.err
+    assert captured.err == ""
+    return cast(dict[str, Any], json.loads(captured.out))
+
+
+@pytest.mark.parametrize("terminal_status", ["settled", "UNSCORED"])
+def test_a_later_exact_trial_run_reconciles_the_crash_window_once_without_refetching_or_rewriting(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    terminal_status: str,
+) -> None:
+    """RED: terminal history must not strand the paid participant artifact forever.
+
+    This drives the real crash ordering, then invokes ``main`` twice.  The first retry must derive
+    the missing participant settlement from the immutable finalized commitment and stored terminal
+    outcome; the second must be a complete no-op.  Outcome byte identity makes "repair by
+    recomputing/re-recording the event" distinguishable from the required participant-only repair.
+    """
+    _, commit, original_outcome_bytes = _crash_after_terminal_outcome(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        terminal_status=terminal_status,
+    )
+    original_record_settlement = ReceiptStore.record_settlement
+    settlement_writes: list[str] = []
+
+    def counted_record_settlement(self: ReceiptStore, settlement: ParticipantSettlement) -> None:
+        settlement_writes.append(settlement.receipt_id)
+        original_record_settlement(self, settlement)
+
+    monkeypatch.setattr(ReceiptStore, "record_settlement", counted_record_settlement)
+    first = _run_terminal_retry(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        trial_id=TRIAL_ID,
+    )
+
+    assert first["eligible"] == 1
+    assert len(first["trials"]) == 1
+    assert first["trials"][0] == {
+        "trial_id": TRIAL_ID,
+        "status": terminal_status,
+        "candles_fetched": 0,
+        "observation_lag_ms": first["trials"][0]["observation_lag_ms"],
+        "follow_markout_bps": first["trials"][0]["follow_markout_bps"],
+        "recorded": True,
+        "settlements_recorded": 1,
+        "settlements_missing": 1,
+        "reconciliation": "recorded",
+    }
+    assert settlement_writes == [commit.receipt_id]
+    assert ReceiptStore(tmp_path).settlement(commit.receipt_id) is not None
+    outcome_path = tmp_path / _OUTCOMES_DIRNAME / f"{TRIAL_ID}.json"
+    assert outcome_path.read_bytes() == original_outcome_bytes
+
+    second = _run_terminal_retry(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        trial_id=TRIAL_ID,
+    )
+    assert second["eligible"] == 0
+    assert second["trials"] == []
+    assert settlement_writes == [commit.receipt_id], "a fully reconciled terminal trial was rewritten"
+    assert outcome_path.read_bytes() == original_outcome_bytes
+
+
+def test_terminal_reconciliation_dry_run_reports_but_writes_nothing_and_exact_id_excludes_other_rows(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Dry-run and exact-id scope apply to the repair path, including non-final commitments."""
+    _, target_commit, target_outcome_bytes = _crash_after_terminal_outcome(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        terminal_status="settled",
+    )
+    other_id = "trial_terminal_other"
+    other_trial, other_commit, other_outcome_bytes = _crash_after_terminal_outcome(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        terminal_status="UNSCORED",
+        trial_id=other_id,
+        receipt_id="rcpt_terminal_other",
+    )
+    store = ReceiptStore(tmp_path)
+    store.stage(
+        staging_id="staged_not_paid",
+        trial_id=TRIAL_ID,
+        payer="0xd",
+        body=_req(0.41),
+        staged_at_ms=T0 + 2_000,
+        commit_deadline_ms=other_trial.commit_deadline_ms,
+        trial_mode="live",
+    )
+    pending_before = store.count_pending()
+
+    dry = _run_terminal_retry(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        trial_id=TRIAL_ID,
+        dry_run=True,
+    )
+    assert dry["eligible"] == 1
+    assert dry["trials"][0]["reconciliation"] == "would_record"
+    assert dry["trials"][0]["recorded"] is False
+    assert dry["trials"][0]["settlements_missing"] == 1
+    assert dry["trials"][0]["settlements_recorded"] == 0
+    assert store.settlement(target_commit.receipt_id) is None
+    assert store.settlement(other_commit.receipt_id) is None
+    assert store.count_pending() == pending_before
+
+    live = _run_terminal_retry(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        trial_id=TRIAL_ID,
+    )
+    assert live["eligible"] == 1
+    assert store.settlement(target_commit.receipt_id) is not None
+    assert store.settlement(other_commit.receipt_id) is None
+    assert store.count_pending() == pending_before
+    assert (tmp_path / _OUTCOMES_DIRNAME / f"{TRIAL_ID}.json").read_bytes() == target_outcome_bytes
+    assert (tmp_path / _OUTCOMES_DIRNAME / f"{other_id}.json").read_bytes() == other_outcome_bytes
+
+
+def test_a_fully_reconciled_terminal_trial_never_calls_the_write_once_store_again(
+    settle_operator: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An existing settlement is not offered back to the idempotent writer as a pseudo-repair."""
+    _, commit, _ = _crash_after_terminal_outcome(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        terminal_status="settled",
+    )
+    store = ReceiptStore(tmp_path)
+    outcome = store.outcome(TRIAL_ID)
+    assert outcome is not None
+    store.record_settlement(settle_commit(commit, outcome))
+
+    def rewrite_forbidden(self: ReceiptStore, settlement: ParticipantSettlement) -> None:
+        raise AssertionError("existing participant settlement was offered for rewrite")
+
+    monkeypatch.setattr(ReceiptStore, "record_settlement", rewrite_forbidden)
+    result = _run_terminal_retry(
+        settle_operator,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        trial_id=TRIAL_ID,
+    )
+    assert result["eligible"] == 0
+    assert result["trials"] == []
 
 
 def test_the_published_check_names_match_the_frozen_tuples(
