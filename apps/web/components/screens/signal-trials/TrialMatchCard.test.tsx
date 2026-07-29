@@ -62,9 +62,25 @@ vi.mock('next/navigation', () => ({
 // Same idiom as SeasonScreen.test.tsx: read the frozen contract fixture from the repo root at test
 // time so this screen cannot drift from the backend's wire shape.
 const FIX = resolve(__dirname, '../../../../../contracts/fixtures');
-const trialWire = JSON.parse(
+const parsedTrialWire = JSON.parse(
   readFileSync(resolve(FIX, 'signal_trials_trial.json'), 'utf8'),
 ) as W.TrialWire;
+const canonicalEvidence = {
+  t0_ms: 1_700_000_000_000,
+  chain_index: '501',
+  token_address: '0x1111111111111111111111111111111111111111',
+  symbol: 'AAA',
+  name: 'Asset A',
+  market_cap_usd: 1_234_567.5,
+  holders: 842,
+  top10_holder_percent: 31.5,
+  trigger_price: 0.0041732,
+  wallet_type: 'smart money',
+  trigger_wallet_count: 3,
+  trigger_wallet_address: '0x2222222222222222222222222222222222222222',
+  amount_usd: 25_000,
+};
+const trialWire: W.TrialWire = { ...parsedTrialWire, evidence: canonicalEvidence };
 
 const TRIAL_ID = trialWire.trial_id;
 
@@ -955,6 +971,99 @@ describe('H5.3 /trials/[trialId] route page', () => {
     const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
     expect(urls.some((u) => u.endsWith(`/signal-trials/trials/${TRIAL_ID}`))).toBe(true);
     expect(urls.some((u) => u.endsWith(`/signal-trials/trials/${TRIAL_ID}/receipts`))).toBe(true);
+  });
+});
+
+describe('SPEC-R1 complete live Match Card surfaces', () => {
+  it('renders the canonical signal snapshot, its exact exclusions, and no invented transport', async () => {
+    await card();
+    const panel = screen.getByTestId('signal-state-panel');
+    for (const value of [
+      canonicalEvidence.symbol, canonicalEvidence.name, canonicalEvidence.chain_index,
+      canonicalEvidence.token_address, String(canonicalEvidence.trigger_price),
+      String(canonicalEvidence.trigger_wallet_count), String(canonicalEvidence.amount_usd),
+      String(canonicalEvidence.market_cap_usd), String(canonicalEvidence.holders),
+      String(canonicalEvidence.top10_holder_percent), canonicalEvidence.trigger_wallet_address,
+    ]) expect(panel).toHaveTextContent(value);
+    expect(panel).toHaveTextContent(
+      'exact historical liquidity — not returned by the signal endpoint; the record states only that the trial passed the $20k min-liquidity query filter.',
+    );
+    expect(panel).toHaveTextContent(
+      'soldRatioPercent — trigger-time semantics unverified; withheld from agent evidence.',
+    );
+    expect(panel.textContent).not.toMatch(/\bREST\b|\bWS\b|SOURCE \/ TRANSPORT/);
+  });
+
+  it('renders only served and fixed-law identity, omitting unsupported replay identity', async () => {
+    await card();
+    const identity = screen.getByTestId('evidence-law-identity');
+    expect(identity).toHaveTextContent(TRIAL_ID);
+    expect(identity).toHaveTextContent('live');
+    expect(identity).toHaveTextContent(trialWire.evidence_hash);
+    expect(identity).toHaveTextContent(String(trialWire.t0_ms));
+    expect(identity).toHaveTextContent(String(trialWire.commit_deadline_ms));
+    expect(identity).toHaveTextContent(String(TRIAL_SETTLEMENT_HORIZON_MS));
+    expect(identity.textContent).not.toMatch(/BAR|LAW VERSION|MANIFEST|CONTESTANT VERSION|n\/a/i);
+  });
+
+  it('renders the selected four-node rail with one hash, served agents and one outcome strip', async () => {
+    await participants();
+    const rail = screen.getByTestId('shared-evidence-rail');
+    expect(within(rail).getAllByTestId('rail-node')).toHaveLength(4);
+    expect(within(rail).getAllByTestId('rail-hash-chip')).toHaveLength(1);
+    expect(within(rail).getAllByTestId('rail-agent')).toHaveLength(RECEIPTS.length);
+    expect(within(rail).getAllByTestId('rail-outcome')).toHaveLength(1);
+  });
+
+  it('selects the greatest-|Δp| pair with payer tie-break and relays p=.91 ABSTAIN', async () => {
+    await participants();
+    const sides = screen.getAllByTestId('split-agent');
+    expect(sides).toHaveLength(2);
+    expect(within(sides[0]).getByText('0xbbb')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('0xccc')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('0.91')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('ABSTAIN')).toBeInTheDocument();
+    expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
+    expect(screen.getAllByTestId('split-outcome')).toHaveLength(1);
+  });
+
+  it('renders the exact one-participant absence branch with dash values and shared evidence intact', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[2]]) });
+    const absent = screen.getByTestId('split-agent-absent');
+    expect(absent).toHaveTextContent('NO COMMITMENT RECORDED');
+    expect(absent).toHaveTextContent(
+      'No second agent committed to this trial before the deadline. The shared evidence, deadline, and law are unchanged; nothing is inferred for the missing side.',
+    );
+    expect(absent).toHaveTextContent('p_follow_profitable —');
+    expect(absent).toHaveTextContent('action —');
+    expect(absent).toHaveTextContent('brier —');
+    expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
+  });
+
+  it('invents no sides when the served participant set is empty', async () => {
+    await participants({ receipts: () => jsonResponse([]) });
+    expect(screen.getByTestId('trials-split')).toHaveAttribute('data-state', 'empty');
+    expect(screen.queryByTestId('split-agent')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('split-agent-absent')).not.toBeInTheDocument();
+  });
+
+  it('shows Fair-Play phase tiers and an independent verdict tally without an aggregate badge', async () => {
+    await participants();
+    const first = screen.getAllByTestId('fairplay-checks')[0];
+    expect(first).toHaveTextContent('COMMIT-TIME');
+    expect(first).toHaveTextContent('OUTCOME-TIME');
+    expect(first).toHaveTextContent('4 pass · 4 pending');
+    expect(first).toHaveTextContent('Every check reports independently');
+    expect(first.textContent).not.toMatch(/\b8 verified\b/i);
+  });
+
+  it('discloses terminal eligibility from the fixed horizon without fabricating settlement fields', async () => {
+    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('UNSCORED'))) });
+    const settlement = screen.getByTestId('settlement-panel');
+    expect(settlement).toHaveTextContent('TERMINAL ELIGIBILITY');
+    expect(settlement).toHaveTextContent('T + bar + 600,000 ms grace elapsed');
+    expect(settlement).toHaveTextContent('SETTLEMENT CANDLE CLOSE');
+    expect(settlement).toHaveTextContent('—');
   });
 });
 

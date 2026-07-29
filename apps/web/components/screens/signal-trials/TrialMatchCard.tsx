@@ -11,6 +11,12 @@ import {
   verifyReceipt,
 } from '@/lib/signal-trials-api';
 import type { CommitReceipt, TrialCard, TrialOutcome, VerifyChecks } from '@/lib/contracts';
+import {
+  EvidenceLawIdentity,
+  SharedEvidenceRail,
+  SignalStatePanel,
+} from './SignalStatePanel';
+import { TrialsSplitScreen } from './TrialsSplitScreen';
 import styles from './TrialMatchCard.module.css';
 
 // H5.3 — the Trial Match Card at /trials/[trialId]. PUBLIC (no AuthGate): this is the judge-facing
@@ -272,10 +278,26 @@ export function TrialMatchCard({ trialId }: { trialId: string }) {
       {/* The participant and cost panels hang off the TRIAL succeeding, because both are framed by
           the trial's own evidence. Their INTERNAL failures are independent and handled below. */}
       {trial.kind === 'ok' ? (
-        <>
-          <ParticipantsSection state={people} />
-          <MarkoutSection outcome={trial.trial.outcome} />
-        </>
+        <div className={styles.trialComposition}>
+          <div className={styles.trialPrimary}>
+            <SharedEvidenceRail
+              trial={trial.trial}
+              agents={people.kind === 'list' ? people.entries.map((entry) => entry.receipt) : []}
+            />
+            <SignalStatePanel trial={trial.trial} />
+            {people.kind === 'list' ? (
+              <TrialsSplitScreen
+                trial={trial.trial}
+                receipts={people.entries.map((entry) => entry.receipt)}
+              />
+            ) : null}
+            <ParticipantsSection state={people} />
+          </div>
+          <aside className={styles.trialSecondary}>
+            <EvidenceLawIdentity trial={trial.trial} />
+            <MarkoutSection outcome={trial.trial.outcome} />
+          </aside>
+        </div>
       ) : null}
     </section>
   );
@@ -374,88 +396,6 @@ function TrialHead({ trial }: { trial: TrialCard }) {
         PAPER BENCHMARK — NOT A TRADE RECOMMENDATION
       </p>
 
-      {/* THE RAIL — and the line this section had to be rewritten to respect.
-          Two kinds of sentence want to live here and they are NOT the same claim:
-
-            CONSTRUCTION — what this trial record IS. It carries one sealed evidence payload, one
-            commit deadline and one settlement law. Those three are true from the record alone,
-            true whatever any verdict says, and stated unconditionally below.
-
-            The OUTCOME is NOT one of them. `TrialCard.outcome` is nullable, and `null` means
-            nothing was computed at all — a state this component renders as "No outcome record
-            exists for this trial". So the outcome half of the summary line below is a DIRECT READ
-            of that one field, not an unconditional statement, and the ternary that produces it is
-            load-bearing: an earlier revision of this block claimed "one outcome" unconditionally
-            and that is exactly the claim the milestone review found false. Do not collapse it.
-
-            VERIFICATION — what is true OF A PARTICULAR RECEIPT: that it really re-derives against
-            that record, really binds this trial, really arrived before the deadline. NOTHING on
-            this rail can establish those. Only the per-receipt checks can, and they report one
-            verdict at a time.
-
-          This rail previously asserted the SECOND kind unconditionally — "IDENTICAL FOR EVERY
-          AGENT", "every agent … committed before the same deadline", "the rail is the fairness
-          claim". Those sentences stayed on screen while a receipt's `deadline_respected` read
-          `fail`, so the card asserted as fact the exact thing its own verifier had just denied.
-
-          The fix is ATTRIBUTION, not gating. Hiding this copy when some check fails would require
-          computing "did everything pass" — an aggregate, and the same defect with the opposite
-          sign. So the construction is stated outright and every per-receipt claim is handed to the
-          checks below, which is why this copy is correct in all four verdict states at once. */}
-      <div className={styles.rail}>
-        <p className={styles.panelLabel}>SHARED EVIDENCE RAIL</p>
-        {/* THE OUTCOME LABEL IS A DIRECT READ of one source-of-truth field, and the distinction
-            matters: `trial.outcome === null` says the endpoint computed nothing at all, which is a
-            state this component already renders six panels down as "No outcome record exists for
-            this trial". A fixed "ONE … OUTCOME" here put both sentences on the same page.
-
-            This branch is NOT the aggregate anti-pattern. It reads ONE served field and reports
-            it; it does not synthesise a judgement from eight verdicts, and it is invariant to every
-            one of them. The all-eight-pass pin in the test file is what holds that line, and it is
-            untouched.
-
-            Note `pending` and `UNSCORED` are RECORDS — `outcome !== null` — so they read
-            ONE OUTCOME RECORD. Only the null case is an absence. */}
-        <p className={styles.panelSub} data-testid="rail-summary">
-          ONE SNAPSHOT · ONE DEADLINE · ONE LAW ·{' '}
-          {trial.outcome === null ? 'NO OUTCOME RECORD' : 'ONE OUTCOME RECORD'}
-        </p>
-        <div className={styles.hashChip}>
-          <span className={styles.hashLabel}>⬢ SEALED EVIDENCE</span>
-          {/* The hash renders in full. A truncation the card invented is a value the backend never
-              served, and this chip is the evidence record the trial was published under. */}
-          <code className={styles.hash} data-testid="trial-evidence-hash">{trial.evidenceHash}</code>
-          {/* Was "IDENTICAL FOR EVERY AGENT" — a claim about what each receipt is bound to, which
-              is `manifest`'s finding and not this chip's. This states the record instead. */}
-          <span className={styles.hashLabel}>ONE RECORD · ONE HASH</span>
-        </div>
-        <p className={styles.footNote}>
-          This trial has one sealed evidence payload, one commit deadline and one settlement law.
-          That is the structure of the record, not a finding about any receipt.
-        </p>
-        {/* Was "…and they are what every commitment below is scored against." Two things were
-            wrong with it. The participant set deliberately carries `pending` and `UNSCORED`
-            commitments whose Brier and chosen markout are null — and `UNSCORED` means no score
-            will EVER be produced — so "every commitment is scored" is false on the standard
-            fixture. And the commit deadline is a VALIDITY predicate, not a scoring input: missing
-            it rejects a commitment rather than moving its number. Split accordingly: binding and
-            timing are the checks' business, scoring is the settled outcome's. */}
-        <p className={styles.footNote}>
-          Whether a given commitment actually re-derives against this record — that its body
-          re-hashes, that it binds the trial it names, and that it arrived before the deadline — is
-          not asserted here. The Fair-Play checks below report it per receipt, one independent
-          verdict at a time.
-        </p>
-        <p className={styles.footNote}>
-          A score exists only where a settled outcome does: Brier and chosen markout are derived
-          from the settled outcome under the recorded law. A pending commitment has none yet, and an
-          UNSCORED one never will.
-        </p>
-        <p className={styles.footNote}>
-          t0 {trial.t0Ms} · one commit deadline {trial.commitDeadlineMs}
-        </p>
-      </div>
-
       <SettlementPanel outcome={trial.outcome} t0Ms={trial.t0Ms} />
     </>
   );
@@ -469,7 +409,7 @@ function SettlementPanel({ outcome, t0Ms }: { outcome: TrialOutcome | null; t0Ms
     <div className={styles.settlement} data-testid="settlement-panel" data-status={status}>
       <p className={styles.panelLabel}>SETTLEMENT</p>
       {outcome === null ? <NoOutcomeBody /> : null}
-      {outcome !== null && outcome.status === 'settled' ? <SettledBody o={outcome} /> : null}
+      {outcome !== null && outcome.status === 'settled' ? <SettledBody o={outcome} t0Ms={t0Ms} /> : null}
       {outcome !== null && outcome.status === 'pending' ? <PendingBody o={outcome} t0Ms={t0Ms} /> : null}
       {outcome !== null && outcome.status === 'UNSCORED' ? <UnscoredBody o={outcome} /> : null}
     </div>
@@ -491,7 +431,7 @@ function NoOutcomeBody() {
   );
 }
 
-function SettledBody({ o }: { o: TrialOutcome }) {
+function SettledBody({ o, t0Ms }: { o: TrialOutcome; t0Ms: number }) {
   return (
     <>
       <dl className={styles.grid}>
@@ -508,6 +448,10 @@ function SettledBody({ o }: { o: TrialOutcome }) {
           label="FOLLOW_PROFITABLE"
           // A boolean is not a number: `false` is a recorded verdict and `null` is its absence.
           value={o.followProfitable === null ? DASH : String(o.followProfitable)}
+        />
+        <Field
+          label="SETTLEMENT TARGET T"
+          value={`${t0Ms + TRIAL_SETTLEMENT_HORIZON_MS} · derived from fixed 1h horizon`}
         />
       </dl>
       <p className={styles.official}>OFFICIAL RESULT · {OFFICIAL_COST_BPS} BPS MODELED COSTS</p>
@@ -538,6 +482,7 @@ function PendingBody({ o, t0Ms }: { o: TrialOutcome; t0Ms: number }) {
         <Field label="COMMIT WINDOW" value="CLOSED" />
         <Field label="EVENT-ANCHORED ENTRY" value={String(o.entry)} />
         <Field label="REMAINING HORIZON" value={remaining(target - now)} testId="settlement-countdown" />
+        <Field label="SETTLEMENT TARGET T" value={`${target} · derived from fixed 1h horizon`} />
       </dl>
       <p className={styles.stateBody}>
         The result is not known. No close, markout, or Brier value exists yet. Commit-time checks
@@ -574,20 +519,17 @@ function UnscoredBody({ o }: { o: TrialOutcome }) {
       </p>
       <dl className={styles.grid}>
         <Field label="EVENT-ANCHORED ENTRY" value={String(o.entry)} />
-        {/* Rendered literally as `null` rather than as a dash: on an UNSCORED trial the absence is
-            terminal and recorded, which is a stronger statement than "no value to show". */}
-        <Field label="SETTLEMENT CANDLE CLOSE" value={o.future === null ? 'null' : String(o.future)} />
-        <Field label="CLOSE TIMESTAMP" value={o.closeTsMs === null ? 'null' : String(o.closeTsMs)} />
+        <Field label="SETTLEMENT CANDLE CLOSE" value={num(o.future)} />
+        <Field label="CLOSE TIMESTAMP" value={num(o.closeTsMs)} />
         <Field
           label="OBSERVATION LAG"
-          value={o.observationLagMs === null ? 'null' : `${o.observationLagMs} ms`}
+          value={o.observationLagMs === null ? DASH : `${o.observationLagMs} ms`}
         />
         <Field
           label="FOLLOW / FADE MARKOUT"
-          value={`${o.followMarkoutBps === null ? 'null' : bps(o.followMarkoutBps)} · ${
-            o.fadeMarkoutBps === null ? 'null' : bps(o.fadeMarkoutBps)
-          }`}
+          value={`${bps(o.followMarkoutBps)} · ${bps(o.fadeMarkoutBps)}`}
         />
+        <Field label="TERMINAL ELIGIBILITY" value="T + bar + 600,000 ms grace elapsed" />
       </dl>
       <p className={styles.footNote}>
         The agent commitments and the evidence receipt above are preserved and remain verifiable. No
@@ -775,6 +717,15 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
     verify !== null && verify.receiptStatus !== null && verify.receiptStatus !== receipt.status
       ? verify.receiptStatus
       : null;
+  const tally = verify === null
+    ? null
+    : (['pass', 'pending', 'fail', null] as const)
+      .map((status) => {
+        const count = verify.checks.filter((check) => check.status === status).length;
+        return count === 0 ? null : `${count} ${status === null ? 'not served' : status}`;
+      })
+      .filter((part): part is string => part !== null)
+      .join(' · ');
 
   return (
     <div
@@ -813,6 +764,11 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
 
       {verify !== null ? (
         <>
+          <div className={styles.checkTierHead}>
+            <span>COMMIT-TIME</span>
+            <span>OUTCOME-TIME</span>
+            <strong data-testid="fairplay-tally">{tally}</strong>
+          </div>
           <ul className={styles.checkList}>
             {/* The frozen eight, always in the frozen order, always driven off the SINGLE exported
                 constant (CF-5). The adapter already guarantees length 8 and the order; iterating
@@ -845,6 +801,10 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
               keys served outside the frozen eight: {verify.unexpectedKeys.join(', ')}
             </p>
           ) : null}
+          <p className={styles.footNote}>
+            Every check reports independently as pass / fail / pending. There is no single
+            aggregate verified badge for this receipt.
+          </p>
           {disagreement !== null ? (
             <p className={styles.stateSub}>
               the verify route reports status {disagreement} for this receipt, which differs from

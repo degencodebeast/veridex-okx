@@ -1,6 +1,8 @@
 /* Layout idioms are lifted from SeasonScreen.module.css (same table/panel language, same design
    tokens) rather than imported from it — that file belongs to H5.2 and must not be modified. */
 .screen { display: flex; flex-direction: column; gap: var(--space-3); }
+.trialComposition { display: grid; gap: var(--space-3); min-width: 0; }
+.trialPrimary, .trialSecondary { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
 
 .panel {
   display: flex; flex-direction: column; gap: var(--space-2);
@@ -178,6 +180,11 @@
 .checks[data-checks-state='not_found'] { border-style: dashed; }
 
 .checkList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.checkTierHead {
+  display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; padding: 7px 0;
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
+.checkTierHead strong { color: var(--accent-hi); text-align: right; }
 .checkRow {
   display: grid; grid-template-columns: minmax(130px, auto) 88px 1fr auto;
   gap: var(--space-2); align-items: baseline;
@@ -237,10 +244,26 @@
    leave this control undersized from 641px to 760px, and would put it at a different size from the
    byte-identical retry on /trials, which is fixed at 760px. */
 @media (max-width: 760px) {
+  .back { display: inline-flex; align-items: center; min-height: 44px; }
   .retry { min-height: 44px; }
+  .tableWrap { overflow: visible; }
+  .table, .table tbody { display: block; width: 100%; }
+  .table thead { display: none; }
+  .table tr { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 10px; border-bottom: 1px solid var(--border); }
+  .table td { display: block; padding: 2px; white-space: normal; overflow-wrap: anywhere; }
+  .checkTierHead { grid-template-columns: 1fr 1fr; }
+  .checkTierHead strong { grid-column: 1 / -1; text-align: left; }
 }
 
 @media (max-width: 640px) {
   .checkRow { grid-template-columns: 1fr auto; }
   .checkPhase, .checkDesc { grid-column: 1 / -1; }
+}
+
+@media (min-width: 900px) and (max-width: 1180px) {
+  .trialComposition { grid-template-columns: 1fr; }
+}
+
+@media (min-width: 1181px) {
+  .trialComposition { grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr); }
 }

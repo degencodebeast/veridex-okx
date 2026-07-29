@@ -40,7 +40,23 @@ function fixture<T>(name: string): T {
 }
 
 const seasonWire = fixture<W.SignalTrialsSeasonWire>('signal_trials_season.json');
-const trialWire = fixture<W.TrialWire>('signal_trials_trial.json');
+const canonicalEvidence = {
+  t0_ms: 1_700_000_000_000,
+  chain_index: '501',
+  token_address: '0x1111111111111111111111111111111111111111',
+  symbol: 'AAA',
+  name: 'Asset A',
+  market_cap_usd: 1_234_567.5,
+  holders: 842,
+  top10_holder_percent: 31.5,
+  trigger_price: 0.0041732,
+  wallet_type: 'smart money',
+  trigger_wallet_count: 3,
+  trigger_wallet_address: '0x2222222222222222222222222222222222222222',
+  amount_usd: 25_000,
+} satisfies W.CanonicalSignalWire;
+const parsedTrialWire = fixture<W.TrialWire>('signal_trials_trial.json');
+const trialWire: W.TrialWire = { ...parsedTrialWire, evidence: canonicalEvidence };
 
 beforeEach(() => { vi.restoreAllMocks(); });
 afterEach(() => { vi.unstubAllGlobals(); });
@@ -236,8 +252,45 @@ describe('adaptTrial', () => {
     expect(t.t0Ms).toBe(trialWire.t0_ms);
     expect(t.commitDeadlineMs).toBe(trialWire.commit_deadline_ms);
     expect(t.evidenceHash).toBe(trialWire.evidence_hash);
-    expect(t.evidence).toEqual(trialWire.evidence);
+    expect(t.evidence.symbol).toBe(trialWire.evidence.symbol);
+    expect(t.evidence.chainIndex).toBe(trialWire.evidence.chain_index);
     expect('participants' in t).toBe(false);
+  });
+
+  it('maps every canonical decision-time evidence field into a typed product model', () => {
+    const e = adaptTrial(trialWire).evidence;
+    expect(e).toEqual({
+      t0Ms: canonicalEvidence.t0_ms,
+      chainIndex: canonicalEvidence.chain_index,
+      tokenAddress: canonicalEvidence.token_address,
+      symbol: canonicalEvidence.symbol,
+      name: canonicalEvidence.name,
+      marketCapUsd: canonicalEvidence.market_cap_usd,
+      holders: canonicalEvidence.holders,
+      top10HolderPercent: canonicalEvidence.top10_holder_percent,
+      triggerPrice: canonicalEvidence.trigger_price,
+      walletType: canonicalEvidence.wallet_type,
+      triggerWalletCount: canonicalEvidence.trigger_wallet_count,
+      triggerWalletAddress: canonicalEvidence.trigger_wallet_address,
+      amountUsd: canonicalEvidence.amount_usd,
+    });
+  });
+
+  it.each(Object.keys(canonicalEvidence))(
+    'fails closed and names a missing canonical evidence field: %s',
+    (field) => {
+      const evidence = { ...canonicalEvidence } as Record<string, unknown>;
+      delete evidence[field];
+      expect(() => adaptTrial({ ...trialWire, evidence } as unknown as W.TrialWire)).toThrow(field);
+    },
+  );
+
+  it('does not add source, transport, historical liquidity or sold ratio fields', () => {
+    const e = adaptTrial(trialWire).evidence as unknown as Record<string, unknown>;
+    expect(e).not.toHaveProperty('source');
+    expect(e).not.toHaveProperty('transport');
+    expect(e).not.toHaveProperty('liquidityUsd');
+    expect(e).not.toHaveProperty('soldRatioPercent');
   });
 
   it('preserves a settled outcome including a real 0 markout', () => {
@@ -266,7 +319,7 @@ describe('adaptTrial', () => {
       trial_mode: 'live',
       t0_ms: 1_700_000_000_000,
       commit_deadline_ms: 1_700_000_300_000,
-      evidence: { symbol: 'AAA' },
+      evidence: canonicalEvidence,
       evidence_hash: 'eh',
     } as unknown as W.TrialWire;
     expect(Object.keys(sixKeyShape)).toHaveLength(6);
@@ -283,7 +336,7 @@ describe('adaptTrial', () => {
     stubFetch(async () => new Response(
       JSON.stringify({
         trial_id: 'trial-0k9f2c', trial_mode: 'live', t0_ms: 1, commit_deadline_ms: 2,
-        evidence: {}, evidence_hash: 'eh',
+        evidence: canonicalEvidence, evidence_hash: 'eh',
       }),
       { status: 200 },
     ));
@@ -503,13 +556,28 @@ describe('resource fetchers treat the backend 404 codes as domain states', () =>
   it('getOpenTrial → the open trial on 200', async () => {
     const open: W.OpenTrialWire = {
       trial_id: 't1', trial_mode: 'live', t0_ms: 1, commit_deadline_ms: 2,
-      evidence: { a: 1 }, evidence_hash: 'eh',
+      evidence: canonicalEvidence, evidence_hash: 'eh',
     };
     stubFetch(async () => new Response(JSON.stringify(open), { status: 200 }));
     const t = await getOpenTrial();
     expect(t).toEqual({
       trialId: 't1', trialMode: 'live', t0Ms: 1, commitDeadlineMs: 2,
-      evidence: { a: 1 }, evidenceHash: 'eh',
+      evidence: {
+        t0Ms: canonicalEvidence.t0_ms,
+        chainIndex: canonicalEvidence.chain_index,
+        tokenAddress: canonicalEvidence.token_address,
+        symbol: canonicalEvidence.symbol,
+        name: canonicalEvidence.name,
+        marketCapUsd: canonicalEvidence.market_cap_usd,
+        holders: canonicalEvidence.holders,
+        top10HolderPercent: canonicalEvidence.top10_holder_percent,
+        triggerPrice: canonicalEvidence.trigger_price,
+        walletType: canonicalEvidence.wallet_type,
+        triggerWalletCount: canonicalEvidence.trigger_wallet_count,
+        triggerWalletAddress: canonicalEvidence.trigger_wallet_address,
+        amountUsd: canonicalEvidence.amount_usd,
+      },
+      evidenceHash: 'eh',
     });
   });
 

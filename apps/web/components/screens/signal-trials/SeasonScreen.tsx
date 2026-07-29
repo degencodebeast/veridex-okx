@@ -1,8 +1,21 @@
 'use client';
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { getOpenTrial, getSignalTrialsSeason, SIGNAL_TRIALS_MARKOUT_LABEL } from '@/lib/signal-trials-api';
-import type { SeasonViewState, SignalTrialsRow, SignalTrialsSeason } from '@/lib/contracts';
+import {
+  getOpenTrial,
+  getSignalTrialsSeason,
+  getTrial,
+  getTrialReceipts,
+  SIGNAL_TRIALS_MARKOUT_LABEL,
+} from '@/lib/signal-trials-api';
+import type {
+  CommitReceipt,
+  SeasonViewState,
+  SignalTrialsRow,
+  SignalTrialsSeason,
+  TrialCard,
+} from '@/lib/contracts';
+import { SharedEvidenceRail } from './SignalStatePanel';
 import styles from './SeasonScreen.module.css';
 
 // H5.2 — the PUBLIC season standings at /trials. No AuthGate: this is the judge-facing benchmark
@@ -54,6 +67,10 @@ export function SeasonScreen() {
   // resolution path is resolve-or-hide, and a FEATURED MATCH CARD → that 404s the judge is worse
   // than no featured card at all.
   const [featuredTrialId, setFeaturedTrialId] = useState<string | null>(null);
+  const [featuredRail, setFeaturedRail] = useState<{
+    trial: TrialCard;
+    receipts: CommitReceipt[];
+  } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -84,8 +101,25 @@ export function SeasonScreen() {
   useEffect(() => {
     let alive = true;
     getOpenTrial()
-      .then((t) => { if (alive) setFeaturedTrialId(t === null ? null : t.trialId); })
-      .catch(() => { if (alive) setFeaturedTrialId(null); });
+      .then(async (open) => {
+        if (!alive || open === null) {
+          if (alive) { setFeaturedTrialId(null); setFeaturedRail(null); }
+          return;
+        }
+        setFeaturedTrialId(open.trialId);
+        try {
+          const [trial, receipts] = await Promise.all([
+            getTrial(open.trialId),
+            getTrialReceipts(open.trialId),
+          ]);
+          if (alive) {
+            setFeaturedRail(trial !== null && receipts !== null ? { trial, receipts } : null);
+          }
+        } catch {
+          if (alive) setFeaturedRail(null);
+        }
+      })
+      .catch(() => { if (alive) { setFeaturedTrialId(null); setFeaturedRail(null); } });
     return () => { alive = false; };
   }, []);
 
@@ -117,7 +151,9 @@ export function SeasonScreen() {
             <span className={styles.sampleCounter} data-testid="season-sample-counter">
               {season === null || season.sampleSize === null
                 ? 'N —'
-                : `N = ${season.sampleSize} settled trials`}
+                : `N = ${season.sampleSize} settled trials${
+                  season.rows.length > 0 ? ` · ${season.rows[0].unscored} unscored` : ''
+                }`}
             </span>
           </div>
           <div className={styles.actionRow}>
@@ -143,16 +179,35 @@ export function SeasonScreen() {
         </div>
       </header>
 
+      {(state === 'qualified' || state === 'exploratory') && featuredRail !== null ? (
+        <SharedEvidenceRail
+          trial={featuredRail.trial}
+          agents={featuredRail.receipts}
+          compact
+          testId="season-shared-evidence-rail"
+        />
+      ) : null}
+
       <div className={styles.statePanel} data-state={state} data-testid="season-panel">
-        <SeasonBody state={state} season={season} onRetry={retry} />
+        <SeasonBody
+          state={state}
+          season={season}
+          onRetry={retry}
+          featuredTrialId={featuredTrialId}
+        />
       </div>
     </section>
   );
 }
 
 function SeasonBody({
-  state, season, onRetry,
-}: { state: ScreenState; season: SignalTrialsSeason | null; onRetry: () => void }) {
+  state, season, onRetry, featuredTrialId,
+}: {
+  state: ScreenState;
+  season: SignalTrialsSeason | null;
+  onRetry: () => void;
+  featuredTrialId: string | null;
+}) {
   switch (state) {
     case 'loading':
       return <LoadingState />;
@@ -165,7 +220,9 @@ function SeasonBody({
     case 'qualified':
     case 'exploratory':
       // `season` is non-null on both standings branches — it is what produced the state.
-      return season ? <Standings season={season} state={state} /> : <LoadingState />;
+      return season
+        ? <Standings season={season} state={state} featuredTrialId={featuredTrialId} />
+        : <LoadingState />;
   }
 }
 
@@ -262,7 +319,15 @@ function NotBuiltState() {
 // The standings table — `qualified` and `exploratory`.
 // ---------------------------------------------------------------------------
 
-function Standings({ season, state }: { season: SignalTrialsSeason; state: 'qualified' | 'exploratory' }) {
+function Standings({
+  season,
+  state,
+  featuredTrialId,
+}: {
+  season: SignalTrialsSeason;
+  state: 'qualified' | 'exploratory';
+  featuredTrialId: string | null;
+}) {
   // An exploratory season states that NO (chain × bar) combination cleared the 40-trial gate.
   // A `qualified: true` row served underneath that is a skill claim the season itself denies, so
   // the badge is suppressed at the SEASON level rather than trusted per row. Relaying the
@@ -336,46 +401,75 @@ function Standings({ season, state }: { season: SignalTrialsSeason; state: 'qual
                 the backend ranks and the client renders. ORD is `index + 1` — a display ordinal,
                 never a rank this screen computed. */}
             {season.rows.map((row, i) => (
-              <SeasonRow key={row.agentId} row={row} ord={i + 1} badgesAllowed={badgesAllowed} />
+              <SeasonRow
+                key={row.agentId}
+                row={row}
+                ord={i + 1}
+                badgesAllowed={badgesAllowed}
+                featuredTrialId={featuredTrialId}
+              />
             ))}
           </tbody>
         </table>
 
-        <div className={styles.tableFoot} data-testid="season-footnotes">
-          <p className={styles.footNote}>
-            Rows are rendered in the order returned by GET /signal-trials/season. The client never
-            re-sorts and never computes rank locally.
-          </p>
-          <p className={styles.footNote}>
-            Ranking is lowest average Brier over 1h-settled trials. Paper markout is a secondary
-            legibility metric computed after 25 bps of modeled costs — a modeled quantity over
-            recorded bars, never an executed trade.
-          </p>
-          <p className={styles.footNote}>
-            The four controls are part of the benchmark, not failed contestants: they are the bar a
-            contestant must clear. Un-scored trials never count toward coverage.
-          </p>
-          {/* The honesty boundary, stated where the numbers are. These standings are reproducible
-              from the recorded evidence — that is a claim about re-derivation, and deliberately
-              not a claim about what a malicious storage operator could do. */}
-          <p className={styles.footNote}>
-            Every row above is reproducible from the evidence recorded for this season. That is
-            reproducibility over stored records — nothing here asserts anything stronger about the
-            storage itself.
-          </p>
-        </div>
+      </div>
+      <div className={styles.seasonCards} data-testid="season-cards">
+        {season.rows.map((row, i) => (
+          <SeasonCard
+            key={row.agentId}
+            row={row}
+            ord={i + 1}
+            badgesAllowed={badgesAllowed}
+            featuredTrialId={featuredTrialId}
+          />
+        ))}
+      </div>
+      <div className={styles.tableFoot} data-testid="season-footnotes">
+        <p className={styles.footNote}>
+          Rows are rendered in the order returned by GET /signal-trials/season. The client never
+          re-sorts and never computes rank locally.
+        </p>
+        <p className={styles.footNote}>
+          Ranking is lowest average Brier over 1h-settled trials. Paper markout is a secondary
+          legibility metric computed after 25 bps of modeled costs — a modeled quantity over
+          recorded bars, never an executed trade.
+        </p>
+        <p className={styles.footNote}>
+          The four controls are part of the benchmark, not failed contestants: they are the bar a
+          contestant must clear. N = {season.sampleSize} settled trials · {season.rows[0]?.unscored ?? '—'} unscored
+          · unscored trials never count toward coverage.
+        </p>
+        <p className={styles.footNote}>
+          Every row above is reproducible from the evidence recorded for this season. That is
+          reproducibility over stored records — nothing here asserts anything stronger about the
+          storage itself.
+        </p>
       </div>
     </>
   );
 }
 
 function SeasonRow({
-  row, ord, badgesAllowed,
-}: { row: SignalTrialsRow; ord: number; badgesAllowed: boolean }) {
+  row, ord, badgesAllowed, featuredTrialId,
+}: {
+  row: SignalTrialsRow;
+  ord: number;
+  badgesAllowed: boolean;
+  featuredTrialId: string | null;
+}) {
   return (
     <tr className={styles.row} data-testid="season-row">
       <td className="mono" data-testid="season-ord">{ord}</td>
-      <td data-testid="season-agent">{row.agentId}</td>
+      <td>
+        <span data-testid="season-agent">
+          {featuredTrialId === null ? row.agentId : (
+            <Link data-testid="season-row-link" href={`/trials/${featuredTrialId}`}>{row.agentId}</Link>
+          )}
+        </span>
+        {agentSubcaption(row) === null ? null : (
+          <small className={styles.agentSub} data-testid="season-agent-sub">{agentSubcaption(row)}</small>
+        )}
+      </td>
       <td
         className={row.isControl ? styles.roleControl : styles.roleContestant}
         data-testid="season-role"
@@ -408,5 +502,61 @@ function SeasonRow({
         )}
       </td>
     </tr>
+  );
+}
+
+const CONTROL_SUBCAPTIONS: Record<string, string> = {
+  'always-follow': 'p = 1 on every trial',
+  'always-fade': 'p = 0 on every trial',
+  neutral: 'p = 0.5 on every trial',
+  climatology: 'prior-only · running base rate, min 10 prior trials',
+};
+
+function agentSubcaption(row: SignalTrialsRow): string | null {
+  if (Object.prototype.hasOwnProperty.call(CONTROL_SUBCAPTIONS, row.agentId)) {
+    return CONTROL_SUBCAPTIONS[row.agentId];
+  }
+  return row.isControl ? null : row.agentId.startsWith('agent-') ? 'contestant law v1 · frozen' : null;
+}
+
+function SeasonCard({
+  row,
+  ord,
+  badgesAllowed,
+  featuredTrialId,
+}: {
+  row: SignalTrialsRow;
+  ord: number;
+  badgesAllowed: boolean;
+  featuredTrialId: string | null;
+}) {
+  const content = (
+    <>
+      <div className={styles.cardHead}>
+        <span className="mono">#{ord}</span>
+        <strong>{row.agentId}</strong>
+        <span>{row.isControl ? 'baseline control' : 'contestant'}</span>
+      </div>
+      {agentSubcaption(row) === null ? null : <small className={styles.agentSub}>{agentSubcaption(row)}</small>}
+      <dl className={styles.cardMetrics}>
+        <div><dt>AVG BRIER ↓ / RANK KEY</dt><dd>{row.avgBrier === null ? '—' : row.avgBrier.toFixed(3)}</dd></div>
+        <div>
+          <dt>paper markout <span>(bps, after modeled costs)</span></dt>
+          <dd>{row.cappedAvgMarkoutBps === null ? '—' : `${row.cappedAvgMarkoutBps.toFixed(1)} bps`}</dd>
+        </div>
+        <div><dt>ACTIVE DECISIONS</dt><dd>{row.activeDecisions}</dd></div>
+        <div><dt>ACTIVE COVERAGE</dt><dd>{(row.activeCoverage * 100).toFixed(1)}%</dd></div>
+        <div><dt>UN-SCORED</dt><dd>{row.unscored}</dd></div>
+        <div><dt>QUALIFIED</dt><dd>{row.isControl ? 'n/a — control' : badgesAllowed && row.qualified ? 'qualified' : 'not qualified'}</dd></div>
+      </dl>
+    </>
+  );
+  return featuredTrialId === null ? (
+    <article className={styles.seasonCard}>{content}</article>
+  ) : (
+    <Link
+      className={`${styles.seasonCard} ${styles.seasonCardAction}`}
+      href={`/trials/${featuredTrialId}`}
+    >{content}</Link>
   );
 }

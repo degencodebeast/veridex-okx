@@ -35,6 +35,21 @@ const FIX = resolve(__dirname, '../../../../../contracts/fixtures');
 const seasonWire = JSON.parse(
   readFileSync(resolve(FIX, 'signal_trials_season.json'), 'utf8'),
 ) as W.SignalTrialsSeasonWire;
+const canonicalEvidence = {
+  t0_ms: 1_700_000_000_000,
+  chain_index: '501',
+  token_address: '0x1111111111111111111111111111111111111111',
+  symbol: 'AAA',
+  name: 'Asset A',
+  market_cap_usd: 1_234_567.5,
+  holders: 842,
+  top10_holder_percent: 31.5,
+  trigger_price: 0.0041732,
+  wallet_type: 'smart money',
+  trigger_wallet_count: 3,
+  trigger_wallet_address: '0x2222222222222222222222222222222222222222',
+  amount_usd: 25_000,
+};
 
 beforeEach(() => { vi.restoreAllMocks(); });
 afterEach(() => { vi.unstubAllGlobals(); });
@@ -596,9 +611,13 @@ describe('H-shell the /trials header carries the ProofArena identity copy', () =
 
 describe('H-shell the /trials header actions', () => {
   // The open-trial route serves OpenTrialResponse — the trial fixture without its `outcome` key.
-  const { outcome: _outcome, ...openTrialWire } = JSON.parse(
+  const { outcome: _outcome, ...parsedOpenTrialWire } = JSON.parse(
     readFileSync(resolve(FIX, 'signal_trials_trial.json'), 'utf8'),
   ) as W.TrialWire;
+  const openTrialWire: W.OpenTrialWire = {
+    ...parsedOpenTrialWire,
+    evidence: canonicalEvidence,
+  };
 
   it('renders READ SKILL.md ↗ as a real link to the served document', async () => {
     stubSeason200();
@@ -709,5 +728,106 @@ describe('H-shell the N counter beside the state badge', () => {
     stubNeverResolvingFetch();
     render(<SeasonScreen />);
     expect((await screen.findByTestId('season-sample-counter')).textContent).toBe('N —');
+  });
+});
+
+describe('SPEC-R1 complete season surfaces', () => {
+  const openTrial: W.OpenTrialWire = {
+    trial_id: 'trial-featured-real',
+    trial_mode: 'live',
+    t0_ms: canonicalEvidence.t0_ms,
+    commit_deadline_ms: canonicalEvidence.t0_ms + 300_000,
+    evidence: canonicalEvidence,
+    evidence_hash: 'evidence-featured-real',
+  };
+  const receipts: W.CommitReceiptWire[] = [
+    {
+      receipt_id: 'r-a', trial_id: openTrial.trial_id, payer: '0xaaa',
+      p_follow_profitable: 0.2, methodology_version: null, action: 'FADE', status: 'settled',
+      brier: 0.04, chosen_markout_bps: 12, committed_at_ms: canonicalEvidence.t0_ms + 1,
+      commit_deadline_ms: openTrial.commit_deadline_ms, trial_mode: 'live',
+      body_hash: 'body-a', payment_tx_hash: 'tx-a',
+    },
+    {
+      receipt_id: 'r-b', trial_id: openTrial.trial_id, payer: '0xbbb',
+      p_follow_profitable: 0.91, methodology_version: null, action: 'ABSTAIN', status: 'pending',
+      brier: null, chosen_markout_bps: null, committed_at_ms: canonicalEvidence.t0_ms + 2,
+      commit_deadline_ms: openTrial.commit_deadline_ms, trial_mode: 'live',
+      body_hash: 'body-b', payment_tx_hash: 'tx-b',
+    },
+  ];
+  const featuredTrialWire: W.TrialWire = {
+    ...(JSON.parse(
+      readFileSync(resolve(FIX, 'signal_trials_trial.json'), 'utf8'),
+    ) as W.TrialWire),
+    trial_id: openTrial.trial_id,
+    evidence: canonicalEvidence,
+  };
+
+  function stubFeatured(receiptsResponse: () => Response = () => jsonResponse(receipts)) {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/signal-trials/open-trial')) return jsonResponse(openTrial);
+      if (url.includes(`/signal-trials/trials/${openTrial.trial_id}/receipts`)) return receiptsResponse();
+      if (url.includes(`/signal-trials/trials/${openTrial.trial_id}`)) return jsonResponse(featuredTrialWire);
+      if (url.includes('/signal-trials/season')) return jsonResponse(seasonWire);
+      throw new Error(`unexpected featured fetch: ${url}`);
+    }) as unknown as typeof fetch);
+  }
+
+  it('renders the compact rail only after the open trial and participants resolve', async () => {
+    stubFeatured();
+    await panel();
+    const rail = await screen.findByTestId('season-shared-evidence-rail');
+    expect(within(rail).getAllByTestId('rail-node')).toHaveLength(4);
+    expect(within(rail).getAllByTestId('rail-hash-chip')).toHaveLength(1);
+    expect(within(rail).getAllByTestId('rail-agent')).toHaveLength(2);
+    expect(within(rail).getAllByTestId('rail-outcome')).toHaveLength(1);
+    expect(screen.getByTestId('season-featured-trial')).toHaveAttribute(
+      'href', `/trials/${openTrial.trial_id}`,
+    );
+  });
+
+  it('keeps valid standings when the compact-rail participant read fails', async () => {
+    stubFeatured(() => errorResponse(500, 'participant_read_failed'));
+    await panel();
+    await waitFor(() => expect(screen.queryByTestId('season-shared-evidence-rail')).not.toBeInTheDocument());
+    expect(screen.getByTestId('season-panel')).toHaveAttribute('data-state', 'qualified');
+    expect(screen.getAllByTestId('season-row')).toHaveLength(seasonWire.rows.length);
+  });
+
+  it('discloses the served settled sample and row-derived unscored count together', async () => {
+    stubSeason200();
+    await panel();
+    expect(screen.getByTestId('season-sample-counter')).toHaveTextContent(
+      `N = ${seasonWire.sample_size} settled trials · ${seasonWire.rows[0].unscored} unscored`,
+    );
+  });
+
+  it('uses the frozen roster subcaption map and omits captions for unknown ids', async () => {
+    stubSeason200({
+      rows: [
+        { ...seasonWire.rows[0], agent_id: 'always-follow' },
+        { ...seasonWire.rows[1], agent_id: 'unknown-external' },
+      ],
+    });
+    await panel();
+    const rows = screen.getAllByTestId('season-row');
+    expect(within(rows[0]).getByTestId('season-agent-sub')).toHaveTextContent('p = 1 on every trial');
+    expect(within(rows[1]).queryByTestId('season-agent-sub')).not.toBeInTheDocument();
+  });
+
+  it('adds row navigation only when the featured trial is a real resolved target', async () => {
+    stubFeatured();
+    await panel();
+    const links = await screen.findAllByTestId('season-row-link');
+    expect(links).toHaveLength(seasonWire.rows.length);
+    for (const link of links) expect(link).toHaveAttribute('href', `/trials/${openTrial.trial_id}`);
+
+    cleanup();
+    vi.unstubAllGlobals();
+    stubSeason200();
+    await panel();
+    expect(screen.queryByTestId('season-row-link')).not.toBeInTheDocument();
   });
 });

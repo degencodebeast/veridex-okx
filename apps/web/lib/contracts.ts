@@ -531,12 +531,28 @@ export interface SignalTrialsHealth {
   seasonState: SeasonViewState;
 }
 
+export interface CanonicalSignalEvidence {
+  t0Ms: number;
+  chainIndex: string;
+  tokenAddress: string;
+  symbol: string;
+  name: string;
+  marketCapUsd: number;
+  holders: number;
+  top10HolderPercent: number;
+  triggerPrice: number;
+  walletType: string;
+  triggerWalletCount: number;
+  triggerWalletAddress: string;
+  amountUsd: number;
+}
+
 export interface OpenTrial {
   trialId: string;
   trialMode: 'live';
   t0Ms: number;
   commitDeadlineMs: number;
-  evidence: Record<string, unknown>;
+  evidence: CanonicalSignalEvidence;
   evidenceHash: string;
 }
 
@@ -560,7 +576,7 @@ export interface TrialCard {
   trialMode: 'live';
   t0Ms: number;
   commitDeadlineMs: number;
-  evidence: Record<string, unknown>;
+  evidence: CanonicalSignalEvidence;
   evidenceHash: string;
   // `null` means nothing was computed at all — weaker than a recorded `pending`.
   outcome: TrialOutcome | null;
