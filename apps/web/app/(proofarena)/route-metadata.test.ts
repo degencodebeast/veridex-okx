@@ -13,6 +13,13 @@
 //
 // The strings below are transcribed from :107-116. They are the authority; this file is a copy of it,
 // so if the two ever disagree the handoff wins and these constants are what changes.
+//
+// WHAT THIS FILE CANNOT PROVE, so that no one reads more into a green run here than it carries.
+// Every `[trialId]` case below calls `generateMetadata` with a segment THIS FILE CONSTRUCTS, so it
+// tests the TEMPLATE — that the composed title carries whatever value the function is handed. It
+// says nothing about what value Next hands it, and it stayed green through a defect where the
+// served title read `release%2B1`. The wire is pinned in `route-metadata.transport.test.ts`, which
+// builds the app, serves it, and reads the `<title>` off a real response.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -160,6 +167,32 @@ describe('/trials/[trialId] serves trial-specific metadata exactly as §4:113-11
     for (const id of ['trial.release-1', 'release+1', 'épreuve-1', `trial-${'z'.repeat(59)}`]) {
       expect(String((await trialMetadata(id)).title)).toBe(trialTitle(id));
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // THE MALFORMED-PERCENT FALLBACK — the one branch the transport test cannot reach.
+  //
+  // The layout decodes the segment, because it arrives percent-ENCODED (measured; see the layout's
+  // own comment and `route-metadata.transport.test.ts`). `decodeURIComponent` throws URIError on a
+  // malformed sequence, and unguarded that throw is a 500 on a PUBLIC route.
+  //
+  // MEASURED: on Next 15.5 these URLs never get that far — `/trials/%`, `/trials/%zz` and
+  // `/trials/%C3` are all answered 400 by the server's request handling before `generateMetadata`
+  // runs, which is why the transport test can only assert "not a 500" for them. That makes THIS
+  // the only place the fallback's behaviour can be stated, and it is worth stating: the guard
+  // exists so that a 500 does not become reachable the day the layer above stops rejecting these.
+  // -------------------------------------------------------------------------
+  it('falls back to the RAW segment when it is not decodable, rather than throwing', async () => {
+    for (const segment of ['%', '%zz', '%C3', 'trial-%E0%A4%A']) {
+      expect(String((await trialMetadata(segment)).title)).toBe(trialTitle(segment));
+    }
+  });
+
+  it('decodes a percent-encoded segment exactly once', async () => {
+    // ONCE, not until stable. `%2520` is the encoding of the literal text `%20`, so an id that
+    // really is `%20` must arrive as `%2520` and come back as `%20` — a second pass would turn it
+    // into a space and name a different trial.
+    expect(String((await trialMetadata('trial%2520x')).title)).toBe(trialTitle('trial%20x'));
   });
 
   // -------------------------------------------------------------------------

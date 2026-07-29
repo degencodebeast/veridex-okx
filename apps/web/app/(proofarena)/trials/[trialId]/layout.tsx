@@ -32,11 +32,41 @@ const DESCRIPTION =
   'One sealed evidence hash, one commit deadline, one settlement law. Paper markout after modeled '
   + 'costs. Not a trade recommendation.';
 
+// THE SEGMENT ARRIVES PERCENT-ENCODED, so it is decoded here — exactly once, and guarded.
+//
+// MEASURED on this tree, built and served (`next build` then `next start`, titles read off the
+// wire), NOT inherited from a comment: `/trials/release+1` served `release%2B1 — …` and
+// `/trials/%C3%A9preuve-1` served `%C3%A9preuve-1 — …`. Both are ids the publisher can mint (see
+// the note below), so the un-decoded title named a trial that does not exist. An earlier revision
+// of this file asserted the opposite — that the segment arrives decoded — and cited `release+1` as
+// its example; the served bytes disprove it, and `route-metadata.transport.test.ts` now pins the
+// served bytes rather than a return value so the claim cannot silently go stale again.
+//
+// WHY THE GUARD IS LOAD-BEARING AND MUST NOT BE "SIMPLIFIED" AWAY. `decodeURIComponent` throws
+// URIError on a malformed percent sequence (`%`, `%zz`, a truncated `%C3`). Unguarded, that throw
+// becomes a 500 on a PUBLIC route — strictly worse than the defect being fixed. On Next 15.5 those
+// URLs are rejected with 400 by the server's own request handling before this function runs, so
+// today the fallback is reachable only from a caller that is not the wire; it stays because the
+// only thing standing between a malformed segment and a 500 must not be a version-specific
+// behaviour of the layer above. Falling back to the RAW segment keeps the title naming the route's
+// subject instead of blanking it.
+//
+// The return value is a STRING handed to Next's metadata API. Next escapes it into the document
+// head — `<script>` comes back as `&lt;script&gt;` — so decoding widens what the title can SAY,
+// never what it can DO. Nothing here builds markup.
+const decodeSegment = (segment: string): string => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    // `decodeURIComponent` throws URIError and nothing else, so this catch is that one case.
+    return segment;
+  }
+};
+
 export async function generateMetadata(
   { params }: { params: Promise<{ trialId: string }> },
 ): Promise<Metadata> {
-  // `params` is a promise in Next 15 and the segment arrives percent-DECODED, so `trialId` here is
-  // the exact text the URL names — which is exactly what the title has to carry.
+  // `params` is a promise in Next 15. `trialId` is the RAW, still-encoded segment.
   const { trialId } = await params;
 
   // THE ID IS NOT VALIDATED HERE, and that is the decision rather than an omission.
@@ -55,7 +85,7 @@ export async function generateMetadata(
   // failure (`TrialMatchCard` keeps those apart deliberately), and the router's non-echo rule
   // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
   // Nothing here does I/O: resolving the id would put a server→API dependency on a public route.
-  return { title: `${trialId} — ${TITLE_TAIL}`, description: DESCRIPTION };
+  return { title: `${decodeSegment(trialId)} — ${TITLE_TAIL}`, description: DESCRIPTION };
 }
 
 export default function TrialMetadataLayout({ children }: { children: ReactNode }) {
