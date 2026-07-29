@@ -66,9 +66,13 @@ def redact(text: str, credentials: OKXCredentials | None) -> str:
     redacted = text
     if credentials is None:
         return redacted
-    for value in (credentials.api_key, credentials.secret_key, credentials.passphrase):
-        if value.strip():
-            redacted = redacted.replace(value, _REDACTED)
+    distinct_nonblank = dict.fromkeys(
+        value
+        for value in (credentials.api_key, credentials.secret_key, credentials.passphrase)
+        if value.strip()
+    )
+    for value in sorted(distinct_nonblank, key=len, reverse=True):
+        redacted = redacted.replace(value, _REDACTED)
     return redacted
 
 

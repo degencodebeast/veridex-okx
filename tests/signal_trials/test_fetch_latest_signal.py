@@ -85,25 +85,73 @@ def test_missing_credentials_stop_before_client_construction(
     captured = capsys.readouterr()
     assert constructed is False
     assert captured.out == ""
-    assert "OKX_API_KEY" in captured.err
-    assert "OKX_SECRET_KEY" in captured.err
-    assert "OKX_PASSPHRASE" in captured.err
+    assert captured.err == (
+        "refused: missing or blank OKX credentials in the environment: "
+        "OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE\n"
+    )
 
 
-def test_exception_diagnostics_redact_every_credential_value(
+@pytest.mark.parametrize(
+    ("sentinels", "residual_fragments"),
+    [
+        pytest.param(
+            {
+                "OKX_API_KEY": "API-PREFIX",
+                "OKX_SECRET_KEY": "API-PREFIX-SECRET-DISTINCTIVE-SUFFIX",
+                "OKX_PASSPHRASE": "PASSPHRASE-NONOVERLAP",
+            },
+            ("-SECRET-DISTINCTIVE-SUFFIX",),
+            id="api-key-prefix-of-secret",
+        ),
+        pytest.param(
+            {
+                "OKX_API_KEY": "API-NONOVERLAP",
+                "OKX_SECRET_KEY": "SECRET-PREFIX",
+                "OKX_PASSPHRASE": "SECRET-PREFIX-PASSPHRASE-DISTINCTIVE-SUFFIX",
+            },
+            ("-PASSPHRASE-DISTINCTIVE-SUFFIX",),
+            id="secret-prefix-of-passphrase",
+        ),
+        pytest.param(
+            {
+                "OKX_API_KEY": "EQUAL-DUPLICATE-VALUE",
+                "OKX_SECRET_KEY": "EQUAL-DUPLICATE-VALUE",
+                "OKX_PASSPHRASE": "PASSPHRASE-UNIQUE",
+            },
+            (),
+            id="equal-duplicate-values",
+        ),
+        pytest.param(
+            {
+                "OKX_API_KEY": "API-UNIQUE",
+                "OKX_SECRET_KEY": "SECRET-UNIQUE",
+                "OKX_PASSPHRASE": "PASSPHRASE-UNIQUE",
+            },
+            (),
+            id="non-overlap-control",
+        ),
+    ],
+)
+def test_exception_diagnostics_redact_distinct_credentials_longest_first_through_main(
     capsys: pytest.CaptureFixture[str],
+    sentinels: dict[str, str],
+    residual_fragments: tuple[str, ...],
 ) -> None:
     producer = _load_producer()
     assert hasattr(producer, "main"), "producer must expose its fail-closed entry point"
-    sentinels = {
-        "OKX_API_KEY": "NOT-A-REAL-API-KEY",
-        "OKX_SECRET_KEY": "NOT-A-REAL-SECRET",
-        "OKX_PASSPHRASE": "NOT-A-REAL-PASSPHRASE",
-    }
 
     class ExplodingClient:
         async def list_signals(self, _filters):
-            raise RuntimeError(" / ".join(sentinels.values()))
+            raise RuntimeError(
+                "upstream echoed "
+                + " / ".join(
+                    (
+                        sentinels["OKX_API_KEY"],
+                        sentinels["OKX_SECRET_KEY"],
+                        sentinels["OKX_PASSPHRASE"],
+                    )
+                )
+            )
 
     @contextlib.asynccontextmanager
     async def client_factory(_credentials):
@@ -112,9 +160,19 @@ def test_exception_diagnostics_redact_every_credential_value(
     assert producer.main(env=sentinels, client_factory=client_factory) != 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "redacted" in captured.err.lower()
-    for sentinel in sentinels.values():
+    assert "<redacted>" in captured.err
+    for sentinel in set(sentinels.values()):
         assert sentinel not in captured.err
+    for fragment in residual_fragments:
+        assert fragment not in captured.err
+
+
+def test_redaction_ignores_blank_values_without_rewriting_diagnostics() -> None:
+    producer = _load_producer()
+    diagnostic = "missing credential value stayed readable"
+    credentials = producer.OKXCredentials("", "   ", "\t")
+
+    assert producer.redact(diagnostic, credentials) == diagnostic
 
 
 def test_producer_reuses_run_preflight_credential_loader_without_a_local_duplicate(

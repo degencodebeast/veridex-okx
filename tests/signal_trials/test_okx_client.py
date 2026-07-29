@@ -156,6 +156,21 @@ class _IntSubclass(int):
     pass
 
 
+class _SecretKeyTripwire(str):
+    """Non-secret credential value that records real signer access to its key bytes."""
+
+    encode_calls: int
+
+    def __new__(cls, value: str) -> "_SecretKeyTripwire":
+        instance = super().__new__(cls, value)
+        instance.encode_calls = 0
+        return instance
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        self.encode_calls += 1
+        return super().encode(encoding, errors)
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
@@ -204,9 +219,8 @@ class _IntSubclass(int):
 async def test_signal_list_refuses_invalid_runtime_input_before_transport(
     field: str,
     invalid_value: object,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every invalid runtime input stops before direct signing and the real HTTP seam."""
+    """Every invalid runtime input stops before key-material use and the real HTTP seam."""
     import httpx
 
     values: dict[str, object] = {
@@ -224,19 +238,7 @@ async def test_signal_list_refuses_invalid_runtime_input_before_transport(
         values[field] = invalid_value
     filters = SignalFilters(**values)  # type: ignore[arg-type]
 
-    hmac_calls: list[tuple[str, str, str]] = []
-    original_headers = OKXMarketClient._headers
-
-    def observe_headers(
-        client: OKXMarketClient,
-        method: str,
-        request_path: str,
-        body: str,
-    ) -> dict[str, str]:
-        hmac_calls.append((method, request_path, body))
-        return original_headers(client, method, request_path, body)
-
-    monkeypatch.setattr(OKXMarketClient, "_headers", observe_headers)
+    secret_key = _SecretKeyTripwire("SIGNER-KEY-MATERIAL-SENTINEL")
 
     captured: list[httpx.Request] = []
 
@@ -259,15 +261,16 @@ async def test_signal_list_refuses_invalid_runtime_input_before_transport(
         with pytest.raises(ValueError) as raised:
             await OKXMarketClient(
                 seam.HttpxTransport(http),
-                OKXCredentials("k", "s", "p"),
+                OKXCredentials("k", secret_key, "p"),
             ).list_signals(
                 filters,
                 cursor=cursor,  # type: ignore[arg-type]
             )
 
-    assert hmac_calls == []
+    assert secret_key.encode_calls == 0
     assert captured == []
     assert "SECRET-SENTINEL" not in str(raised.value)
+    assert secret_key not in str(raised.value)
 
 
 async def test_signal_list_accepts_zero_thresholds_all_wallet_codes_and_non_ascii_cursor() -> None:
