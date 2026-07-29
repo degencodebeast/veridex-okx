@@ -32,57 +32,30 @@ const DESCRIPTION =
   'One sealed evidence hash, one commit deadline, one settlement law. Paper markout after modeled '
   + 'costs. Not a trade recommendation.';
 
-// The shape a trial id has. `veridex/signal_trials/live.py:183` derives ids as `trial_{hex}` from the
-// evidence hash and the open instant; the fixtures in this tree use `trial-0k9f2c` and `trial_h43`.
-// This gate is strictly WIDER than every id the store mints and strictly NARROWER than what a URL
-// path segment can carry, which is exactly where the line belongs — see the non-echo note below.
-const TRIAL_ID_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-
-/**
- * The title for `trialId`, naming it only when the segment is shaped like a trial id.
- *
- * THE JUDGEMENT CALL, stated because it is one. `generateMetadata` runs before anything is known
- * about whether the id RESOLVES — the page discovers that from its own fetch, and renders
- * "Trial not found" when it does not. So the title is composed from caller-controlled text, and
- * there are two hazards to hold apart:
- *
- * 1. FABRICATING A TRIAL IDENTITY. The route contract for this API records the trial id as
- *    non-echoing (`veridex/api/signal_trials_router.py:322-323`, `PKT-TASK-H4-4.md:60-61`: the id
- *    "arrives from a URL path segment, so echoing it would reflect caller-controlled text back into
- *    logs and responses"), and the card's `not_found` branch honours that by rendering no id at all.
- *    A `<title>` is the most shareable reflection surface the page has — it is what a link preview
- *    shows — and §4:119 forbids metadata that claims a result. `/trials/ALPHA-BEAT-BASELINE-BY-40BPS`
- *    must not become a link preview asserting that.
- * 2. BLANKING A WORKING PAGE'S TITLE. Every real trial must get the handoff's exact title.
- *
- * A SHAPE GATE separates them without a network call: a segment shaped like an id passes through
- * verbatim, anything else gets a title that names no trial. What this deliberately does NOT do is
- * resolve the trial, and that is the substantive part of the decision rather than an omission —
- * fetching here would put a server→API dependency on a public route and, worse, would introduce a
- * third state the title cannot express. `TrialMatchCard` spends real effort keeping `not_found`
- * (a domain answer) distinct from `unavailable` (a transport failure); a title that fell back to the
- * un-named form when the fetch failed would silently report "no such trial" during an outage, which
- * is precisely the conflation the card refuses to make.
- *
- * The residue, stated plainly: a WELL-FORMED id that does not resolve still appears in the title.
- * That is intended. The title names the route's subject — which trial this page is about — and the
- * page BODY is what states whether it exists, where the non-echo rule is enforced against a real
- * 404. Nothing in the title claims a result, a settlement or a score for it.
- */
-function titleFor(trialId: string): string {
-  // The un-named form is the specified title with the `{trial_id} — ` prefix dropped, so the two
-  // differ ONLY in whether an id is named. It is not a separate string to keep in step.
-  return TRIAL_ID_SHAPE.test(trialId) ? `${trialId} — ${TITLE_TAIL}` : TITLE_TAIL;
-}
-
 export async function generateMetadata(
   { params }: { params: Promise<{ trialId: string }> },
 ): Promise<Metadata> {
-  // `params` is a promise in Next 15 and the segment arrives percent-DECODED, which is what the
-  // shape gate needs to see: `%3Cscript%3E` reaches this function as `<script>` and is refused as
-  // the text it actually is, not as the encoding it travelled in.
+  // `params` is a promise in Next 15 and the segment arrives percent-DECODED, so `trialId` here is
+  // the exact text the URL names — which is exactly what the title has to carry.
   const { trialId } = await params;
-  return { title: titleFor(trialId), description: DESCRIPTION };
+
+  // THE ID IS NOT VALIDATED HERE, and that is the decision rather than an omission.
+  //
+  // There is no id grammar for this layer to check against. `open_live_trial`
+  // (`veridex/signal_trials/live.py:150`) takes an operator-supplied `trial_id` and validates
+  // NOTHING, and the repository's one check (`live.py:323`) refuses only an empty id, a path
+  // separator, `.` and `..`. So `trial.release-1`, `release+1`, `épreuve-1` and ids past 64
+  // characters are all REAL, PUBLISHABLE trials. Any shape gate written here would be a second,
+  // narrower contract than the publisher's, and its only observable effect would be to drop the id
+  // from the title of a legitimately published trial — which is the defect this file used to have.
+  //
+  // METADATA IS PRESENTATION, NOT A SECOND VALIDATOR. The title names the route's SUBJECT — which
+  // trial this page is about — and claims nothing about it: no result, no settlement, no score.
+  // The page BODY owns the distinction between a real trial, `trial_not_found`, and a transport
+  // failure (`TrialMatchCard` keeps those apart deliberately), and the router's non-echo rule
+  // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
+  // Nothing here does I/O: resolving the id would put a server→API dependency on a public route.
+  return { title: `${trialId} — ${TITLE_TAIL}`, description: DESCRIPTION };
 }
 
 export default function TrialMetadataLayout({ children }: { children: ReactNode }) {

@@ -150,35 +150,43 @@ describe('/trials/[trialId] serves trial-specific metadata exactly as §4:113-11
     }
   });
 
-  // -------------------------------------------------------------------------
-  // THE NON-ECHO BOUNDARY for a segment that is not an id at all.
-  //
-  // `generateMetadata` runs before anything is known about whether the id resolves, so the title is
-  // composed from caller-controlled text. The route contract for this API records the trial id as
-  // NON-ECHOING (`PKT-TASK-H4-4.md:60-61`, `veridex/api/signal_trials_router.py:322-323`: "it
-  // arrives from a URL path segment, so echoing it would reflect caller-controlled text back into
-  // logs and responses"), and §4:119 forbids metadata that claims results. A `<title>` is the most
-  // shareable reflection surface the page has — it is what a link preview shows — so a segment that
-  // is not shaped like an id must not reach it.
-  // -------------------------------------------------------------------------
-  it('refuses to reflect a segment that is not shaped like a trial id', async () => {
-    const claims = [
-      'ALPHA BEAT THE BASELINE BY 40 BPS',
-      '<script>alert(1)</script>',
-      '../../season-001',
-      'trial-0k9f2c?verdict=settled',
-      '',
-    ];
-    for (const segment of claims) {
-      const title = String((await trialMetadata(segment)).title);
-      expect(title, `"${segment}" was reflected into the document title`).toBe(
-        'Fair-Play trial · ProofArena',
-      );
-      if (segment !== '') expect(title).not.toContain(segment);
+  it('names every id the PUBLISHER can mint, not a narrower frontend guess at the shape', async () => {
+    // MEASURED against the publisher, not assumed. `open_live_trial`
+    // (`veridex/signal_trials/live.py:150`) takes an operator-supplied `trial_id` and validates
+    // NOTHING, and the repository's one check (`live.py:323`) refuses only an empty id, a path
+    // separator, `.` and `..`. So each id below is one a real operator can publish TODAY: a dot, a
+    // plus, an accented letter, and 65 characters. Each must reach the title verbatim — dropping
+    // one leaves a legitimately published trial serving a title that names no trial.
+    for (const id of ['trial.release-1', 'release+1', 'épreuve-1', `trial-${'z'.repeat(59)}`]) {
+      expect(String((await trialMetadata(id)).title)).toBe(trialTitle(id));
     }
   });
 
-  it('still states the settlement law for an unrecognised segment', async () => {
+  // -------------------------------------------------------------------------
+  // THERE IS NO FRONTEND ID GRAMMAR, and this block exists so that its absence is a STATED
+  // contract rather than something a later edit can reinstate by accident.
+  //
+  // An earlier version of this layer gated the title behind `/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/`
+  // and served a title naming no trial when a segment missed it. That gate was narrower than the
+  // publisher (see the test above), so its only measurable effect was to drop the id from the
+  // title of a real trial.
+  //
+  // The division of responsibility that replaces it: the TITLE names the route's SUBJECT and
+  // asserts nothing about it — no result, no settlement, no score, which is all §4:119 asks of
+  // metadata. The page BODY states whether the trial exists, and the router's non-echo rule
+  // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
+  // -------------------------------------------------------------------------
+  it('names whatever subject the route names, with no shape judgement of its own', async () => {
+    for (const segment of [
+      'ALPHA BEAT THE BASELINE BY 40 BPS',
+      '<script>alert(1)</script>',
+      'trial-0k9f2c?verdict=settled',
+    ]) {
+      expect(String((await trialMetadata(segment)).title)).toBe(trialTitle(segment));
+    }
+  });
+
+  it('still states the settlement law whatever the segment is', async () => {
     // The description is fixed [COPY] about the law, not a claim about any particular trial, so it
     // is true of the route whatever the segment is. Blanking it would withhold the disclaimer
     // ("Not a trade recommendation") on exactly the requests most likely to be adversarial.
