@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
+import { decodeTrialRouteSegment } from './route-segment';
 
 // The metadata layout for `/trials/[trialId]`, and NOTHING else.
 //
@@ -53,15 +54,8 @@ const DESCRIPTION =
 //
 // The return value is a STRING handed to Next's metadata API. Next escapes it into the document
 // head — `<script>` comes back as `&lt;script&gt;` — so decoding widens what the title can SAY,
-// never what it can DO. Nothing here builds markup.
-const decodeSegment = (segment: string): string => {
-  try {
-    return decodeURIComponent(segment);
-  } catch {
-    // `decodeURIComponent` throws URIError and nothing else, so this catch is that one case.
-    return segment;
-  }
-};
+// never what it can DO. Nothing here builds markup. The same guarded helper is used by the
+// hydrated page so the title and API requests cannot disagree about the route subject.
 
 export async function generateMetadata(
   { params }: { params: Promise<{ trialId: string }> },
@@ -85,7 +79,10 @@ export async function generateMetadata(
   // failure (`TrialMatchCard` keeps those apart deliberately), and the router's non-echo rule
   // (`veridex/api/signal_trials_router.py:322-323`) governs REFUSAL BODIES, not this template.
   // Nothing here does I/O: resolving the id would put a server→API dependency on a public route.
-  return { title: `${decodeSegment(trialId)} — ${TITLE_TAIL}`, description: DESCRIPTION };
+  return {
+    title: `${decodeTrialRouteSegment(trialId)} — ${TITLE_TAIL}`,
+    description: DESCRIPTION,
+  };
 }
 
 export default function TrialMetadataLayout({ children }: { children: ReactNode }) {

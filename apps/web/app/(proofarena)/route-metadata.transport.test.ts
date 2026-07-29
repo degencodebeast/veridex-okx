@@ -21,8 +21,10 @@
 // The segment arrives PERCENT-ENCODED. The two WRONG rows are what this file was written to fail on.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { resolve } from 'node:path';
+import { chromium, type Browser } from '@playwright/test';
 
 const WEB = resolve(__dirname, '../..');
 const NEXT = resolve(WEB, 'node_modules/.bin/next');
@@ -45,6 +47,7 @@ const freePort = () =>
   });
 
 let server: ChildProcess | undefined;
+let browser: Browser | undefined;
 let origin = '';
 
 /**
@@ -85,9 +88,50 @@ beforeAll(async () => {
   }
 }, 600_000);
 
-afterAll(() => {
+afterAll(async () => {
+  await browser?.close();
   server?.kill('SIGTERM');
 });
+
+/**
+ * Load the real production document, let React hydrate, and record the two public API paths the
+ * client card actually requests. Only those API calls are intercepted; the document and bundles
+ * still cross `next start` over HTTP.
+ */
+const hydratedTrialRequests = async (documentPath: string): Promise<string[]> => {
+  if (!browser) {
+    const bundled = chromium.executablePath();
+    const systemChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: existsSync(bundled) ? bundled : systemChrome,
+    });
+  }
+
+  const page = await browser.newPage();
+  const observed: string[] = [];
+  await page.route('**/signal-trials/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    observed.push(path);
+    if (path.endsWith('/receipts')) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
+    } else {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: '{"error":"trial_not_found"}',
+      });
+    }
+  });
+
+  await page.goto(`${origin}${documentPath}`, { waitUntil: 'domcontentloaded' });
+  const deadline = Date.now() + 10_000;
+  while (observed.length < 2 && Date.now() < deadline) {
+    await page.waitForTimeout(50);
+  }
+  await page.close();
+  return observed.sort();
+};
 
 describe('/trials/[trialId] names the id the URL names, through the built transport', () => {
   // THE CONTROL. An id with no percent-encoding in it, which was already correct before the fix.
@@ -146,5 +190,37 @@ describe('/trials/[trialId] names the id the URL names, through the built transp
     // present as text and absent as markup.
     expect(titleOf(html)).toBe(trialTitle('&lt;script&gt;alert(1)&lt;/script&gt;'));
     expect(html).not.toContain('<title><script>');
+  });
+});
+
+describe('/trials/[trialId] requests the same decoded id after hydration', () => {
+  const expectedPair = (encodedId: string) => [
+    `/signal-trials/trials/${encodedId}`,
+    `/signal-trials/trials/${encodedId}/receipts`,
+  ].sort();
+
+  it('keeps the ordinary ASCII control on one encoding boundary', async () => {
+    expect(await hydratedTrialRequests('/trials/trial-0k9f2c'))
+      .toEqual(expectedPair('trial-0k9f2c'));
+  });
+
+  it('decodes `+` once before both client request paths encode it once', async () => {
+    expect(await hydratedTrialRequests('/trials/release+1'))
+      .toEqual(expectedPair('release%2B1'));
+  });
+
+  it('decodes UTF-8 once before both client request paths encode it once', async () => {
+    expect(await hydratedTrialRequests('/trials/%C3%A9preuve-1'))
+      .toEqual(expectedPair('%C3%A9preuve-1'));
+  });
+
+  it('decodes an encoded control once before both client request paths encode it once', async () => {
+    expect(await hydratedTrialRequests('/trials/control%09tab'))
+      .toEqual(expectedPair('control%09tab'));
+  });
+
+  it('decodes markup as text while preserving one encoded request boundary', async () => {
+    expect(await hydratedTrialRequests('/trials/%3Cscript%3Ealert(1)%3C%2Fscript%3E'))
+      .toEqual(expectedPair('%3Cscript%3Ealert(1)%3C%2Fscript%3E'));
   });
 });
