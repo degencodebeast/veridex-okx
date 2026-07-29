@@ -66,8 +66,9 @@ services:
       # --- the SERVED money path. FAIL-CLOSED, and that is a correction. ---
       # A first cut wired X402_FACILITATOR_URL and X402_PAY_TO_ADDRESS. NEITHER NAME IS CONSUMED
       # ANYWHERE — they were invented rather than measured, and the names production actually reads
-      # were absent. Found by the Gate A reviewer. The authoritative list is the 17 keys the
-      # signal-trials path reads; there is no facilitator variable at all, because the facilitator is
+      # were absent. Found by the Gate A reviewer. The authoritative list is the 18 keys the
+      # signal-trials path reads (17 at the time of that audit, plus SIGNAL_TRIALS_COMMIT_RESOURCE_URL
+      # below); there is no facilitator variable at all, because the facilitator is
       # BUILT from the OKX credentials by _build_okx_facilitator(), not configured by URL.
       #
       # `:-`, MATCHING THE OKX CREDENTIALS ABOVE. An earlier head used `:?` here and argued the
@@ -85,6 +86,19 @@ services:
       # `:-` here on purpose: payments.py:236 falls back to DEFAULT_COMMIT_PRICE, so an unset value
       # is a real default rather than a missing configuration.
       SIGNAL_TRIALS_COMMIT_PRICE: ${SIGNAL_TRIALS_COMMIT_PRICE:-}
+      # The x402 v2 `resource.url` the 402 challenge advertises. `:-` for the same reason as the
+      # price above: the loader falls back to DEFAULT_COMMIT_RESOURCE_URL
+      # (https://api.proofarena.xyz/signal-trials/commit), so unset is a real default. Override only
+      # when this route is served from another origin, and the value MUST be an absolute https:// URL
+      # naming a host, with no embedded credentials — a present-but-malformed value refuses to boot
+      # rather than falling back, so an operator's typo is never silently replaced.
+      #
+      # DELIBERATELY OPERATOR-CONFIGURED RATHER THAN REQUEST-DERIVED. The app never reads this from
+      # the Host header: the 402 is the one response an unauthenticated caller can provoke at will,
+      # so a request-derived URL would let any caller choose the resource URL advertised to OTHER
+      # paying agents. Behind a proxy this means the value must be set to the PUBLIC origin, because
+      # the container cannot infer it and must not try.
+      SIGNAL_TRIALS_COMMIT_RESOURCE_URL: ${SIGNAL_TRIALS_COMMIT_RESOURCE_URL:-}
       # Seed-pack catalog the /readyz ReplayPack check + demo/backtest surfaces resolve. The leaf dir
       # name IS the pack_id, so the demo_pack_real leaf catalogs as pack_id="demo_pack_real" — the id the
       # F1 Official-Replay-League seed's phase-1 assert_pack requires (kept in sync with Dockerfile.api).
