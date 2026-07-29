@@ -30,7 +30,9 @@ PREOPEN_BODY="$(mktemp)"
 trap 'rm -f "$PREOPEN_BODY"' EXIT
 PREOPEN_STATUS="$(curl -sS -o "$PREOPEN_BODY" -w '%{http_code}' \
   https://api.proofarena.xyz/signal-trials/open-trial)"
-if [ "$PREOPEN_STATUS" = "404" ] && jq -e '.error == "no_open_trial"' "$PREOPEN_BODY" >/dev/null; then
+if [ "$PREOPEN_STATUS" = "404" ] && \
+  jq -e 'type == "object" and keys == ["error"] and .error == "no_open_trial"' \
+    "$PREOPEN_BODY" >/dev/null; then
   echo "expected safe pre-open state: 404 no_open_trial"
 elif [ "$PREOPEN_STATUS" = "200" ]; then
   echo "STOP: a trial is already open; do not start a new-open sequence" >&2

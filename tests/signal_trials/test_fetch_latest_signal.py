@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from importlib import util as importlib_util
@@ -322,6 +323,7 @@ print("transport-load-ok")
 def test_runbook_preopen_check_accepts_only_honest_404_and_final_qa_allows_closed_trial(
     tmp_path: Path,
 ) -> None:
+    assert shutil.which("jq") is not None, "this executable runbook contract requires real jq"
     text = RUNBOOK.read_text(encoding="utf-8")
     start_marker = "<!-- PREOPEN_CHECK_START -->"
     end_marker = "<!-- PREOPEN_CHECK_END -->"
@@ -347,24 +349,15 @@ sys.stdout.write(os.environ["FAKE_STATUS"])
         encoding="utf-8",
     )
     fake_curl.chmod(0o755)
-    fake_jq = fake_bin / "jq"
-    fake_jq.write_text(
-        """#!/usr/bin/env python3
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[-1]).read_text(encoding="utf-8"))
-raise SystemExit(0 if payload == {"error": "no_open_trial"} else 1)
-""",
-        encoding="utf-8",
-    )
-    fake_jq.chmod(0o755)
 
     cases = [
         ("404", '{"error":"no_open_trial"}', 0, "expected safe"),
+        ("404", '{"error":"no_open_trial","unexpected":true}', 1, "unexpected"),
+        ("404", "{}", 1, "unexpected"),
         ("200", '{"trial_id":"already-open"}', 1, "already open"),
         ("404", '{"error":"different"}', 1, "unexpected"),
+        ("404", "[]", 1, "unexpected"),
+        ("404", "{invalid-json", 1, "unexpected"),
         ("500", '{"error":"no_open_trial"}', 1, "unexpected"),
     ]
     for status, body, expected_exit, expected_diagnostic in cases:
