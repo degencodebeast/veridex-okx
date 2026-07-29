@@ -2,6 +2,7 @@ import ast
 import asyncio
 import base64
 import contextlib
+import copy
 import functools
 import hashlib
 import hmac
@@ -157,6 +158,17 @@ class _IntSubclass(int):
     pass
 
 
+class _SecretReadRecorder:
+    """Per-test mutable counter whose identity survives credential copies."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_SecretReadRecorder":
+        memo[id(self)] = self
+        return self
+
+
 class _CountingCredentials:
     """Structural credential double that records access to the configured signing secret."""
 
@@ -166,12 +178,28 @@ class _CountingCredentials:
     configured_secret = "SIGNER-KEY-MATERIAL-SENTINEL"
 
     def __init__(self) -> None:
-        self.secret_key_reads = 0
+        self._secret_reads = _SecretReadRecorder()
+
+    @property
+    def secret_key_reads(self) -> int:
+        return self._secret_reads.reads
 
     @property
     def secret_key(self) -> str:
-        self.secret_key_reads += 1
+        self._secret_reads.reads += 1
         return self.configured_secret
+
+
+def test_credential_secret_read_recorder_is_shared_across_shallow_and_deep_copies() -> None:
+    credentials = _CountingCredentials()
+    shallow = copy.copy(credentials)
+    deep = copy.deepcopy(credentials)
+
+    assert credentials.secret_key_reads == 0
+    assert shallow.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 1
+    assert deep.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 2
 
 
 @pytest.mark.parametrize(
