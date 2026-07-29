@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.signal_trials.test_challenge_spec import REST
+from veridex.signal_trials.challenge_spec import evidence_hash, normalize_signal, visible_at_decision
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "fetch_latest_signal.py"
 OPEN_LIVE_TRIAL = SCRIPT.with_name("open_live_trial.py")
@@ -410,6 +411,9 @@ _PUBLIC_LOCAL_TRIAL = {
     "evidence_hash": _LOCAL_EVIDENCE_HASH,
     "outcome": None,
 }
+_REVIEWED_REST_SIGNAL = normalize_signal(REST, source="rest")
+_REVIEWED_REST_EVIDENCE_HASH = evidence_hash(_REVIEWED_REST_SIGNAL)
+_REVIEWED_REST_EVIDENCE = visible_at_decision(_REVIEWED_REST_SIGNAL)
 
 
 def _extract_live_open_shell() -> str:
@@ -423,18 +427,40 @@ def _extract_live_open_shell() -> str:
     return shell_blocks[-1].split("```", 1)[0].strip()
 
 
+def _mutate_live_open_command(shell: str, mutation: str) -> str:
+    replacements = {
+        "wrong-script-path": (
+            "/app/scripts/signal_trials/open_live_trial.py",
+            "/app/scripts/signal_trials/does_not_exist.py",
+        ),
+        "missing-signal-file": (
+            "  --signal-file /tmp/proofarena-rest-signal.json \\\n",
+            "",
+        ),
+        "missing-data-dir": (
+            '  --data-dir "$SIGNAL_TRIALS_DATA_DIR" > "$OPEN_SUMMARY"',
+            '  > "$OPEN_SUMMARY"',
+        ),
+    }
+    before, after = replacements[mutation]
+    mutated = shell.replace(before, after, 1)
+    assert mutated != shell, f"{mutation} did not reach the extracted production live command"
+    return mutated
+
+
 def _run_live_open_shell(
     tmp_path: Path,
     *,
     open_exit: int = 0,
-    local_summary: dict[str, object] | None = _LOCAL_OPEN_SUMMARY,
+    local_summary: dict[str, object] | None = None,
     preopen_exit: int = 0,
     preopen_status: str = "404",
     preopen_body: str = '{"error":"no_open_trial"}',
     public_exit: int = 0,
     public_status: str = "200",
-    public_body: dict[str, object] = _PUBLIC_LOCAL_TRIAL,
+    public_body: dict[str, object] | None = None,
     prehold_lock: bool = False,
+    command_mutation: str | None = None,
 ) -> SimpleNamespace:
     assert shutil.which("jq") is not None, "the executable open workflow requires real jq"
     data_dir = tmp_path / "signal-trials-data"
@@ -447,6 +473,8 @@ def _run_live_open_shell(
 
     open_marker = tmp_path / "open-command-called"
     curl_log = tmp_path / "curl-urls"
+    signal_fixture = tmp_path / "reviewed-rest-signal.json"
+    signal_fixture.write_text(json.dumps(REST), encoding="utf-8")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_python = fake_bin / "python"
@@ -456,12 +484,40 @@ import os
 import sys
 from pathlib import Path
 
+args = sys.argv[1:]
+expected = [
+    "/app/scripts/signal_trials/open_live_trial.py",
+    "--source",
+    "rest",
+    "--signal-file",
+    "/tmp/proofarena-rest-signal.json",
+    "--data-dir",
+    os.environ["EXPECTED_DATA_DIR"],
+]
+if args != expected:
+    sys.stderr.write(f"strict open command mismatch: {args!r}\\n")
+    raise SystemExit(64)
+
 Path(os.environ["FAKE_OPEN_MARKER"]).write_text("called", encoding="utf-8")
 summary = os.environ.get("FAKE_LOCAL_SUMMARY", "")
 if summary:
     sys.stdout.write(summary)
-sys.stderr.write(os.environ.get("FAKE_OPEN_STDERR", ""))
-raise SystemExit(int(os.environ["FAKE_OPEN_EXIT"]))
+    raise SystemExit(int(os.environ["FAKE_OPEN_EXIT"]))
+open_exit = int(os.environ["FAKE_OPEN_EXIT"])
+if open_exit:
+    sys.stderr.write(os.environ.get("FAKE_OPEN_STDERR", ""))
+    raise SystemExit(open_exit)
+
+mapped = [
+    os.environ["REAL_OPEN_SCRIPT"],
+    "--source",
+    "rest",
+    "--signal-file",
+    os.environ["REAL_SIGNAL_FILE"],
+    "--data-dir",
+    os.environ["EXPECTED_DATA_DIR"],
+]
+os.execv(sys.executable, [sys.executable, *mapped])
 """,
         encoding="utf-8",
     )
@@ -469,6 +525,7 @@ raise SystemExit(int(os.environ["FAKE_OPEN_EXIT"]))
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         """#!/usr/bin/env python3
+import json
 import os
 import sys
 from pathlib import Path
@@ -477,9 +534,6 @@ args = sys.argv[1:]
 url = args[-1]
 with Path(os.environ["FAKE_CURL_LOG"]).open("a", encoding="utf-8") as handle:
     handle.write(url + "\\n")
-if "-o" not in args:
-    sys.stdout.write(os.environ["FAKE_PUBLIC_BODY"])
-    raise SystemExit(int(os.environ["FAKE_PUBLIC_EXIT"]))
 out = args[args.index("-o") + 1]
 if url.endswith("/open-trial"):
     body = os.environ["FAKE_PREOPEN_BODY"]
@@ -487,6 +541,26 @@ if url.endswith("/open-trial"):
     exit_code = int(os.environ["FAKE_PREOPEN_EXIT"])
 else:
     body = os.environ["FAKE_PUBLIC_BODY"]
+    if not body:
+        trial_id = url.rsplit("/", 1)[-1]
+        trial_path = (
+            Path(os.environ["EXPECTED_DATA_DIR"])
+            / "live"
+            / "trials"
+            / f"{trial_id}.json"
+        )
+        document = json.loads(trial_path.read_text(encoding="utf-8"))
+        body = json.dumps(
+            {
+                "trial_id": document["trial_id"],
+                "trial_mode": document["trial_mode"],
+                "t0_ms": document["t0_ms"],
+                "commit_deadline_ms": document["commit_deadline_ms"],
+                "evidence": json.loads(os.environ["REAL_PUBLIC_EVIDENCE"]),
+                "evidence_hash": os.environ["REAL_EVIDENCE_HASH"],
+                "outcome": None,
+            }
+        )
     status = os.environ["FAKE_PUBLIC_STATUS"]
     exit_code = int(os.environ["FAKE_PUBLIC_EXIT"])
 Path(out).write_text(body, encoding="utf-8")
@@ -501,6 +575,8 @@ raise SystemExit(exit_code)
         "/var/lib/veridex/signal-trials",
         str(data_dir),
     )
+    if command_mutation is not None:
+        shell = _mutate_live_open_command(shell, command_mutation)
     env = dict(os.environ)
     env.update(
         {
@@ -511,13 +587,18 @@ raise SystemExit(exit_code)
             "FAKE_OPEN_EXIT": str(open_exit),
             "FAKE_OPEN_STDERR": "simulated open refusal\n" if open_exit else "",
             "FAKE_LOCAL_SUMMARY": "" if local_summary is None else json.dumps(local_summary),
+            "EXPECTED_DATA_DIR": str(data_dir),
+            "REAL_OPEN_SCRIPT": str(OPEN_LIVE_TRIAL),
+            "REAL_SIGNAL_FILE": str(signal_fixture),
+            "REAL_EVIDENCE_HASH": _REVIEWED_REST_EVIDENCE_HASH,
+            "REAL_PUBLIC_EVIDENCE": json.dumps(_REVIEWED_REST_EVIDENCE),
             "FAKE_CURL_LOG": str(curl_log),
             "FAKE_PREOPEN_EXIT": str(preopen_exit),
             "FAKE_PREOPEN_STATUS": preopen_status,
             "FAKE_PREOPEN_BODY": preopen_body,
             "FAKE_PUBLIC_EXIT": str(public_exit),
             "FAKE_PUBLIC_STATUS": public_status,
-            "FAKE_PUBLIC_BODY": json.dumps(public_body),
+            "FAKE_PUBLIC_BODY": "" if public_body is None else json.dumps(public_body),
         }
     )
     result = subprocess.run(
@@ -529,12 +610,18 @@ raise SystemExit(exit_code)
         check=False,
     )
     urls = curl_log.read_text(encoding="utf-8").splitlines() if curl_log.is_file() else []
+    persisted_paths = sorted((data_dir / "live" / "trials").glob("*.json"))
+    persisted_trials = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in persisted_paths
+    ]
     return SimpleNamespace(
         result=result,
         open_marker=open_marker,
         lock_dir=lock_dir,
         temp_dir=temp_dir,
         urls=urls,
+        persisted_trials=persisted_trials,
     )
 
 
@@ -616,7 +703,11 @@ def test_live_open_refuses_public_trial_mismatch_before_payment_handoff(
     mismatched_value: object,
 ) -> None:
     public = {**_PUBLIC_LOCAL_TRIAL, field: mismatched_value}
-    execution = _run_live_open_shell(tmp_path, public_body=public)
+    execution = _run_live_open_shell(
+        tmp_path,
+        local_summary=_LOCAL_OPEN_SUMMARY,
+        public_body=public,
+    )
 
     assert execution.result.returncode != 0
     assert "TRIAL_ID=" not in execution.result.stdout
@@ -652,14 +743,40 @@ def test_live_open_honest_single_writer_binds_direct_read_and_emits_only_local_i
     execution = _run_live_open_shell(tmp_path)
 
     assert execution.result.returncode == 0, execution.result.stderr
-    assert execution.result.stdout == f"TRIAL_ID={_LOCAL_TRIAL_ID}\n"
+    assert len(execution.persisted_trials) == 1
+    persisted = execution.persisted_trials[0]
+    trial_id = persisted["trial_id"]
+    assert execution.result.stdout == f"TRIAL_ID={trial_id}\n"
     assert execution.open_marker.is_file()
     assert execution.urls == [
         "https://api.proofarena.xyz/signal-trials/open-trial",
-        f"https://api.proofarena.xyz/signal-trials/trials/{_LOCAL_TRIAL_ID}",
+        f"https://api.proofarena.xyz/signal-trials/trials/{trial_id}",
     ]
+    assert persisted["trial_mode"] == "live"
+    assert persisted["commit_deadline_ms"] - persisted["t0_ms"] == 300_000
+    assert persisted["sig"] == _REVIEWED_REST_SIGNAL.model_dump(mode="json")
     assert not execution.lock_dir.exists()
     assert list(execution.temp_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param("wrong-script-path", id="wrong-script-path"),
+        pytest.param("missing-signal-file", id="missing-signal-file"),
+        pytest.param("missing-data-dir", id="missing-data-dir"),
+    ],
+)
+def test_live_open_strict_real_command_boundary_kills_mutations(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    execution = _run_live_open_shell(tmp_path, command_mutation=mutation)
+
+    assert execution.result.returncode != 0
+    assert execution.result.stdout == ""
+    assert not execution.open_marker.exists()
+    assert execution.persisted_trials == []
 
 
 def test_demo_runbook_pins_order_hosts_boundaries_windows_and_authority() -> None:

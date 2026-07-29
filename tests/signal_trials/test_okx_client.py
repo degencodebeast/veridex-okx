@@ -148,54 +148,6 @@ async def test_signal_list_hmac_covers_the_exact_utf8_bytes_emitted_by_real_http
     assert request.headers["OK-ACCESS-SIGN"] == expected_signature
 
 
-@pytest.mark.parametrize(
-    "invalid_threshold",
-    [
-        pytest.param(True, id="boolean"),
-        pytest.param(float("nan"), id="nan"),
-        pytest.param(float("inf"), id="infinity"),
-    ],
-)
-async def test_invalid_threshold_never_reaches_real_httpx_transport_or_hmac(
-    invalid_threshold: object,
-) -> None:
-    """Runtime-invalid numeric values must stop before the authenticated transport boundary."""
-    import httpx
-
-    captured: list[httpx.Request] = []
-
-    async def respond(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return httpx.Response(200, json={"code": "0", "data": []})
-
-    seam_path = (
-        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
-    )
-    spec = importlib_util.spec_from_file_location("invalid_input_real_http_seam", seam_path)
-    assert spec is not None and spec.loader is not None
-    seam = importlib_util.module_from_spec(spec)
-    spec.loader.exec_module(seam)
-
-    filters = SignalFilters(chain_index="196", min_amount_usd=invalid_threshold)  # type: ignore[arg-type]
-    refused: ValueError | None = None
-    async with httpx.AsyncClient(
-        base_url="https://example.invalid",
-        transport=httpx.MockTransport(respond),
-    ) as http:
-        try:
-            await OKXMarketClient(
-                seam.HttpxTransport(http),
-                OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel"),
-            ).list_signals(filters)
-        except ValueError as error:
-            refused = error
-
-    signed = bool(captured and "OK-ACCESS-SIGN" in captured[0].headers)
-    emitted = None if not captured else captured[0].content
-    assert captured == [], f"invalid threshold reached real HttpxTransport: signed={signed}, body={emitted!r}"
-    assert refused is not None
-
-
 class _StringSubclass(str):
     pass
 
@@ -234,14 +186,15 @@ class _IntSubclass(int):
                 ("boolean", True),
                 ("negative", -1),
                 ("float", 1.0),
+                ("nan", float("nan")),
+                ("infinity", float("inf")),
+                ("negative-infinity", float("-inf")),
                 ("string", "1"),
                 ("none", None),
+                ("int-subclass", _IntSubclass(1)),
             )
         ],
-        pytest.param("min_amount_usd", float("nan"), id="amount-nan"),
-        pytest.param("min_amount_usd", float("inf"), id="amount-infinity"),
-        pytest.param("min_amount_usd", float("-inf"), id="amount-negative-infinity"),
-        pytest.param("min_amount_usd", _IntSubclass(1), id="amount-int-subclass"),
+        pytest.param("min_amount_usd", 10**5000, id="amount-beyond-int-string-limit"),
         pytest.param("cursor", "", id="cursor-empty"),
         pytest.param("cursor", 1, id="cursor-int"),
         pytest.param("cursor", True, id="cursor-bool"),
@@ -251,7 +204,11 @@ class _IntSubclass(int):
 async def test_signal_list_refuses_invalid_runtime_input_before_transport(
     field: str,
     invalid_value: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Every invalid runtime input stops before direct signing and the real HTTP seam."""
+    import httpx
+
     values: dict[str, object] = {
         "chain_index": "196",
         "wallet_type": "1",
@@ -266,15 +223,50 @@ async def test_signal_list_refuses_invalid_runtime_input_before_transport(
     else:
         values[field] = invalid_value
     filters = SignalFilters(**values)  # type: ignore[arg-type]
-    transport = RecordingFake({"code": "0", "data": []})
 
-    with pytest.raises(ValueError) as raised:
-        await OKXMarketClient(transport, OKXCredentials("k", "s", "p")).list_signals(
-            filters,
-            cursor=cursor,  # type: ignore[arg-type]
-        )
+    hmac_calls: list[tuple[str, str, str]] = []
+    original_headers = OKXMarketClient._headers
 
-    assert transport.calls == []
+    def observe_headers(
+        client: OKXMarketClient,
+        method: str,
+        request_path: str,
+        body: str,
+    ) -> dict[str, str]:
+        hmac_calls.append((method, request_path, body))
+        return original_headers(client, method, request_path, body)
+
+    monkeypatch.setattr(OKXMarketClient, "_headers", observe_headers)
+
+    captured: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"code": "0", "data": []})
+
+    seam_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    )
+    spec = importlib_util.spec_from_file_location("invalid_matrix_real_http_seam", seam_path)
+    assert spec is not None and spec.loader is not None
+    seam = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(seam)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http:
+        with pytest.raises(ValueError) as raised:
+            await OKXMarketClient(
+                seam.HttpxTransport(http),
+                OKXCredentials("k", "s", "p"),
+            ).list_signals(
+                filters,
+                cursor=cursor,  # type: ignore[arg-type]
+            )
+
+    assert hmac_calls == []
+    assert captured == []
     assert "SECRET-SENTINEL" not in str(raised.value)
 
 
