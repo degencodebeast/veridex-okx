@@ -6,7 +6,44 @@
 .headText { display: flex; flex-direction: column; gap: 4px; min-width: 240px; }
 .title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
 .lead { margin: 0; font-size: 11px; color: var(--text-2); }
-.leadSub { margin: 0; font-size: 11px; color: var(--text-3); }
+/* `--text-2`, not `--text-3`: two sentences, and the honesty boundary between the ranked metric and
+   the legibility one. PROOFARENA-OKX-DELTA-HANDOFF §12:302 puts every sentence-case string on a
+   body-copy token and reserves the darker two for "8–9px uppercase letter-spaced micro-labels only";
+   §12:304 forbids a multi-sentence string below the descriptive value outright. Measured 3.42:1 on
+   the page background at `--text-3`, 7.49:1 at `--text-2`. See prose-contrast.test.ts. */
+.leadSub { margin: 0; font-size: 11px; color: var(--text-2); }
+
+/* The route's identity copy, under the h1. Mono descriptor, sans thesis — the same pairing the
+   prototype uses, and the reason it reads as a product statement rather than as more table
+   commentary. */
+.descriptor { margin: 0; font-family: var(--font-mono), monospace; font-size: 12px; color: var(--text-2); }
+.thesis { margin: 0; max-width: 620px; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--text-2); text-wrap: pretty; }
+
+/* The header's right column: the state badge with its sample counter, and the two actions. */
+.headSide { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; }
+.statusRow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.actionRow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* `N = 61 settled trials`, or `N —` when no season document exists to count from. Tabular figures
+   so the number does not shift the badge beside it as the season grows. */
+.sampleCounter {
+  font-family: var(--font-mono), monospace; font-size: 10px; font-weight: 600;
+  color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+.headAction {
+  display: inline-flex; align-items: center;
+  /* ≥ 34px here, ≥ 44px at the narrow breakpoint (handoff §7). */
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border); background: var(--panel);
+  font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.04em;
+  color: var(--text-2); text-decoration: none; white-space: nowrap;
+}
+.headAction:hover, .headAction:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
+/* The featured card is the one action that leads INTO the benchmark, so it carries the accent. */
+.headActionPrimary { border-color: var(--accent); background: var(--accent-bg); color: var(--accent-hi); }
 
 /* Season status chip. Deliberately NOT the shared <Badge> component: none of the season states is
    an existing BadgeVariant, and `verified` — the one that looks closest — is a legacy variant whose
@@ -24,7 +61,16 @@
    borrow the visual weight of one we do. */
 .chip[data-state='not_built'], .chip[data-state='loading'] { border-style: dashed; color: var(--text-3); }
 
-.metaRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-3); }
+/* THE ROW MOVES, THE LABEL INSIDE IT DOES NOT. `.metaRow` is a CARRIER: the only element that takes
+   its colour by inheritance is the unclassed `season-combo` span (SeasonScreen.tsx:277-287), which
+   renders the season id, the humanized combo, and — in the exploratory state — the suffix
+   `· below the 40-trial gate`. That suffix is a lowercase honesty qualifier saying the combo never
+   reached the gate (handoff §6:189), so the carrier is MIXED and §12:302 moves it. `.metaLabel`
+   declares its own colour on the next line and keeps the micro-label token, which is what preserves
+   the SEASON-label/value register distinction across this change. 3.42:1 → 7.49:1 on `--bg`: the
+   shell's `.main` sets no background (ProofArenaShell.module.css:106), so this row sits on the body
+   background, not on a panel. */
+.metaRow { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-2); }
 .metaLabel { letter-spacing: 0.1em; color: var(--text-3); }
 
 .banner { margin: 0; padding: var(--space-2) var(--pad-panel); border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: var(--radius-control); background: var(--panel); color: var(--text-2); font-size: 11px; }
@@ -35,7 +81,14 @@
 .table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
 .table th { text-align: left; padding: 9px; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); white-space: nowrap; }
 .table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); white-space: nowrap; }
+.row { position: relative; }
 .row:hover { background: var(--panel-2); }
+.rowNavigable { cursor: pointer; }
+.rowAction { position: absolute; inset: 0; z-index: 1; }
+.visuallyHidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 .r { text-align: right; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .dash { color: var(--text-3); }
@@ -57,10 +110,40 @@
   padding: 2px 6px; border-radius: var(--radius-badge);
   border: 1px solid var(--accent); color: var(--accent-hi); background: var(--panel);
 }
-.notQualified { color: var(--text-3); }
+/* THE EXCLUSION NOTES. §12:302 names "exclusion notes" verbatim among the strings that must clear a
+   body-copy token, and these are the handoff's own: §5:145 lists `qualified` / `not qualified` /
+   `n/a — control` as one [DER] row, and §9:257 explains why a control renders `n/a — control` rather
+   than "not qualified". 11px, lowercase, `letter-spacing` normal — it misses all three criteria of
+   the reservation, where the seven selectors fixed in c4ed6ba missed two or three. It also renders in
+   the DEFAULT `qualified` state, on every non-qualified contestant row AND every control row, which
+   makes it the most-rendered member of this cluster. 3.42:1 → 7.49:1 on `--bg` (the table declares no
+   background on `td`, and `.tableWrap` none at all). */
+.notQualified { color: var(--text-2); }
+.agentSub { display: block; margin-top: 3px; color: var(--text-2); font: 9px/1.35 var(--font-mono), monospace; }
+.seasonCards { display: none; }
+.seasonCard {
+  min-width: 0; padding: 12px; border: 1px solid var(--border);
+  border-radius: var(--radius-panel); background: var(--panel-2); color: var(--text-1);
+  text-decoration: none;
+}
+.cardHead { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: baseline; font-size: 10px; }
+.cardHead strong { overflow-wrap: anywhere; }
+.cardHead span:last-child { color: var(--text-2); font-family: var(--font-mono), monospace; }
+.cardMetrics { display: grid; gap: 6px; margin: 10px 0 0; }
+.cardMetrics div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 5px; }
+.cardMetrics dt { color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; text-transform: uppercase; }
+.cardMetrics dd { margin: 0; color: var(--text-1); font: 10px/1.4 var(--font-mono), monospace; text-align: right; }
 
 .tableFoot { display: flex; flex-direction: column; gap: 6px; padding: var(--space-2) var(--pad-panel); border-top: 1px solid var(--border); }
-.footNote { font-size: 10px; color: var(--text-3); margin: 0; }
+/* §12:302 names "footnotes" verbatim among the sentence-case strings that must clear a body-copy
+   token. All four of these are multi-sentence, and none is letter-spaced, so none is in the class
+   §12:302 reserves the darker tokens for. 3.42:1 → 7.49:1 on `--bg`.
+   THE SURFACE IS CORRECTED HERE: this said "on the panel these sit on" and gave the panel's 3.29:1 →
+   7.20:1. Chrome disagrees — `.tableFoot` and `.tableWrap` declare no background and the shell's
+   `.main` declares none either (ProofArenaShell.module.css:106), so the first painted ancestor is
+   `body`, which `app/globals.css:7` sets to `--bg`. The direction of the fix was right and both
+   figures clear AA; the surface named was not. */
+.footNote { font-size: 10px; color: var(--text-2); margin: 0; }
 
 /* Empty / loading / error panels. None of them is ever populated with values. */
 .statePanel { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-4) var(--pad-panel); border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel); }
@@ -72,7 +155,15 @@
 .statePanel[data-state='unavailable'] { border-color: var(--negative); }
 .stateTitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
 .stateBody { margin: 0; font-size: 12px; color: var(--text-2); }
-.stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
+/* §12:302 names "empty/error bodies" verbatim. This class carries the transport-failure line, the
+   probe-counts explanation and the no-season disclosure — sentence-case, several of them
+   multi-sentence. It ALSO carries two short strings (`SEASON STANDINGS`, `N = n settled trials`), and
+   they move with it deliberately: §12:302 reserves the darker tokens for LETTER-SPACED micro-labels,
+   this rule sets no letter-spacing, and the authority is a contrast FLOOR rather than an instruction
+   to keep anything dim. TWO SURFACES, both measured, because this class has call sites in both
+   places: 3.29:1 → 7.20:1 inside `.statePanel` (which does set `--panel`), and 3.42:1 → 7.49:1 at
+   SeasonScreen.tsx:288, where the paragraph is a bare child of the screen and lands on `--bg`. */
+.stateSub { margin: 0; font-size: 10px; color: var(--text-2); font-family: var(--font-mono), monospace; }
 
 .probeCounts { font-size: 11px; color: var(--text-2); }
 /* `text-decoration: none` is required, not cosmetic: H5.5 applies this class to an <a> as well as
@@ -84,6 +175,10 @@
 .probeSummary:hover, .probeSummary:focus-visible { color: var(--accent-hi); }
 
 .retry {
+  /* An explicit flex box rather than the <button> UA default, for the same reason `.headAction`
+     above declares one: the narrow breakpoint gives this control a 44px minimum that its 10px label
+     does not fill, and centring must not depend on how a UA happens to align button content. */
+  display: inline-flex; align-items: center; justify-content: center;
   align-self: flex-start; font-family: var(--font-mono), monospace; font-size: 10px;
   letter-spacing: 0.06em; padding: 5px 10px; border-radius: var(--radius-control);
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text-1); cursor: pointer;
@@ -91,3 +186,20 @@
 .retry:hover, .retry:focus-visible { border-color: var(--accent); color: var(--accent-hi); }
 
 .skeletonRow { height: 11px; border-radius: 3px; background: var(--panel-2); }
+
+/* Narrow (handoff §7). The header's right column stops being a right rail and becomes a normal
+   block, so nothing is pushed off a phone's edge, and every action reaches the 44px tap target. */
+@media (max-width: 760px) {
+  .headSide { align-items: flex-start; width: 100%; }
+  .statusRow, .actionRow { justify-content: flex-start; }
+  .headAction { min-height: 44px; }
+  .probeSummary { display: inline-flex; align-items: center; min-height: 44px; }
+  /* The retry offered on a transport failure is a real tap target and was not one: 10px type with
+     5px of vertical padding measured ~25px at 390px. The same control is authored again in
+     TrialMatchCard.module.css and is fixed at THIS breakpoint there too — a judge moves between
+     /trials and /trials/[trialId], and one control must not render at two sizes. */
+  .retry { min-height: 44px; }
+  .tableWrap { display: none; }
+  .seasonCards { display: grid; gap: 10px; }
+  .seasonCardAction { display: block; min-height: 44px; }
+}

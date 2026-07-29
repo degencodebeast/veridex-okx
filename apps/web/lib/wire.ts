@@ -315,13 +315,32 @@ export interface SignalTrialsSeasonWire {
   rows: SignalTrialsRowWire[];
 }
 
+// The complete decision-time payload returned by CanonicalSignal.model_dump(). These are the only
+// evidence fields agents receive; post-decision liquidity and soldRatioPercent are structurally
+// excluded by the backend model.
+export interface CanonicalSignalWire {
+  t0_ms: number;
+  chain_index: string;
+  token_address: string;
+  symbol: string;
+  name: string;
+  market_cap_usd: number;
+  holders: number;
+  top10_holder_percent: number;
+  trigger_price: number;
+  wallet_type: string;
+  trigger_wallet_count: number;
+  trigger_wallet_address: string;
+  amount_usd: number;
+}
+
 // GET /signal-trials/open-trial — 404 `no_open_trial` when none is open.
 export interface OpenTrialWire {
   trial_id: string;
   trial_mode: 'live';
   t0_ms: number;
   commit_deadline_ms: number;
-  evidence: Record<string, unknown>;
+  evidence: CanonicalSignalWire;
   evidence_hash: string;
 }
 
@@ -347,7 +366,7 @@ export interface TrialWire {
   trial_mode: 'live';
   t0_ms: number;
   commit_deadline_ms: number;
-  evidence: Record<string, unknown>;
+  evidence: CanonicalSignalWire;
   evidence_hash: string;
   // `null` means NOTHING was computed at all — a WEAKER statement than a recorded `pending`.
   outcome: TrialOutcomeWire | null;

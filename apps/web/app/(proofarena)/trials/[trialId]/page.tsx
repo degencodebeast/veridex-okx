@@ -1,6 +1,7 @@
 'use client';
 import { useParams } from 'next/navigation';
 import { TrialMatchCard } from '@/components/screens/signal-trials/TrialMatchCard';
+import { decodeTrialRouteSegment } from './route-segment';
 
 // /trials/[trialId] — the PUBLIC ProofArena Fair-Play match card.
 //
@@ -25,5 +26,5 @@ import { TrialMatchCard } from '@/components/screens/signal-trials/TrialMatchCar
 // would add a boundary without moving any work across it.
 export default function TrialPage() {
   const params = useParams<{ trialId: string }>();
-  return <TrialMatchCard trialId={params.trialId} />;
+  return <TrialMatchCard trialId={decodeTrialRouteSegment(params.trialId)} />;
 }

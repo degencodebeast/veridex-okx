@@ -28,7 +28,7 @@
 import { ApiError } from '@/lib/api';
 import type * as W from '@/lib/wire';
 import type {
-  AgentRecord, CommitReceipt, OpenTrial, SeasonViewState, SignalTrialsHealth, SignalTrialsRow,
+  AgentRecord, CanonicalSignalEvidence, CommitReceipt, OpenTrial, SeasonViewState, SignalTrialsHealth, SignalTrialsRow,
   SignalTrialsSeason, TrialCard, TrialOutcome, VerifyChecks,
 } from '@/lib/contracts';
 
@@ -202,13 +202,47 @@ export function adaptSignalTrialsSeason(w: W.SignalTrialsSeasonWire): SignalTria
   };
 }
 
+const CANONICAL_EVIDENCE_FIELDS = [
+  ['t0_ms', 'number', 't0Ms'],
+  ['chain_index', 'string', 'chainIndex'],
+  ['token_address', 'string', 'tokenAddress'],
+  ['symbol', 'string', 'symbol'],
+  ['name', 'string', 'name'],
+  ['market_cap_usd', 'number', 'marketCapUsd'],
+  ['holders', 'number', 'holders'],
+  ['top10_holder_percent', 'number', 'top10HolderPercent'],
+  ['trigger_price', 'number', 'triggerPrice'],
+  ['wallet_type', 'string', 'walletType'],
+  ['trigger_wallet_count', 'number', 'triggerWalletCount'],
+  ['trigger_wallet_address', 'string', 'triggerWalletAddress'],
+  ['amount_usd', 'number', 'amountUsd'],
+] as const;
+
+export function adaptCanonicalEvidence(
+  evidence: W.CanonicalSignalWire,
+  path = 'signal-trials evidence',
+): CanonicalSignalEvidence {
+  const raw = evidence as unknown as Record<string, unknown>;
+  const mapped: Record<string, unknown> = {};
+  for (const [wireKey, expectedType, productKey] of CANONICAL_EVIDENCE_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(raw, wireKey)) {
+      throw new Error(`${path} omitted the required evidence field '${wireKey}'.`);
+    }
+    if (typeof raw[wireKey] !== expectedType || (expectedType === 'number' && !Number.isFinite(raw[wireKey]))) {
+      throw new Error(`${path} served invalid evidence field '${wireKey}'; expected ${expectedType}.`);
+    }
+    mapped[productKey] = raw[wireKey];
+  }
+  return mapped as unknown as CanonicalSignalEvidence;
+}
+
 export function adaptOpenTrial(w: W.OpenTrialWire): OpenTrial {
   return {
     trialId: w.trial_id,
     trialMode: w.trial_mode,
     t0Ms: w.t0_ms,
     commitDeadlineMs: w.commit_deadline_ms,
-    evidence: w.evidence,
+    evidence: adaptCanonicalEvidence(w.evidence, `GET ${SIGNAL_TRIALS_PATHS.openTrial()}`),
     evidenceHash: w.evidence_hash,
   };
 }
@@ -251,7 +285,7 @@ export function adaptTrial(w: W.TrialWire): TrialCard {
     trialMode: w.trial_mode,
     t0Ms: w.t0_ms,
     commitDeadlineMs: w.commit_deadline_ms,
-    evidence: w.evidence,
+    evidence: adaptCanonicalEvidence(w.evidence, `GET ${SIGNAL_TRIALS_PATHS.trial(w.trial_id)}`),
     evidenceHash: w.evidence_hash,
     // A recorded null outcome stays null: it claims nothing was computed at all, which is a
     // WEAKER statement than a recorded `pending`, and the two must not be merged.
@@ -362,6 +396,20 @@ export async function getSignalTrialsSeason(): Promise<SignalTrialsSeason> {
   // 404 `no_season_published` — the honest empty state. Which of the two it is comes from health,
   // and if health cannot be read either, that throws too rather than guessing a state.
   const health = await getSeasonHealth();
+  if (health.seasonState === 'qualified' || health.seasonState === 'exploratory') {
+    // `/health` and `/season` are separate reads. A publisher can commit the season between them,
+    // so one initial 404 followed by a positive health state is a race, not an empty positive
+    // season. Re-read exactly once: the bounded retry recovers the published document without
+    // polling, while a second non-200 fails closed instead of inventing ids, sample sizes or rows.
+    const published = await signalTrialsGet(path);
+    if (published.ok) {
+      return adaptSignalTrialsSeason((await published.json()) as W.SignalTrialsSeasonWire);
+    }
+    throw new ApiError(
+      published.status,
+      `GET ${path} remained unavailable after health reported ${health.seasonState}: ${published.status}`,
+    );
+  }
   return {
     seasonStatus: health.seasonState,
     seasonId: null,

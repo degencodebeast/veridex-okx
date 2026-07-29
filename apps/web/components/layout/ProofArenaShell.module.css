@@ -1,0 +1,187 @@
+/* The ProofArena shell. Zero new palette, type-scale or radius tokens — every value below comes
+   from styles/tokens.css (Direction A), which is what PAT-001 and __tests__/token-conformance
+   require and also what keeps this shell visually of the same product as the screens inside it. */
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  /* THE NARROW-VIEWPORT GUARD, and the reason it is on the ROOT rather than on a table.
+     At 390px the legacy-shelled route measured a 558px-wide document: a single non-wrapping flex
+     row (five nav links + a wallet control) plus a nowrap status strip has a min-content width far
+     wider than a phone, and once the document is wider than the viewport EVERY page scrolls
+     sideways. The wrapping rules below remove that cause; these two lines make the guarantee
+     structural, so a future descendant that is intrinsically too wide (a hash chip, a wide table)
+     cannot re-break the page body — it has to scroll inside its own container instead.
+     `overflow-x: clip` and NOT `hidden`: `hidden` makes this element a scroll container, which
+     would make it the sticky header's containing scrollport and break `position: sticky`. `clip`
+     clips without creating one. */
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+/* One deterministic focus contract for every keyboard target inside the two-route shell. The
+   accent resolves from Direction A's token source; keeping the declaration tokenized also
+   preserves PAT-001's single palette source. */
+.shell a:focus-visible,
+.shell button:focus-visible,
+.shell summary:focus-visible,
+.shell [role='link']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── top bar ─────────────────────────────────────────────────────────────── */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  /* Load-bearing for the 390px fix: the bar reflows onto a second line instead of setting a
+     min-content width the viewport cannot satisfy. */
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--pad-screen);
+  background: var(--bg-bar);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.brand { display: flex; align-items: center; gap: 9px; }
+
+.mark {
+  flex: none;
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 5px;
+  background: var(--accent-bg-soft);
+  border: 1px solid var(--accent);
+  font-family: var(--font-mono), monospace; font-size: 10px;
+  color: var(--accent-hi);
+}
+
+.wordmark { font-size: 14px; font-weight: 700; letter-spacing: 0.14em; color: var(--text-1); }
+
+.nav { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+
+.navLink {
+  display: inline-flex; align-items: center;
+  /* 34px on desktop matches the prototype's 52px bar; the 44px tap target is applied at the narrow
+     breakpoint below, where it is a requirement rather than a value. */
+  min-height: 34px;
+  padding: 0 11px;
+  border-radius: var(--radius-control);
+  font-size: 12px; font-weight: 500;
+  color: var(--text-2);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.navLink:hover, .navLink:focus-visible { color: var(--text-1); }
+/* The Arena tab is the current section on BOTH routes this shell wraps, so it is styled current
+   statically. `aria-current` carries the same fact to assistive tech. */
+.navActive { color: var(--text-1); background: var(--panel-2); }
+
+.integrations {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+  /* Pushes the group to the header's right edge, and — because the header wraps — onto its own
+     right-aligned line rather than off the side of a phone. */
+  margin-left: auto;
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
+  color: var(--text-3);
+}
+.integration {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-badge);
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+/* ── content column ──────────────────────────────────────────────────────── */
+
+/* Same centred, capped column as AppShell.module.css `.main` — the screens inside were written
+   against that measure, so reproducing it here is what keeps the two routes' layout unchanged by
+   the shell swap. */
+.column {
+  flex: 1;
+  align-self: center;
+  width: 100%;
+  max-width: 1440px;
+  padding: var(--pad-screen);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.main { display: flex; flex-direction: column; gap: var(--space-4); }
+
+/* ── footer band + product boundary ──────────────────────────────────────── */
+
+.footer { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.footerBand {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-3) var(--pad-panel);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+}
+
+.closingLine {
+  margin: 0;
+  max-width: 680px;
+  font-size: 13px; font-weight: 500; line-height: 1.5;
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+
+.footerActions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.onboarding {
+  font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.footerSkill {
+  display: inline-flex; align-items: center;
+  min-height: 38px;
+  padding: 0 13px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--accent);
+  background: var(--accent-bg);
+  color: var(--accent-hi);
+  font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.04em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.footerSkill:hover, .footerSkill:focus-visible { border-color: var(--accent-hi); }
+
+.disclaimer {
+  margin: 0;
+  max-width: 920px;
+  font-family: var(--font-mono), monospace; font-size: 11px; line-height: 1.6;
+  /* `--text-2`, NOT `--text-3`, and the handoff fixes this per role rather than per taste: §7:304
+     reserves `--text-3`/`--text-4` for 8–9px uppercase micro-labels and assigns sentence-case body
+     and HONESTY-CRITICAL DISCLAIMERS to `--text-2`, with an explicit "do not put a multi-sentence
+     string" below the descriptive-mono value. This string is both. At `--text-3` it measured 3.42:1
+     on the page background this paragraph actually sits on (it is a sibling of `.footerBand`, so
+     `--bg`, not `--panel`), which fails AA at 11px; `--text-2` measures 7.49:1. Same token as
+     `.closingLine` above — one band of footer prose should not render at two contrasts. */
+  color: var(--text-2);
+}
+
+/* ── narrow ──────────────────────────────────────────────────────────────── */
+
+@media (max-width: 760px) {
+  /* PROOFARENA-OKX-DELTA-HANDOFF §7: every tap target ≥ 44px at this breakpoint. */
+  .navLink, .footerSkill { min-height: 44px; }
+  .column { padding: var(--space-3) var(--space-2); }
+  .header { padding: var(--space-2) var(--space-2); }
+  /* The badges are identity, not controls: on a phone they take the full line they wrapped onto
+     rather than crowding the wordmark. */
+  .integrations { margin-left: 0; }
+}

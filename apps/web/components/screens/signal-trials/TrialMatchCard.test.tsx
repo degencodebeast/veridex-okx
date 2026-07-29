@@ -33,7 +33,7 @@
 // null ones; FOLLOW, FADE and ABSTAIN actions; a served check `fail`, a served `pending`, and an
 // ABSENT key. What this basis CANNOT express is stated at the bottom of this file.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
@@ -43,7 +43,10 @@ import {
 } from '@/lib/signal-trials-api';
 import type * as W from '@/lib/wire';
 import { TrialMatchCard, TRIAL_SETTLEMENT_HORIZON_MS } from './TrialMatchCard';
-import TrialPage from '@/app/(app)/trials/[trialId]/page';
+// The route moved OUT of the `(app)` group so it could stop inheriting the legacy Veridex shell.
+// Route groups are URL-transparent, so `/trials/[trialId]` is unchanged; only this import path is.
+// See app/(proofarena)/route-scope.test.ts.
+import TrialPage from '@/app/(proofarena)/trials/[trialId]/page';
 
 // next/navigation is globally mocked in vitest.setup.ts WITHOUT `useParams`, which the route page
 // needs. Re-mocked here rather than widened globally: the trial id this page reads is the one thing
@@ -59,9 +62,25 @@ vi.mock('next/navigation', () => ({
 // Same idiom as SeasonScreen.test.tsx: read the frozen contract fixture from the repo root at test
 // time so this screen cannot drift from the backend's wire shape.
 const FIX = resolve(__dirname, '../../../../../contracts/fixtures');
-const trialWire = JSON.parse(
+const parsedTrialWire = JSON.parse(
   readFileSync(resolve(FIX, 'signal_trials_trial.json'), 'utf8'),
 ) as W.TrialWire;
+const canonicalEvidence = {
+  t0_ms: 1_700_000_000_000,
+  chain_index: '501',
+  token_address: '0x1111111111111111111111111111111111111111',
+  symbol: 'AAA',
+  name: 'Asset A',
+  market_cap_usd: 1_234_567.5,
+  holders: 842,
+  top10_holder_percent: 31.5,
+  trigger_price: 0.0041732,
+  wallet_type: 'smart money',
+  trigger_wallet_count: 3,
+  trigger_wallet_address: '0x2222222222222222222222222222222222222222',
+  amount_usd: 25_000,
+};
+const trialWire: W.TrialWire = { ...parsedTrialWire, evidence: canonicalEvidence };
 
 const TRIAL_ID = trialWire.trial_id;
 
@@ -178,7 +197,7 @@ function verifyWire(
 // has `/signal-trials/trials/{id}` as a strict prefix, and `/signal-trials/receipts/{rid}/verify`
 // also contains the substring `/receipts`. A naive `includes()` chain routes the card's calls to
 // the wrong stub and the whole file becomes meaningless.
-type Route = (url: string) => Response;
+type Route = (url: string) => Response | Promise<Response>;
 interface Routes {
   trial?: Route;
   receipts?: Route;
@@ -340,6 +359,44 @@ describe('H5.3 participants — the action is on the wire and is never re-derive
     expect(within(rows[0]).getByTestId('participant-p')).toHaveTextContent('0.72');
   });
 
+  it('labels the live participant surface as paid external commitments without inventing roles', async () => {
+    const panel = await participants();
+    expect(within(panel).getByTestId('participants-context'))
+      .toHaveTextContent('paid commits · live-only · 300s window');
+    expect(within(panel).getByRole('columnheader', { name: 'ROLE' })).toBeInTheDocument();
+
+    const roles = within(panel).getAllByTestId('participant-role');
+    expect(roles).toHaveLength(RECEIPTS.length);
+    expect(roles.map((role) => role.textContent)).toEqual(
+      RECEIPTS.map(() => 'external payer'),
+    );
+    const participantLabels = Array.from(
+      within(panel).getAllByTestId('participant-row')[0].querySelectorAll('td'),
+      (cell) => ({
+        dataLabel: cell.getAttribute('data-label'),
+        ariaLabel: cell.getAttribute('aria-label'),
+      }),
+    );
+    const expectedLabels = [
+      'AGENT',
+      'ROLE',
+      'p_follow_profitable',
+      'DERIVED ACTION',
+      'BRIER',
+      `chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`,
+      'STATUS',
+    ];
+    expect(participantLabels.map((label) => label.dataLabel)).toEqual(expectedLabels);
+    expect(participantLabels.map((label) => label.ariaLabel)).toEqual(expectedLabels);
+
+    const splitRoles = screen.getAllByTestId('split-agent-role');
+    expect(splitRoles).toHaveLength(2);
+    expect(splitRoles.map((role) => role.textContent)).toEqual([
+      'external payer',
+      'external payer',
+    ]);
+  });
+
   it('renders ABSTAIN for a receipt whose p is 0.91 — the wire action, not a client-side band', async () => {
     const panel = await participants();
     const row = within(panel).getAllByTestId('participant-row')[2];
@@ -419,6 +476,56 @@ describe('H5.3 participants — three answers, none interchangeable', () => {
 // GROUP E — Fair-Play checks, ALL EIGHT keys (element 5, CF-5)
 // ---------------------------------------------------------------------------
 describe('H5.3 Fair-Play checks', () => {
+  it('collapses all eight descriptions as one group while keeping every status visible', async () => {
+    const panel = await participants();
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    const toggle = within(group).getByRole('button', {
+      name: 'Collapse Fair-Play check descriptions',
+    });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(within(group).getAllByTestId('check-description')).toHaveLength(8);
+    expect(within(group).getAllByTestId('check-status')).toHaveLength(8);
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAccessibleName('Expand Fair-Play check descriptions');
+    expect(within(group).queryAllByTestId('check-description')).toHaveLength(0);
+    expect(within(group).getAllByTestId('check-row')).toHaveLength(8);
+    expect(within(group).getAllByTestId('check-status')).toHaveLength(8);
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(within(group).getAllByTestId('check-description')).toHaveLength(8);
+  });
+
+  it('renders a visible glyph and status word for pass, fail, pending, and not served', async () => {
+    const missingManifest: Record<string, W.SignalTrialsCheckStatusWire> = {
+      ...ALL_EIGHT,
+      body_hash: 'fail' as const,
+    };
+    delete missingManifest.manifest;
+    const panel = await participants({ verify: verifyRoute(missingManifest) });
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    const rows = within(group).getAllByTestId('check-row');
+    const expectedWords = new Map([
+      ['fail', 'FAIL'],
+      ['pass', 'PASS'],
+      ['pending', 'PENDING'],
+      ['not_served', 'not served'],
+    ]);
+
+    for (const [status, word] of expectedWords) {
+      const row = rows.find((candidate) => candidate.getAttribute('data-status') === status);
+      expect(row, `missing ${status} fixture row`).toBeDefined();
+      const badge = within(row!).getByTestId('check-status');
+      expect(badge).toHaveTextContent(word);
+      const glyph = within(badge).getByTestId('check-status-glyph');
+      expect(glyph.textContent?.trim()).not.toBe('');
+      expect(glyph).toHaveAttribute('aria-hidden', 'true');
+    }
+  });
+
   it('renders all EIGHT frozen keys per participant, in the frozen order, from the shared constant', async () => {
     const panel = await participants();
     const group = within(panel).getAllByTestId('fairplay-checks')[0];
@@ -753,6 +860,15 @@ describe('H5.3 rail copy is true in every outcome state the card supports', () =
 // GROUP F — the markout table (element 4)
 // ---------------------------------------------------------------------------
 describe('H5.3 markout table', () => {
+  it('is a semantic disclosure that is open by default for settled evidence', async () => {
+    await card();
+    const disclosure = screen.getByTestId('markout-table');
+    expect(disclosure.tagName).toBe('DETAILS');
+    expect(disclosure).toHaveAttribute('open');
+    expect(within(disclosure).getByText(/COST SENSITIVITY/)).toBeInTheDocument();
+    expect(within(disclosure).getAllByTestId('markout-row')).toHaveLength(4);
+  });
+
   it('carries the frozen markout label and the diagnostic tag', async () => {
     await card();
     expect(screen.getByText(SIGNAL_TRIALS_MARKOUT_LABEL)).toBeInTheDocument();
@@ -764,32 +880,80 @@ describe('H5.3 markout table', () => {
     await card();
     const rows = screen.getAllByTestId('markout-row');
     expect(rows.map((r) => r.getAttribute('data-cost-bps'))).toEqual(['0', '10', '25', '50']);
+    const expectedLabels = [
+      'DECLARED COST',
+      'FOLLOW MARKOUT (BPS)',
+      'FADE MARKOUT (BPS)',
+      'BASIS',
+    ];
+    const labels = Array.from(rows[0].querySelectorAll('td'), (cell) => ({
+      dataLabel: cell.getAttribute('data-label'),
+      ariaLabel: cell.getAttribute('aria-label'),
+    }));
+    expect(labels.map((label) => label.dataLabel)).toEqual(expectedLabels);
+    expect(labels.map((label) => label.ariaLabel)).toEqual(expectedLabels);
     const official = rows.filter((r) => r.getAttribute('data-basis') === 'official');
     expect(official).toHaveLength(1);
     expect(official[0]).toHaveAttribute('data-cost-bps', '25');
   });
 
-  it('fills the 25 bps row from the SERVED values and leaves the sweep rows explicitly not-served', async () => {
+  it('derives the declared 0/10/50 diagnostic rows and preserves the SERVED 25 bps pair', async () => {
     await card();
     const rows = screen.getAllByTestId('markout-row');
-    const official = rows.find((r) => r.getAttribute('data-cost-bps') === '25')!;
-    expect(within(official).getByTestId('markout-follow'))
-      .toHaveTextContent(String(settledOutcome.follow_markout_bps));
-    expect(within(official).getByTestId('markout-fade'))
-      .toHaveTextContent(String(settledOutcome.fade_markout_bps));
-    // THE CONTROL AGAINST A DERIVED SWEEP. `TrialOutcomeWire` carries exactly ONE (follow, fade)
-    // pair — the official 25 bps basis. No 0/10/50 bps value is on the wire, and computing one on
-    // the client would be the frontend re-deriving scoring. These cells must hold NO digits.
-    for (const cost of ['0', '10', '50']) {
-      const row = rows.find((r) => r.getAttribute('data-cost-bps') === cost)!;
-      expect(within(row).getByTestId('markout-follow').textContent).not.toMatch(/\d/);
-      expect(within(row).getByTestId('markout-fade').textContent).not.toMatch(/\d/);
-    }
+    const values = Object.fromEntries(rows.map((row) => [
+      row.getAttribute('data-cost-bps'),
+      [
+        within(row).getByTestId('markout-follow').textContent,
+        within(row).getByTestId('markout-fade').textContent,
+      ],
+    ]));
+    // Binding handoff [DER]: gross = served FOLLOW + 25; follow(c) = gross - c;
+    // fade(c) = -gross - c. The 25-bps row is NOT derived: it remains the API pair verbatim.
+    expect(values).toEqual({
+      0: ['+66.0 bps', '-66.0 bps'],
+      10: ['+56.0 bps', '-76.0 bps'],
+      25: ['+41.0 bps', '-41.0 bps'],
+      50: ['+16.0 bps', '-116.0 bps'],
+    });
   });
 
-  it('shows no sweep at all when nothing settled, and says the 25 bps basis is unchanged', async () => {
-    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('pending'))) });
+  it('discloses when the served official pair disagrees with the diagnostic formula', async () => {
+    await card();
+    expect(screen.getByTestId('markout-formula-warning')).toHaveTextContent(
+      'The served 25 bps pair is inconsistent with the declared diagnostic formula. The official values remain displayed verbatim.',
+    );
+  });
+
+  it('does not invent an inconsistency warning when the served official pair matches the formula', async () => {
+    await card({
+      trial: () => jsonResponse(trial({
+        ...settledOutcome,
+        follow_markout_bps: 41.1,
+        fade_markout_bps: -91.1,
+      })),
+    });
+    expect(screen.queryByTestId('markout-formula-warning')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['an absent outcome', null],
+    ['a pending outcome', nullMetricOutcome('pending')],
+    ['an UNSCORED outcome', nullMetricOutcome('UNSCORED')],
+    [
+      'a settled outcome with absent markouts',
+      { ...settledOutcome, follow_markout_bps: null, fade_markout_bps: null },
+    ],
+  ] as const)('shows no sweep for %s and never fabricates diagnostic values', async (
+    _state,
+    outcome,
+  ) => {
+    await card({ trial: () => jsonResponse(trial(outcome)) });
+    const disclosure = screen.getByTestId('markout-table');
+    expect(disclosure.tagName).toBe('DETAILS');
+    expect(disclosure).not.toHaveAttribute('open');
     expect(screen.queryAllByTestId('markout-row')).toHaveLength(0);
+    expect(screen.queryByTestId('markout-formula-warning')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-diagnostic-tag')).not.toBeInTheDocument();
     expect(screen.getByTestId('markout-table').textContent)
       .toMatch(/no markout exists at any cost assumption/i);
   });
@@ -799,6 +963,24 @@ describe('H5.3 markout table', () => {
 // GROUP G — the trial section's own failure domains
 // ---------------------------------------------------------------------------
 describe('H5.3 trial section states', () => {
+  it.each([
+    ['loading', () => new Promise<Response>(() => {})],
+    ['not found', () => errorResponse(404, 'trial_not_found')],
+    ['unavailable', () => errorResponse(500, 'boom')],
+  ] as const)('renders no cost disclosure or diagnostic sweep while the trial is %s', async (
+    _state,
+    trialRoute,
+  ) => {
+    stubRoutes({ trial: trialRoute, receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    if (_state !== 'loading') {
+      await waitFor(() => expect(screen.getByTestId('trial-panel')).not.toHaveAttribute('data-state', 'loading'));
+    }
+    expect(screen.queryByTestId('markout-table')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-diagnostic-tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-row')).not.toBeInTheDocument();
+  });
+
   it('404 renders "trial not found" with no retry — a 404 is not a transport failure', async () => {
     stubRoutes({ trial: () => errorResponse(404, 'trial_not_found'), receipts: OK_RECEIPTS, verify: OK_VERIFY });
     render(<TrialMatchCard trialId={TRIAL_ID} />);
@@ -808,6 +990,36 @@ describe('H5.3 trial section states', () => {
     expect(screen.queryByTestId('trial-retry')).toBeNull();
     // Non-echo: the addendum forbids reflecting the requested id back from a 404.
     expect(panel.textContent).not.toContain(TRIAL_ID);
+  });
+
+  it('SAYS why there is no retry, in the required words', async () => {
+    // PROOFARENA-EXACT-COPY.md §4 `not found` gives this state a fourth line, and it is the line
+    // that turns a design choice into a stated one: the ABSENCE of a retry button is invisible, so
+    // a judge cannot tell a deliberate refusal from a forgotten affordance without the sub. The
+    // behaviour was already right; the explanation was missing.
+    stubRoutes({ trial: () => errorResponse(404, 'trial_not_found'), receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    const panel = await screen.findByTestId('trial-panel');
+    await waitFor(() => expect(panel).toHaveAttribute('data-state', 'not_found'));
+    // Exact node text, em dash included. `toHaveTextContent` matches substrings and normalises
+    // whitespace, so it would pass on copy the exact-copy sheet forbids.
+    expect(screen.getByTestId('trial-not-found-sub').textContent)
+      .toBe('404 is not a transport failure — retry is not offered.');
+    // The behaviour the copy describes must still hold: saying it is not a substitute for it.
+    expect(screen.queryByTestId('trial-retry')).toBeNull();
+  });
+
+  it('does NOT put the 404 sub on the transport-failure state', async () => {
+    // The discrimination control, and it is a claim about meaning rather than about layout: the
+    // `unavailable` state IS a transport failure and DOES offer a retry, so borrowing this line
+    // there would state the exact opposite of the truth about that state.
+    stubRoutes({ trial: () => jsonResponse({ error: 'boom' }, 500), receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    const panel = await screen.findByTestId('trial-panel');
+    await waitFor(() => expect(panel).toHaveAttribute('data-state', 'unavailable'));
+    expect(screen.queryByTestId('trial-not-found-sub')).toBeNull();
+    expect(panel.textContent).not.toContain('404 is not a transport failure');
+    expect(screen.getByTestId('trial-retry')).toBeInTheDocument();
   });
 
   it('a 500 renders "trial data unavailable" WITH a retry, and never as "not found"', async () => {
@@ -922,6 +1134,143 @@ describe('H5.3 /trials/[trialId] route page', () => {
     const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
     expect(urls.some((u) => u.endsWith(`/signal-trials/trials/${TRIAL_ID}`))).toBe(true);
     expect(urls.some((u) => u.endsWith(`/signal-trials/trials/${TRIAL_ID}/receipts`))).toBe(true);
+  });
+});
+
+describe('SPEC-R1 complete live Match Card surfaces', () => {
+  it('renders the canonical signal snapshot, its exact exclusions, and no invented transport', async () => {
+    await card();
+    const panel = screen.getByTestId('signal-state-panel');
+    for (const value of [
+      canonicalEvidence.symbol, canonicalEvidence.name, canonicalEvidence.chain_index,
+      canonicalEvidence.token_address, String(canonicalEvidence.trigger_price),
+      String(canonicalEvidence.trigger_wallet_count), String(canonicalEvidence.amount_usd),
+      String(canonicalEvidence.market_cap_usd), String(canonicalEvidence.holders),
+      String(canonicalEvidence.top10_holder_percent), canonicalEvidence.trigger_wallet_address,
+    ]) expect(panel).toHaveTextContent(value);
+    expect(panel).toHaveTextContent(
+      'exact historical liquidity — not returned by the signal endpoint; the record states only that the trial passed the $20k min-liquidity query filter.',
+    );
+    expect(panel).toHaveTextContent(
+      'soldRatioPercent — trigger-time semantics unverified; withheld from agent evidence.',
+    );
+    expect(panel.textContent).not.toMatch(/\bREST\b|\bWS\b|SOURCE \/ TRANSPORT/);
+  });
+
+  it('renders only served and fixed-law identity, omitting unsupported replay identity', async () => {
+    await card();
+    const identity = screen.getByTestId('evidence-law-identity');
+    expect(identity).toHaveTextContent(TRIAL_ID);
+    expect(identity).toHaveTextContent('live');
+    expect(identity).toHaveTextContent(trialWire.evidence_hash);
+    expect(identity).toHaveTextContent(String(trialWire.t0_ms));
+    expect(identity).toHaveTextContent(String(trialWire.commit_deadline_ms));
+    expect(identity).toHaveTextContent(String(TRIAL_SETTLEMENT_HORIZON_MS));
+    expect(identity.textContent).not.toMatch(/BAR|LAW VERSION|MANIFEST|CONTESTANT VERSION|n\/a/i);
+  });
+
+  it('renders the selected four-node rail with one hash, served agents and one outcome strip', async () => {
+    await participants();
+    const rail = screen.getByTestId('shared-evidence-rail');
+    expect(within(rail).getAllByTestId('rail-node')).toHaveLength(4);
+    expect(within(rail).getAllByTestId('rail-hash-chip')).toHaveLength(1);
+    expect(within(rail).getAllByTestId('rail-agent')).toHaveLength(RECEIPTS.length);
+    expect(within(rail).getAllByTestId('rail-outcome')).toHaveLength(1);
+  });
+
+  it('selects the greatest-|Δp| pair with payer tie-break and relays p=.91 ABSTAIN', async () => {
+    await participants();
+    const sides = screen.getAllByTestId('split-agent');
+    expect(sides).toHaveLength(2);
+    expect(within(sides[0]).getByText('0xbbb')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('0xccc')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('0.91')).toBeInTheDocument();
+    expect(within(sides[1]).getByText('ABSTAIN')).toBeInTheDocument();
+    expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
+    expect(screen.getAllByTestId('split-outcome')).toHaveLength(1);
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.60');
+  });
+
+  it('shows the exact opposite-actions callout for recorded FOLLOW + FADE', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[0], RECEIPTS[1]]) });
+    const callout = screen.getByTestId('split-opposite-actions');
+    expect(callout).toHaveTextContent('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('shows the exact opposite-actions callout for recorded FADE + FOLLOW', async () => {
+    await participants({
+      receipts: () => jsonResponse([
+        { ...RECEIPTS[0], action: 'FADE' },
+        { ...RECEIPTS[1], action: 'FOLLOW' },
+      ]),
+    });
+    const callout = screen.getByTestId('split-opposite-actions');
+    expect(callout).toHaveTextContent('OPPOSITE ACTIONS · FADE ↔ FOLLOW');
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('keeps disagreement Δ but omits opposite actions for recorded FOLLOW + ABSTAIN', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[0], RECEIPTS[2]]) });
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.19');
+  });
+
+  it('does not show the opposite-actions callout for a same-action pair', async () => {
+    await participants({
+      receipts: () => jsonResponse([
+        RECEIPTS[0],
+        { ...RECEIPTS[1], action: 'FOLLOW' },
+      ]),
+    });
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+    expect(screen.getByTestId('split-evidence')).toHaveTextContent('DISAGREEMENT · Δ 0.41');
+  });
+
+  it('renders the exact one-participant absence branch with dash values and shared evidence intact', async () => {
+    await participants({ receipts: () => jsonResponse([RECEIPTS[2]]) });
+    const absent = screen.getByTestId('split-agent-absent');
+    expect(absent).toHaveTextContent('NO COMMITMENT RECORDED');
+    expect(absent).toHaveTextContent(
+      'No second agent committed to this trial before the deadline. The shared evidence, deadline, and law are unchanged; nothing is inferred for the missing side.',
+    );
+    expect(absent).toHaveTextContent('p_follow_profitable —');
+    expect(absent).toHaveTextContent('action —');
+    expect(absent).toHaveTextContent('brier —');
+    expect(screen.getAllByTestId('split-evidence-hash')).toHaveLength(1);
+    expect(screen.queryByTestId('split-opposite-actions')).not.toBeInTheDocument();
+  });
+
+  it('does not mount a two-side comparison when the served participant set is empty', async () => {
+    await participants({ receipts: () => jsonResponse([]) });
+    expect(screen.queryByTestId('trials-split')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('split-agent')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('split-agent-absent')).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(
+      'two agents · one snapshot · one hash · one t0 · one deadline · one law',
+    );
+    expect(document.body.textContent).not.toContain('NO INDEPENDENT EVIDENCE PER SIDE');
+    expect(document.body.textContent).not.toContain('ONE SHARED OUTCOME BENEATH BOTH AGENTS');
+  });
+
+  it('shows Fair-Play phase tiers and an independent verdict tally without an aggregate badge', async () => {
+    await participants();
+    const first = screen.getAllByTestId('fairplay-checks')[0];
+    expect(first).toHaveTextContent('COMMIT-TIME');
+    expect(first).toHaveTextContent('OUTCOME-TIME');
+    expect(first).toHaveTextContent('4 pass · 4 pending');
+    expect(first).toHaveTextContent('Every check reports independently');
+    expect(first.textContent).not.toMatch(/\b8 verified\b/i);
+  });
+
+  it('discloses terminal eligibility from the fixed horizon without fabricating settlement fields', async () => {
+    await card({ trial: () => jsonResponse(trial(nullMetricOutcome('UNSCORED'))) });
+    const settlement = screen.getByTestId('settlement-panel');
+    expect(settlement).toHaveTextContent('TERMINAL ELIGIBILITY');
+    expect(settlement).toHaveTextContent('T + bar + 600,000 ms grace elapsed');
+    expect(settlement).toHaveTextContent('SETTLEMENT CANDLE CLOSE');
+    expect(settlement).toHaveTextContent('—');
   });
 });
 

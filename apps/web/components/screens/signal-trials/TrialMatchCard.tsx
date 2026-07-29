@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ApiError } from '@/lib/api';
 import {
@@ -11,6 +11,12 @@ import {
   verifyReceipt,
 } from '@/lib/signal-trials-api';
 import type { CommitReceipt, TrialCard, TrialOutcome, VerifyChecks } from '@/lib/contracts';
+import {
+  EvidenceLawIdentity,
+  SharedEvidenceRail,
+  SignalStatePanel,
+} from './SignalStatePanel';
+import { TrialsSplitScreen } from './TrialsSplitScreen';
 import styles from './TrialMatchCard.module.css';
 
 // H5.3 — the Trial Match Card at /trials/[trialId]. PUBLIC (no AuthGate): this is the judge-facing
@@ -63,13 +69,10 @@ import styles from './TrialMatchCard.module.css';
 // exists to avoid. Exported so the test pins the same constant the card counts against.
 export const TRIAL_SETTLEMENT_HORIZON_MS = 3_600_000;
 
-// The official cost basis, and the declared diagnostic sweep around it.
-//
-// ONLY THE 25 bps ROW HAS SERVED VALUES. `TrialOutcomeWire` carries exactly one (follow, fade)
-// pair — the official basis the season ranks on. No 0 / 10 / 50 bps markout exists anywhere on the
-// frozen wire, and synthesising one here (gross − cost, or any other arithmetic) would be this
-// client recomputing the settlement law. The sweep rows therefore render as NOT SERVED rather than
-// as numbers. See the note under the table.
+// The official cost basis, and the declared diagnostic sweep around it. The API carries the 25-bps
+// pair used by ranking. The binding handoff separately classifies 0 / 10 / 50 as presentation
+// derivations: gross = served FOLLOW + 25; follow(c) = gross - c; fade(c) = -gross - c. Those rows
+// never replace or reinterpret the official pair, and the sweep never changes ranking.
 const OFFICIAL_COST_BPS = 25;
 const COST_SWEEP_BPS = [0, 10, 25, 50] as const;
 
@@ -121,6 +124,13 @@ const CHECK_DESCRIPTION: Record<FrozenCheckKey, string> = {
   // passing". Describing this as a boundary re-derivation sells it short.
   outcome_source: 'Three obligations: the close boundary, the law’s outputs (entry, both markout legs and follow_profitable) and the fetch source all re-derive from the recorded candle.',
 };
+
+const CHECK_STATUS_PRESENTATION = {
+  pass: { glyph: '✓', word: 'PASS' },
+  fail: { glyph: '✕', word: 'FAIL' },
+  pending: { glyph: '◷', word: 'PENDING' },
+  not_served: { glyph: '—', word: 'not served' },
+} as const;
 
 // ---------------------------------------------------------------------------
 // state machines — one per failure domain, deliberately not merged
@@ -272,10 +282,26 @@ export function TrialMatchCard({ trialId }: { trialId: string }) {
       {/* The participant and cost panels hang off the TRIAL succeeding, because both are framed by
           the trial's own evidence. Their INTERNAL failures are independent and handled below. */}
       {trial.kind === 'ok' ? (
-        <>
-          <ParticipantsSection state={people} />
-          <MarkoutSection outcome={trial.trial.outcome} />
-        </>
+        <div className={styles.trialComposition}>
+          <div className={styles.trialPrimary}>
+            <SharedEvidenceRail
+              trial={trial.trial}
+              agents={people.kind === 'list' ? people.entries.map((entry) => entry.receipt) : []}
+            />
+            <SignalStatePanel trial={trial.trial} />
+            {people.kind === 'list' && people.entries.length > 0 ? (
+              <TrialsSplitScreen
+                trial={trial.trial}
+                receipts={people.entries.map((entry) => entry.receipt)}
+              />
+            ) : null}
+            <ParticipantsSection state={people} />
+          </div>
+          <aside className={styles.trialSecondary}>
+            <EvidenceLawIdentity trial={trial.trial} />
+            <MarkoutSection outcome={trial.trial.outcome} />
+          </aside>
+        </div>
       ) : null}
     </section>
   );
@@ -304,6 +330,15 @@ function TrialBody({ state, onRetry }: { state: TrialState; onRetry: () => void 
           <h1 className={styles.stateTitle}>Trial not found</h1>
           <p className={styles.stateBody}>No trial exists for this id. Nothing was published under it.</p>
           <Link className={styles.back} href="/trials">← BACK TO ARENA</Link>
+          {/* PROOFARENA-EXACT-COPY.md §4 `not found`. The behaviour above was already correct; this
+              line is what makes it LEGIBLE. An absent retry button is invisible — a judge cannot
+              distinguish a deliberate refusal from a forgotten affordance by looking at nothing —
+              so the reason is stated rather than merely enacted. It appears on this state ONLY:
+              `unavailable` IS a transport failure and DOES offer a retry, so borrowing the line
+              there would state the exact opposite of the truth about that state. */}
+          <p className={styles.stateSub} data-testid="trial-not-found-sub">
+            404 is not a transport failure — retry is not offered.
+          </p>
         </>
       );
     case 'unavailable':
@@ -365,88 +400,6 @@ function TrialHead({ trial }: { trial: TrialCard }) {
         PAPER BENCHMARK — NOT A TRADE RECOMMENDATION
       </p>
 
-      {/* THE RAIL — and the line this section had to be rewritten to respect.
-          Two kinds of sentence want to live here and they are NOT the same claim:
-
-            CONSTRUCTION — what this trial record IS. It carries one sealed evidence payload, one
-            commit deadline and one settlement law. Those three are true from the record alone,
-            true whatever any verdict says, and stated unconditionally below.
-
-            The OUTCOME is NOT one of them. `TrialCard.outcome` is nullable, and `null` means
-            nothing was computed at all — a state this component renders as "No outcome record
-            exists for this trial". So the outcome half of the summary line below is a DIRECT READ
-            of that one field, not an unconditional statement, and the ternary that produces it is
-            load-bearing: an earlier revision of this block claimed "one outcome" unconditionally
-            and that is exactly the claim the milestone review found false. Do not collapse it.
-
-            VERIFICATION — what is true OF A PARTICULAR RECEIPT: that it really re-derives against
-            that record, really binds this trial, really arrived before the deadline. NOTHING on
-            this rail can establish those. Only the per-receipt checks can, and they report one
-            verdict at a time.
-
-          This rail previously asserted the SECOND kind unconditionally — "IDENTICAL FOR EVERY
-          AGENT", "every agent … committed before the same deadline", "the rail is the fairness
-          claim". Those sentences stayed on screen while a receipt's `deadline_respected` read
-          `fail`, so the card asserted as fact the exact thing its own verifier had just denied.
-
-          The fix is ATTRIBUTION, not gating. Hiding this copy when some check fails would require
-          computing "did everything pass" — an aggregate, and the same defect with the opposite
-          sign. So the construction is stated outright and every per-receipt claim is handed to the
-          checks below, which is why this copy is correct in all four verdict states at once. */}
-      <div className={styles.rail}>
-        <p className={styles.panelLabel}>SHARED EVIDENCE RAIL</p>
-        {/* THE OUTCOME LABEL IS A DIRECT READ of one source-of-truth field, and the distinction
-            matters: `trial.outcome === null` says the endpoint computed nothing at all, which is a
-            state this component already renders six panels down as "No outcome record exists for
-            this trial". A fixed "ONE … OUTCOME" here put both sentences on the same page.
-
-            This branch is NOT the aggregate anti-pattern. It reads ONE served field and reports
-            it; it does not synthesise a judgement from eight verdicts, and it is invariant to every
-            one of them. The all-eight-pass pin in the test file is what holds that line, and it is
-            untouched.
-
-            Note `pending` and `UNSCORED` are RECORDS — `outcome !== null` — so they read
-            ONE OUTCOME RECORD. Only the null case is an absence. */}
-        <p className={styles.panelSub} data-testid="rail-summary">
-          ONE SNAPSHOT · ONE DEADLINE · ONE LAW ·{' '}
-          {trial.outcome === null ? 'NO OUTCOME RECORD' : 'ONE OUTCOME RECORD'}
-        </p>
-        <div className={styles.hashChip}>
-          <span className={styles.hashLabel}>⬢ SEALED EVIDENCE</span>
-          {/* The hash renders in full. A truncation the card invented is a value the backend never
-              served, and this chip is the evidence record the trial was published under. */}
-          <code className={styles.hash} data-testid="trial-evidence-hash">{trial.evidenceHash}</code>
-          {/* Was "IDENTICAL FOR EVERY AGENT" — a claim about what each receipt is bound to, which
-              is `manifest`'s finding and not this chip's. This states the record instead. */}
-          <span className={styles.hashLabel}>ONE RECORD · ONE HASH</span>
-        </div>
-        <p className={styles.footNote}>
-          This trial has one sealed evidence payload, one commit deadline and one settlement law.
-          That is the structure of the record, not a finding about any receipt.
-        </p>
-        {/* Was "…and they are what every commitment below is scored against." Two things were
-            wrong with it. The participant set deliberately carries `pending` and `UNSCORED`
-            commitments whose Brier and chosen markout are null — and `UNSCORED` means no score
-            will EVER be produced — so "every commitment is scored" is false on the standard
-            fixture. And the commit deadline is a VALIDITY predicate, not a scoring input: missing
-            it rejects a commitment rather than moving its number. Split accordingly: binding and
-            timing are the checks' business, scoring is the settled outcome's. */}
-        <p className={styles.footNote}>
-          Whether a given commitment actually re-derives against this record — that its body
-          re-hashes, that it binds the trial it names, and that it arrived before the deadline — is
-          not asserted here. The Fair-Play checks below report it per receipt, one independent
-          verdict at a time.
-        </p>
-        <p className={styles.footNote}>
-          A score exists only where a settled outcome does: Brier and chosen markout are derived
-          from the settled outcome under the recorded law. A pending commitment has none yet, and an
-          UNSCORED one never will.
-        </p>
-        <p className={styles.footNote}>
-          t0 {trial.t0Ms} · one commit deadline {trial.commitDeadlineMs}
-        </p>
-      </div>
-
       <SettlementPanel outcome={trial.outcome} t0Ms={trial.t0Ms} />
     </>
   );
@@ -460,7 +413,7 @@ function SettlementPanel({ outcome, t0Ms }: { outcome: TrialOutcome | null; t0Ms
     <div className={styles.settlement} data-testid="settlement-panel" data-status={status}>
       <p className={styles.panelLabel}>SETTLEMENT</p>
       {outcome === null ? <NoOutcomeBody /> : null}
-      {outcome !== null && outcome.status === 'settled' ? <SettledBody o={outcome} /> : null}
+      {outcome !== null && outcome.status === 'settled' ? <SettledBody o={outcome} t0Ms={t0Ms} /> : null}
       {outcome !== null && outcome.status === 'pending' ? <PendingBody o={outcome} t0Ms={t0Ms} /> : null}
       {outcome !== null && outcome.status === 'UNSCORED' ? <UnscoredBody o={outcome} /> : null}
     </div>
@@ -482,7 +435,7 @@ function NoOutcomeBody() {
   );
 }
 
-function SettledBody({ o }: { o: TrialOutcome }) {
+function SettledBody({ o, t0Ms }: { o: TrialOutcome; t0Ms: number }) {
   return (
     <>
       <dl className={styles.grid}>
@@ -499,6 +452,10 @@ function SettledBody({ o }: { o: TrialOutcome }) {
           label="FOLLOW_PROFITABLE"
           // A boolean is not a number: `false` is a recorded verdict and `null` is its absence.
           value={o.followProfitable === null ? DASH : String(o.followProfitable)}
+        />
+        <Field
+          label="SETTLEMENT TARGET T"
+          value={`${t0Ms + TRIAL_SETTLEMENT_HORIZON_MS} · derived from fixed 1h horizon`}
         />
       </dl>
       <p className={styles.official}>OFFICIAL RESULT · {OFFICIAL_COST_BPS} BPS MODELED COSTS</p>
@@ -529,6 +486,7 @@ function PendingBody({ o, t0Ms }: { o: TrialOutcome; t0Ms: number }) {
         <Field label="COMMIT WINDOW" value="CLOSED" />
         <Field label="EVENT-ANCHORED ENTRY" value={String(o.entry)} />
         <Field label="REMAINING HORIZON" value={remaining(target - now)} testId="settlement-countdown" />
+        <Field label="SETTLEMENT TARGET T" value={`${target} · derived from fixed 1h horizon`} />
       </dl>
       <p className={styles.stateBody}>
         The result is not known. No close, markout, or Brier value exists yet. Commit-time checks
@@ -565,20 +523,17 @@ function UnscoredBody({ o }: { o: TrialOutcome }) {
       </p>
       <dl className={styles.grid}>
         <Field label="EVENT-ANCHORED ENTRY" value={String(o.entry)} />
-        {/* Rendered literally as `null` rather than as a dash: on an UNSCORED trial the absence is
-            terminal and recorded, which is a stronger statement than "no value to show". */}
-        <Field label="SETTLEMENT CANDLE CLOSE" value={o.future === null ? 'null' : String(o.future)} />
-        <Field label="CLOSE TIMESTAMP" value={o.closeTsMs === null ? 'null' : String(o.closeTsMs)} />
+        <Field label="SETTLEMENT CANDLE CLOSE" value={num(o.future)} />
+        <Field label="CLOSE TIMESTAMP" value={num(o.closeTsMs)} />
         <Field
           label="OBSERVATION LAG"
-          value={o.observationLagMs === null ? 'null' : `${o.observationLagMs} ms`}
+          value={o.observationLagMs === null ? DASH : `${o.observationLagMs} ms`}
         />
         <Field
           label="FOLLOW / FADE MARKOUT"
-          value={`${o.followMarkoutBps === null ? 'null' : bps(o.followMarkoutBps)} · ${
-            o.fadeMarkoutBps === null ? 'null' : bps(o.fadeMarkoutBps)
-          }`}
+          value={`${bps(o.followMarkoutBps)} · ${bps(o.fadeMarkoutBps)}`}
         />
+        <Field label="TERMINAL ELIGIBILITY" value="T + bar + 600,000 ms grace elapsed" />
       </dl>
       <p className={styles.footNote}>
         The agent commitments and the evidence receipt above are preserved and remain verifiable. No
@@ -608,7 +563,12 @@ function ParticipantsSection({ state }: { state: ParticipantsState }) {
   const attr = state.kind === 'list' ? (state.entries.length === 0 ? 'empty' : 'list') : state.kind;
   return (
     <div className={styles.panel} data-testid="participants-panel" data-state={attr}>
-      <p className={styles.panelLabel}>AGENT DECISIONS</p>
+      <div className={styles.panelHead}>
+        <p className={styles.panelLabel}>AGENT DECISIONS</p>
+        <span className={styles.participantContext} data-testid="participants-context">
+          paid commits · live-only · 300s window
+        </span>
+      </div>
       <p className={styles.panelSub}>one probability per agent · action is derived, never submitted</p>
       <ParticipantsBody state={state} />
     </div>
@@ -681,6 +641,7 @@ function ParticipantsBody({ state }: { state: ParticipantsState }) {
               <thead>
                 <tr>
                   <th className={styles.upper}>AGENT</th>
+                  <th className={styles.upper}>ROLE</th>
                   <th className={`${styles.upper} ${styles.r}`}>p_follow_profitable</th>
                   <th className={styles.upper}>DERIVED ACTION</th>
                   <th className={`${styles.upper} ${styles.r}`}>BRIER</th>
@@ -740,24 +701,58 @@ function ParticipantRow({ entry }: { entry: ParticipantEntry }) {
   const r = entry.receipt;
   return (
     <tr className={styles.row} data-testid="participant-row">
-      <td className="mono" data-testid="participant-payer">{r.payer}</td>
-      <td className={styles.num} data-testid="participant-p">{r.pFollowProfitable.toFixed(2)}</td>
+      <td
+        className="mono"
+        data-testid="participant-payer"
+        data-label="AGENT"
+        aria-label="AGENT"
+      >
+        {r.payer}
+      </td>
+      <td data-testid="participant-role" data-label="ROLE" aria-label="ROLE">
+        external payer
+      </td>
+      <td
+        className={styles.num}
+        data-testid="participant-p"
+        data-label="p_follow_profitable"
+        aria-label="p_follow_profitable"
+      >
+        {r.pFollowProfitable.toFixed(2)}
+      </td>
       {/* RELAYED, NOT RE-DERIVED. The backend derived this action at commit time and recorded it;
           re-deriving the bands here would let a client-side rule silently overrule the record. */}
-      <td data-testid="participant-action">
+      <td data-testid="participant-action" data-label="DERIVED ACTION" aria-label="DERIVED ACTION">
         <span className={styles.actionChip} data-action={r.action}>{r.action}</span>
       </td>
-      <td className={styles.num} data-testid="participant-brier">{brierText(r.brier)}</td>
-      <td className={styles.num} data-testid="participant-markout">{bps(r.chosenMarkoutBps)}</td>
+      <td
+        className={styles.num}
+        data-testid="participant-brier"
+        data-label="BRIER"
+        aria-label="BRIER"
+      >
+        {brierText(r.brier)}
+      </td>
+      <td
+        className={styles.num}
+        data-testid="participant-markout"
+        data-label={`chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`}
+        aria-label={`chosen ${SIGNAL_TRIALS_MARKOUT_LABEL}`}
+      >
+        {bps(r.chosenMarkoutBps)}
+      </td>
       {/* C26 at the participant surface: `pending` and `UNSCORED` rows carry identical null
           metrics, so this cell is the only thing that separates them. */}
-      <td data-testid="participant-status">{r.status}</td>
+      <td data-testid="participant-status" data-label="STATUS" aria-label="STATUS">
+        {r.status}
+      </td>
     </tr>
   );
 }
 
 function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
   const { receipt, checks } = entry;
+  const [descriptionsExpanded, setDescriptionsExpanded] = useState(true);
   const verify = checks.kind === 'ok' ? checks.verify : null;
   // The verify route can serve a receipt whose status disagrees with the one the participant route
   // served. Surfaced rather than silently preferring one: they are two published reads of the same
@@ -766,6 +761,15 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
     verify !== null && verify.receiptStatus !== null && verify.receiptStatus !== receipt.status
       ? verify.receiptStatus
       : null;
+  const tally = verify === null
+    ? null
+    : (['pass', 'pending', 'fail', null] as const)
+      .map((status) => {
+        const count = verify.checks.filter((check) => check.status === status).length;
+        return count === 0 ? null : `${count} ${status === null ? 'not served' : status}`;
+      })
+      .filter((part): part is string => part !== null)
+      .join(' · ');
 
   return (
     <div
@@ -776,7 +780,21 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
       // yet" from "settled UNSCORED and never will be". Only the receipt status does.
       data-receipt-status={receipt.status}
     >
-      <p className={styles.panelLabel}>FAIR-PLAY CHECKS · {receipt.payer}</p>
+      <div className={styles.panelHead}>
+        <p className={styles.panelLabel}>FAIR-PLAY CHECKS · {receipt.payer}</p>
+        {verify === null ? null : (
+          <button
+            type="button"
+            className={styles.checkToggle}
+            aria-expanded={descriptionsExpanded}
+            onClick={() => setDescriptionsExpanded((expanded) => !expanded)}
+          >
+            {descriptionsExpanded
+              ? 'Collapse Fair-Play check descriptions'
+              : 'Expand Fair-Play check descriptions'}
+          </button>
+        )}
+      </div>
       {/* Was "was this benchmark produced correctly?". Interrogative, so it asserted nothing — but
           it puts the aggregate phrasing on screen beside eight independent verdicts, and a reader
           skimming a screenshot does not parse a question mark. Scoped to this receipt instead. */}
@@ -804,30 +822,50 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
 
       {verify !== null ? (
         <>
+          <div className={styles.checkTierHead}>
+            <span>COMMIT-TIME</span>
+            <span>OUTCOME-TIME</span>
+            <strong data-testid="fairplay-tally">{tally}</strong>
+          </div>
           <ul className={styles.checkList}>
             {/* The frozen eight, always in the frozen order, always driven off the SINGLE exported
                 constant (CF-5). The adapter already guarantees length 8 and the order; iterating
                 its output rather than a local list is what keeps a second spelling out of the
                 tree. */}
-            {verify.checks.map((c) => (
-              <li
-                key={c.key}
-                className={styles.checkRow}
-                data-testid="check-row"
-                data-key={c.key}
-                data-phase={c.phase}
-                // `null` means the backend did not serve this key. It is NOT the verdict
-                // `pending`, which the verifier would then never have made.
-                data-status={c.status === null ? 'not_served' : c.status}
-              >
-                <code className={styles.checkKey}>{c.key}</code>
-                <span className={styles.checkPhase}>{c.phase}-time</span>
-                <span className={styles.checkDesc}>{CHECK_DESCRIPTION[c.key as FrozenCheckKey]}</span>
-                <span className={styles.checkStatus} data-status={c.status === null ? 'not_served' : c.status}>
-                  {c.status === null ? 'not served' : c.status.toUpperCase()}
-                </span>
-              </li>
-            ))}
+            {verify.checks.map((c) => {
+              const status = c.status === null ? 'not_served' : c.status;
+              const presentation = CHECK_STATUS_PRESENTATION[status];
+              return (
+                <li
+                  key={c.key}
+                  className={styles.checkRow}
+                  data-testid="check-row"
+                  data-key={c.key}
+                  data-phase={c.phase}
+                  // `null` means the backend did not serve this key. It is NOT the verdict
+                  // `pending`, which the verifier would then never have made.
+                  data-status={status}
+                >
+                  <code className={styles.checkKey}>{c.key}</code>
+                  <span className={styles.checkPhase}>{c.phase}-time</span>
+                  {descriptionsExpanded ? (
+                    <span className={styles.checkDesc} data-testid="check-description">
+                      {CHECK_DESCRIPTION[c.key as FrozenCheckKey]}
+                    </span>
+                  ) : null}
+                  <span
+                    className={styles.checkStatus}
+                    data-status={status}
+                    data-testid="check-status"
+                  >
+                    <span aria-hidden="true" data-testid="check-status-glyph">
+                      {presentation.glyph}
+                    </span>{' '}
+                    {presentation.word}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
           {verify.unexpectedKeys.length > 0 ? (
             // CF-5 drift is invisible precisely because the keys are unconstrained `str`, so a
@@ -836,6 +874,10 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
               keys served outside the frozen eight: {verify.unexpectedKeys.join(', ')}
             </p>
           ) : null}
+          <p className={styles.footNote}>
+            Every check reports independently as pass / fail / pending. There is no single
+            aggregate verified badge for this receipt.
+          </p>
           {disagreement !== null ? (
             <p className={styles.stateSub}>
               the verify route reports status {disagreement} for this receipt, which differs from
@@ -853,23 +895,31 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
 // ---------------------------------------------------------------------------
 
 function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
-  const settled = outcome !== null && outcome.status === 'settled';
-  const rows = useMemo(
-    () => COST_SWEEP_BPS.map((cost) => ({ cost, official: cost === OFFICIAL_COST_BPS })),
-    [],
-  );
+  const followOfficial = outcome?.status === 'settled' ? outcome.followMarkoutBps : null;
+  const fadeOfficial = outcome?.status === 'settled' ? outcome.fadeMarkoutBps : null;
+  const settled = followOfficial !== null && fadeOfficial !== null;
+  const gross = followOfficial === null ? null : followOfficial + OFFICIAL_COST_BPS;
+  const rows = COST_SWEEP_BPS.map((cost) => ({
+    cost,
+    official: cost === OFFICIAL_COST_BPS,
+    follow: cost === OFFICIAL_COST_BPS || gross === null ? followOfficial : gross - cost,
+    fade: cost === OFFICIAL_COST_BPS || gross === null ? fadeOfficial : -gross - cost,
+  }));
+  const officialFormulaFade = gross === null ? null : -gross - OFFICIAL_COST_BPS;
+  const officialPairIsInconsistent = settled
+    && officialFormulaFade !== null
+    && Math.abs(fadeOfficial - officialFormulaFade) > 1e-9;
 
   return (
-    <div className={styles.panel} data-testid="markout-table">
-      <p className={styles.panelLabel}>
-        COST SENSITIVITY · <span className={styles.frozenLabel}>{SIGNAL_TRIALS_MARKOUT_LABEL}</span>
-      </p>
-      <p className={styles.panelSub}>official rank basis: {OFFICIAL_COST_BPS} bps modeled costs</p>
-      {/* VERBATIM. The DOM carries the task packet's exact spelling; `.verbatimUpper` supplies the
-          design handoff's uppercase presentation. Same resolution as the UNSCORED title above. */}
-      <p className={`${styles.tag} ${styles.verbatimUpper}`} data-testid="markout-diagnostic-tag">
-        diagnostic — does not change ranking
-      </p>
+    <details className={`${styles.panel} ${styles.disclosure}`} open={settled} data-testid="markout-table">
+      <summary className={styles.disclosureSummary}>
+        <span className={styles.panelLabel}>
+          COST SENSITIVITY · <span className={styles.frozenLabel}>{SIGNAL_TRIALS_MARKOUT_LABEL}</span>
+        </span>
+        <span className={styles.disclosureState}>
+          {settled ? 'SETTLED EVIDENCE · SWEEP AVAILABLE' : 'NO SETTLED MARKOUT · NO SWEEP'}
+        </span>
+      </summary>
 
       {!settled ? (
         <p className={styles.stateBody}>
@@ -878,6 +928,12 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
         </p>
       ) : (
         <>
+          <p className={styles.panelSub}>official rank basis: {OFFICIAL_COST_BPS} bps modeled costs</p>
+          {/* VERBATIM. The DOM carries the task packet's exact spelling; `.verbatimUpper` supplies
+              the design handoff's uppercase presentation. Same resolution as UNSCORED above. */}
+          <p className={`${styles.tag} ${styles.verbatimUpper}`} data-testid="markout-diagnostic-tag">
+            diagnostic — does not change ranking
+          </p>
           <div className={styles.tableWrap}>
             <table className={styles.table}>
               <thead>
@@ -889,7 +945,7 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                 </tr>
               </thead>
               <tbody>
-                {rows.map(({ cost, official }) => (
+                {rows.map(({ cost, official, follow, fade }) => (
                   <tr
                     key={cost}
                     className={styles.row}
@@ -897,28 +953,48 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
                     data-cost-bps={cost}
                     data-basis={official ? 'official' : 'diagnostic'}
                   >
-                    <td className={styles.num}>{cost} bps</td>
-                    {/* ONLY the official row has served values. The other three rows are declared
-                        by the published sweep and are NOT carried by the frozen wire, so they
-                        render as not served. Computing them from the 25 bps pair would be this
-                        client recomputing the settlement law — see the note below the table. */}
-                    <td className={styles.num} data-testid="markout-follow">
-                      {official ? bps(outcome.followMarkoutBps) : DASH}
+                    <td
+                      className={styles.num}
+                      data-label="DECLARED COST"
+                      aria-label="DECLARED COST"
+                    >
+                      {cost} bps
                     </td>
-                    <td className={styles.num} data-testid="markout-fade">
-                      {official ? bps(outcome.fadeMarkoutBps) : DASH}
+                    <td
+                      className={styles.num}
+                      data-testid="markout-follow"
+                      data-label="FOLLOW MARKOUT (BPS)"
+                      aria-label="FOLLOW MARKOUT (BPS)"
+                    >
+                      {bps(follow)}
                     </td>
-                    <td>{official ? 'official rank basis' : 'diagnostic'}</td>
+                    <td
+                      className={styles.num}
+                      data-testid="markout-fade"
+                      data-label="FADE MARKOUT (BPS)"
+                      aria-label="FADE MARKOUT (BPS)"
+                    >
+                      {bps(fade)}
+                    </td>
+                    <td data-label="BASIS" aria-label="BASIS">
+                      {official ? 'official rank basis' : 'diagnostic'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          {officialPairIsInconsistent ? (
+            <p className={styles.fence} data-testid="markout-formula-warning">
+              The served 25 bps pair is inconsistent with the declared diagnostic formula. The
+              official values remain displayed verbatim.
+            </p>
+          ) : null}
           <p className={styles.footNote}>
-            The {OFFICIAL_COST_BPS} bps row is the only basis the season ranks on. The 0, 10 and 50
-            bps rows are declared by the published sweep, but the trial endpoint serves a single
-            markout pair — the official basis — so no value is shown for them. This card does not
-            compute markouts.
+            The {OFFICIAL_COST_BPS} bps row is the only basis the season ranks on and is displayed
+            from the served official pair. The 0, 10 and 50 bps rows are diagnostic presentation
+            derivations from gross = served FOLLOW + {OFFICIAL_COST_BPS}; they do not alter the
+            official evidence.
           </p>
           <p className={styles.footNote}>
             The sweep exists to answer one question: does the ordering survive the cost assumption?
@@ -926,6 +1002,6 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
           </p>
         </>
       )}
-    </div>
+    </details>
   );
 }

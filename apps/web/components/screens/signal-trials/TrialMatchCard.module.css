@@ -1,6 +1,8 @@
 /* Layout idioms are lifted from SeasonScreen.module.css (same table/panel language, same design
    tokens) rather than imported from it — that file belongs to H5.2 and must not be modified. */
 .screen { display: flex; flex-direction: column; gap: var(--space-3); }
+.trialComposition { display: grid; gap: var(--space-3); min-width: 0; }
+.trialPrimary, .trialSecondary { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
 
 .panel {
   display: flex; flex-direction: column; gap: var(--space-2);
@@ -19,7 +21,10 @@
 .head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
 .headText { display: flex; flex-direction: column; gap: 4px; min-width: 240px; }
 .headChips { display: flex; gap: 6px; flex-wrap: wrap; }
-.title { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; font-family: var(--font-mono), monospace; }
+.title {
+  margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -0.01em;
+  font-family: var(--font-mono), monospace; overflow-wrap: anywhere;
+}
 .lead { margin: 0; font-size: 11px; color: var(--text-2); max-width: 62ch; }
 
 .back {
@@ -70,8 +75,31 @@
 .settlement[data-status='UNSCORED'] { border-color: var(--warning); }
 .settlement[data-status='none'] { border-style: dashed; }
 
+/* THE TWO REGISTERS, AND WHY THEY CARRY DIFFERENT TOKENS. These two rules sit adjacent on purpose:
+   they are the classification PROOFARENA-OKX-DELTA-HANDOFF §12:302-304 draws, and the difference
+   between them is not taste.
+
+   `.panelLabel` KEEPS `--text-3`. Mono, letter-spaced, and every string it renders is a short
+   uppercase panel heading — SHARED EVIDENCE RAIL, SETTLEMENT, AGENT DECISIONS, FAIR-PLAY CHECKS,
+   COST SENSITIVITY. That is precisely what §12:304 reserves the token FOR ("short uppercase mono
+   labels and timestamps"), so brightening it would erase the register distinction between a heading
+   and the prose under it.
+
+   `.panelSub` moves to `--text-2`. Sans, NOT letter-spaced, and it renders the explanatory line
+   under each of those headings — including "does this receipt's record re-derive? · receipt status
+   …" with its two trailing clauses. It fails every criterion §12:302 attaches to the reserved
+   tokens. 3.18:1 on `--panel-2` and 3.29:1 on `--panel` → 6.97:1 and 7.20:1.
+
+   prose-contrast.test.ts asserts BOTH directions, so a change to either rule fails on its own. */
 .panelLabel { margin: 0; font-family: var(--font-mono), monospace; font-size: 10px; letter-spacing: 0.1em; color: var(--text-3); }
-.panelSub { margin: 0; font-size: 10px; color: var(--text-3); }
+.panelSub { margin: 0; font-size: 10px; color: var(--text-2); }
+.panelHead {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.participantContext {
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
 
 .hashChip { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .hashLabel { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em; color: var(--text-3); }
@@ -88,8 +116,22 @@
 
 .stateTitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-1); }
 .stateBody { margin: 0; font-size: 12px; color: var(--text-2); max-width: 78ch; }
-.stateSub { margin: 0; font-size: 10px; color: var(--text-3); font-family: var(--font-mono), monospace; }
-.footNote { margin: 0; font-size: 10px; color: var(--text-3); max-width: 88ch; }
+/* Both on `--text-2` per §12:302, which names "empty/error bodies" and "footnotes" verbatim.
+
+   `.stateSub` carries this route's single most honesty-critical string — the pending-settlement
+   disclosure that the settlement target is DERIVED from the published law and not served by the
+   endpoint (TrialMatchCard.tsx:550, three sentences) — plus "404 is not a transport failure — retry
+   is not offered." It also carries two `LOADING …` lines and a raw error code; those move with it for
+   the reason given on `.panelSub` above, and brightening the line that tells a judge the skeleton
+   below it stands for nothing is the right direction for it anyway.
+
+   `.footNote` is `max-width: 88ch` of multi-sentence prose throughout — the paper-markout
+   qualifier, the no-aggregate-badge rule, the re-derivation scoping.
+
+   3.18:1 on `--panel-2` (`.rail` / `.checks` / `.settlement`) and 3.29:1 on `--panel` → 6.97:1 and
+   7.20:1. */
+.stateSub { margin: 0; font-size: 10px; color: var(--text-2); font-family: var(--font-mono), monospace; }
+.footNote { margin: 0; font-size: 10px; color: var(--text-2); max-width: 88ch; }
 
 .errorDetail {
   margin: 0; padding: var(--space-2); overflow-x: auto; white-space: pre-wrap;
@@ -101,6 +143,10 @@
 .table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
 .table th { text-align: left; padding: 9px; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); white-space: nowrap; }
 .table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); white-space: nowrap; }
+.table td::before {
+  content: attr(data-label); display: none; margin-bottom: 2px;
+  color: var(--text-3); font-size: 9px; letter-spacing: .06em; text-transform: uppercase;
+}
 .row:hover { background: var(--panel-2); }
 .r { text-align: right; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -114,12 +160,35 @@
 .verbatimUpper { text-transform: uppercase; }
 .frozenLabel { text-transform: none; }
 
+/* THE DIAGNOSTIC TAG, and the one case in this file classified AGAINST its own typography. Its single
+   call site renders `diagnostic — does not change ranking` (TrialMatchCard.tsx:879), and
+   `.verbatimUpper` presents it uppercase — so by FORM it satisfies the reservation. It moves on
+   CONTENT: that string is the line that stops a judge reading the cost sweep as a ranking, which puts
+   it in the class §12:302 calls "the product-boundary disclaimer" and §12:304 calls
+   "honesty-critical disclaimers". The reservation is a floor for the protected class, not a ceiling
+   for the permitted one, so a string that is both may be brightened and a disclaimer must be.
+   3.29:1 → 7.20:1 on the `--panel` this pill sets on itself.
+   SEPARATELY, AND NOT DONE HERE: handoff §3:38 puts the diagnostic tag in the warning amber family
+   rather than on a text token at all. That is a colour-fidelity delta outside this change's mandate;
+   it is recorded rather than taken silently, because amber would also change what the tag competes
+   with (`.fence`, the exploratory banner). */
 .tag {
   margin: 0; align-self: flex-start; padding: 3px 8px;
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.08em;
   border: 1px solid var(--border); border-radius: var(--radius-badge);
-  color: var(--text-3); background: var(--panel);
+  color: var(--text-2); background: var(--panel);
 }
+
+.disclosure { display: block; }
+.disclosureSummary {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2);
+  cursor: pointer; list-style: none;
+}
+.disclosureSummary::-webkit-details-marker { display: none; }
+.disclosureState {
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
+.disclosure[open] > .disclosureSummary { margin-bottom: 6px; }
 
 .actionChip {
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
@@ -136,6 +205,11 @@
 .checks[data-checks-state='not_found'] { border-style: dashed; }
 
 .checkList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.checkTierHead {
+  display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; padding: 7px 0;
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
+.checkTierHead strong { color: var(--accent-hi); text-align: right; }
 .checkRow {
   display: grid; grid-template-columns: minmax(130px, auto) 88px 1fr auto;
   gap: var(--space-2); align-items: baseline;
@@ -143,7 +217,12 @@
 }
 .checkKey { font-family: var(--font-mono), monospace; font-size: 10px; color: var(--text-1); }
 .checkPhase { font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); }
-.checkDesc { font-size: 10px; color: var(--text-3); }
+/* §12:302 names "check descriptions" verbatim AND cites Direction A's own `Veridex.dc.html`
+   proof-check description rows as the precedent — "for exactly this class of copy". These are the
+   eight CHECK_DESCRIPTION sentences, sans and not letter-spaced; the 9px letter-spaced
+   `.checkPhase` tag beside them is the micro-label in this row and keeps `--text-3`. 3.18:1 →
+   6.97:1 on `--panel-2`. */
+.checkDesc { font-size: 10px; color: var(--text-2); }
 .checkStatus {
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
   padding: 2px 6px; border-radius: var(--radius-badge);
@@ -153,10 +232,34 @@
 .checkStatus[data-status='fail'] { border-color: var(--negative); color: var(--negative); }
 .checkStatus[data-status='pending'] { border-color: var(--warning); color: var(--warning); }
 /* `not served` is the ABSENCE of a verdict, not a verdict. It is styled as neither a pass nor a
-   pending so it can never be read as one the verifier actually made. */
-.checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-3); }
+   pending so it can never be read as one the verifier actually made. WHAT CARRIES THAT, measured
+   rather than assumed: the neutral HUE against three coloured verdicts (pass `--accent-hi`, fail
+   `--negative`, pending `--warning` — named by token because PAT-001 makes styles/tokens.css the only
+   file allowed to spell a hex, comments included), plus the lowercase spelling in a family where
+   every real verdict is uppercase. NOT the dashed border — it is `--border` at 1.14:1 on `--panel-2`,
+   which is very nearly invisible. Both of the signals that do the work are unaffected by the colour
+   token, which is why this could move at all: it goes from a dark neutral to a lighter neutral and
+   stays neutral.
+   IT MOVED, and it is the one member of this pill family that does. Every real verdict here is
+   `c.status.toUpperCase()` — PASS / FAIL / PENDING, uppercase micro-labels on the reserved token's
+   own terms. This variant instead renders the lowercase AUTHORED string `not served`
+   (TrialMatchCard.tsx:836), invented for the case where the backend served no key at all. That is the
+   same copy class as SeasonScreen's `.notQualified`: an absence disclosure, not a data code and not a
+   label, so §12:302 reaches it where it does not reach the 9px lowercase `.checkPhase` tag beside it
+   (`commit-time` IS a data code — `phase: 'commit' | 'outcome'`, lib/contracts.ts:599). 3.18:1 →
+   6.97:1 on the `--panel-2` of the `.checks` box these rows sit in. */
+.checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-2); }
+.checkToggle {
+  padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-control);
+  background: var(--panel); color: var(--accent-hi); cursor: pointer;
+  font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .04em;
+}
 
 .retry {
+  /* An explicit flex box rather than the <button> UA default: the narrow breakpoint below gives this
+     control a 44px minimum that its 10px label does not fill, and centring must not depend on how a
+     UA happens to align button content. Kept identical to SeasonScreen.module.css `.retry`. */
+  display: inline-flex; align-items: center; justify-content: center;
   align-self: flex-start; font-family: var(--font-mono), monospace; font-size: 10px;
   letter-spacing: 0.06em; padding: 5px 10px; border-radius: var(--radius-control);
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text-1); cursor: pointer;
@@ -165,7 +268,35 @@
 
 .skeletonRow { height: 11px; border-radius: 3px; background: var(--panel-2); }
 
+/* Narrow (handoff §7: "at ≤ 760px … every tap target is ≥ 44px"). This stylesheet had no 760px
+   block — its only breakpoint was the 640px grid reflow below — so the tap-target rule gets its own
+   at the breakpoint the handoff actually names. Reusing 640px because it was already here would
+   leave this control undersized from 641px to 760px, and would put it at a different size from the
+   byte-identical retry on /trials, which is fixed at 760px. */
+@media (max-width: 760px) {
+  .back { display: inline-flex; align-items: center; min-height: 44px; }
+  .retry { min-height: 44px; }
+  .checkToggle { min-height: 44px; }
+  .disclosureSummary { min-height: 44px; align-items: center; }
+  .tableWrap { overflow: visible; }
+  .table, .table tbody { display: block; width: 100%; }
+  .table thead { display: none; }
+  .table tr { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 10px; border-bottom: 1px solid var(--border); }
+  .table td { display: block; padding: 2px; white-space: normal; overflow-wrap: anywhere; }
+  .table td::before { display: block; }
+  .checkTierHead { grid-template-columns: 1fr 1fr; }
+  .checkTierHead strong { grid-column: 1 / -1; text-align: left; }
+}
+
 @media (max-width: 640px) {
   .checkRow { grid-template-columns: 1fr auto; }
   .checkPhase, .checkDesc { grid-column: 1 / -1; }
+}
+
+@media (min-width: 900px) and (max-width: 1180px) {
+  .trialComposition { grid-template-columns: 1fr; }
+}
+
+@media (min-width: 1181px) {
+  .trialComposition { grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr); }
 }
