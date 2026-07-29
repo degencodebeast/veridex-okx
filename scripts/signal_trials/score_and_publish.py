@@ -34,7 +34,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from veridex.signal_trials.pack import load_pack, read_pack_ref
+from veridex.signal_trials.pack import PackRef, load_pack
 from veridex.signal_trials.published import read_state, write_season, write_state
 from veridex.signal_trials.scoring import SeasonResult, score_season, season_document
 
@@ -59,10 +59,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="The signal-trials data directory holding the published-season repository.",
     )
+    parser.add_argument(
+        "--expected-content-hash",
+        default=None,
+        help="The exact sealed-pack content hash approved by the named human.",
+    )
     return parser.parse_args(argv)
 
 
-def publish_season(data_dir: Path | str, season: SeasonResult) -> None:
+def publish_season(
+    data_dir: Path | str,
+    season: SeasonResult,
+    approved_pack_content_hash: str,
+) -> None:
     """Publish ``season`` to the repository the router serves.
 
     The payload is written BEFORE the state that advertises it. That order is not stylistic: writes
@@ -73,6 +82,8 @@ def publish_season(data_dir: Path | str, season: SeasonResult) -> None:
     Args:
         data_dir: The signal-trials data directory (created on demand).
         season: The scored season.
+        approved_pack_content_hash: The verified human-approved pack hash retained in local state
+            provenance. It is not added to the public season payload.
     """
     write_season(data_dir, season_document(season))
     write_state(
@@ -83,6 +94,7 @@ def publish_season(data_dir: Path | str, season: SeasonResult) -> None:
             "sample_size": season.sample_size,
             "row_count": len(season.rows),
             "qualified_rows": sum(1 for row in season.rows if row.qualified),
+            "approved_pack_content_hash": approved_pack_content_hash,
         },
     )
 
@@ -100,14 +112,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
+    if not args.expected_content_hash:
+        print(
+            "scoring REFUSED: --expected-content-hash is required before a pack may be scored",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
-        season = score_season(load_pack(read_pack_ref(args.pack_dir)))
+        approved_ref = PackRef(
+            dir=args.pack_dir,
+            content_hash=str(args.expected_content_hash),
+        )
+        season = score_season(load_pack(approved_ref))
     except Exception as exc:  # noqa: BLE001 - every failure must be reported, not just the known ones
         print(f"scoring FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
         print("nothing was published; the previous published state is unchanged", file=sys.stderr)
         return 1
 
-    publish_season(args.data_dir, season)
+    publish_season(args.data_dir, season, approved_ref.content_hash)
     qualified = sum(1 for row in season.rows if row.qualified)
     print(
         f"published season {season.season_id!r} status={season.season_status!r} "

@@ -88,7 +88,7 @@ from veridex.signal_trials.okx_client import (
 )
 from veridex.signal_trials.preflight import FROZEN_HORIZON_MS
 from veridex.signal_trials.published import read_season
-from veridex.signal_trials.receipts import TERMINAL_STATUSES, ReceiptStore
+from veridex.signal_trials.receipts import TERMINAL_STATUSES, CommitRecord, ReceiptStore, TrialOutcome
 
 #: Where the live-trial repository lives under the data dir. Must match ``open_live_trial.py`` and
 #: ``veridex/api/server.py`` — the store is the data dir itself, the trials sit one level down —
@@ -341,6 +341,72 @@ def _eligible(
     return eligible
 
 
+def _terminal_reconciliation_candidates(
+    trials: Sequence[LiveTrial],
+    store: ReceiptStore,
+    *,
+    trial_id: str | None,
+) -> list[tuple[LiveTrial, TrialOutcome, tuple[CommitRecord, ...]]]:
+    """Return terminal trials whose finalized commitments lack participant settlements.
+
+    This is intentionally separate from :func:`_eligible`: terminal trials must never return to
+    the candle-fetch/settlement-law path, but a crash after the outcome write must not strand the
+    participant artifact forever.  Only immutable finalized commitments are considered, and an
+    existing settlement is excluded before the write-once store is called.
+    """
+    selected = [trial for trial in trials if trial_id is None or trial.trial_id == trial_id]
+    finalized = store.finalized()
+    candidates: list[tuple[LiveTrial, TrialOutcome, tuple[CommitRecord, ...]]] = []
+    for trial in selected:
+        outcome = store.outcome(trial.trial_id)
+        if outcome is None or outcome.status not in TERMINAL_STATUSES:
+            continue
+        missing = tuple(
+            commit
+            for commit in finalized
+            if commit.trial_id == trial.trial_id and store.settlement(commit.receipt_id) is None
+        )
+        if missing:
+            candidates.append((trial, outcome, missing))
+    return candidates
+
+
+def _reconcile_terminal(
+    trial: LiveTrial,
+    outcome: TrialOutcome,
+    missing: Sequence[CommitRecord],
+    store: ReceiptStore,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Record only missing participant settlements for an already-terminal outcome.
+
+    No candle series enters this function and the outcome writer is never called.  A second
+    settlement-presence check immediately before each live write keeps an already-reconciled row
+    out of the write-once store even if another invocation completed it after candidate discovery.
+    """
+    summary: dict[str, Any] = {
+        "trial_id": trial.trial_id,
+        "status": outcome.status,
+        "candles_fetched": 0,
+        "observation_lag_ms": outcome.observation_lag_ms,
+        "follow_markout_bps": outcome.follow_markout_bps,
+        "recorded": False,
+        "settlements_recorded": 0,
+        "settlements_missing": len(missing),
+        "reconciliation": "would_record" if args.dry_run else "recorded",
+    }
+    if args.dry_run:
+        return summary
+
+    for commit in missing:
+        if store.settlement(commit.receipt_id) is not None:
+            continue
+        store.record_settlement(settle_commit(commit, outcome))
+        summary["settlements_recorded"] += 1
+    summary["recorded"] = summary["settlements_recorded"] > 0
+    return summary
+
+
 async def _settle_all(
     trials: Sequence[LiveTrial],
     store: ReceiptStore,
@@ -505,8 +571,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     secrets = [creds.api_key, creds.secret_key, creds.passphrase]
     try:
-        eligible = _eligible(repository.all_trials(), store, now_ms=now_ms, trial_id=args.trial_id)
-        results = asyncio.run(_settle_all(eligible, store, creds, args, now_ms=now_ms))
+        trials = repository.all_trials()
+        terminal_repairs = _terminal_reconciliation_candidates(trials, store, trial_id=args.trial_id)
+        eligible = _eligible(trials, store, now_ms=now_ms, trial_id=args.trial_id)
+        results = [
+            _reconcile_terminal(trial, outcome, missing, store, args) for trial, outcome, missing in terminal_repairs
+        ]
+        if eligible:
+            results.extend(asyncio.run(_settle_all(eligible, store, creds, args, now_ms=now_ms)))
         payers = sorted({commit.payer for commit in store.finalized()})
         records = [build_agent_record(payer, store).model_dump() for payer in payers]
     except Exception as error:  # noqa: BLE001 - every failure must be reported redacted, not just known ones
@@ -522,7 +594,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # authority rather than leaving a reader to trust that one was consulted.
                 "season_selection": dict(selection),
                 "dry_run": args.dry_run,
-                "eligible": len(eligible),
+                "eligible": len(results),
                 "trials": results,
                 "agent_records": records,
             },

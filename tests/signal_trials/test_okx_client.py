@@ -1,16 +1,26 @@
 import ast
 import asyncio
+import base64
 import contextlib
+import copy
 import functools
+import gc
+import hashlib
+import hmac
 import inspect
 import io
 import json
 import math
+import pickle
 import subprocess
 import sys
+import threading
 import time
+import uuid
+import weakref
 from importlib import util as importlib_util
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -43,7 +53,418 @@ from veridex.signal_trials.okx_client import (
 class RecordingFake:
     def __init__(self, payload): self.payload, self.calls = payload, []
     async def request(self, method, path, *, params, json_body, headers):
-        self.calls.append((method, path, params, json_body, headers)); return self.payload
+        self.calls.append((method, path, params, json_body, headers))
+        return self.payload
+
+
+async def test_signal_list_serializes_all_six_filters_as_strings_and_signs_the_transmitted_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v6 Signal List declares every request parameter String, including four app-level ints."""
+
+    class ByteRecordingTransport(RecordingFake):
+        transmitted_body: bytes | None = None
+
+        async def request(self, method, path, *, params, json_body, headers):
+            self.transmitted_body = json.dumps(json_body, separators=(",", ":")).encode()
+            return await super().request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                headers=headers,
+            )
+
+    fixed_timestamp = "2026-07-29T00:00:00.000Z"
+    monkeypatch.setattr(okx_client, "_timestamp", lambda: fixed_timestamp)
+    filters = SignalFilters(
+        chain_index="196",
+        wallet_type="1",
+        min_address_count=7,
+        min_amount_usd=1234,
+        min_market_cap_usd=567_890,
+        min_liquidity_usd=23_456,
+    )
+    # The wire conversion belongs at the client boundary; application threshold types remain ints.
+    assert isinstance(filters.min_address_count, int)
+    assert isinstance(filters.min_amount_usd, int)
+    assert isinstance(filters.min_market_cap_usd, int)
+    assert isinstance(filters.min_liquidity_usd, int)
+
+    transport = ByteRecordingTransport({"code": "0", "data": []})
+    creds = OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel")
+    await OKXMarketClient(transport, creds).list_signals(filters)
+
+    expected_body = (
+        b'[{"chainIndex":"196","walletType":"1","minAddressCount":"7",'
+        b'"minAmountUsd":"1234","minMarketCapUsd":"567890","minLiquidityUsd":"23456"}]'
+    )
+    assert transport.transmitted_body == expected_body
+
+    assert len(transport.calls) == 1
+    headers = transport.calls[0][4]
+    prehash = fixed_timestamp.encode() + b"POST" + b"/api/v6/dex/market/signal/list" + expected_body
+    expected_signature = base64.b64encode(
+        hmac.new(b"secret-sentinel", prehash, hashlib.sha256).digest()
+    ).decode()
+    assert headers["OK-ACCESS-SIGN"] == expected_signature
+
+
+async def test_signal_list_hmac_covers_the_exact_utf8_bytes_emitted_by_real_httpx_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ASCII accepted cursor must not make signed JSON differ from real httpx request bytes."""
+    import httpx
+
+    fixed_timestamp = "2026-07-29T00:00:00.000Z"
+    monkeypatch.setattr(okx_client, "_timestamp", lambda: fixed_timestamp)
+    captured: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"code": "0", "data": []})
+
+    seam_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    )
+    spec = importlib_util.spec_from_file_location("real_run_preflight_http_seam", seam_path)
+    assert spec is not None and spec.loader is not None
+    seam = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(seam)
+
+    creds = OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel")
+    async with httpx.AsyncClient(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http:
+        client = OKXMarketClient(seam.HttpxTransport(http), creds)
+        await client.list_signals(SignalFilters(chain_index="196"), cursor="café")
+
+    assert len(captured) == 1
+    request = captured[0]
+    expected_body = (
+        b'[{"chainIndex":"196","walletType":"1","minAddressCount":"2",'
+        b'"minAmountUsd":"1000","minMarketCapUsd":"100000","minLiquidityUsd":"20000",'
+        b'"cursor":"caf\xc3\xa9"}]'
+    )
+    assert request.content == expected_body
+    prehash = fixed_timestamp.encode() + b"POST" + b"/api/v6/dex/market/signal/list" + request.content
+    expected_signature = base64.b64encode(
+        hmac.new(b"secret-sentinel", prehash, hashlib.sha256).digest()
+    ).decode()
+    assert request.headers["OK-ACCESS-SIGN"] == expected_signature
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _SecretReadRecorder:
+    """Per-credential counter shared by copies and in-process reconstructions."""
+
+    def __init__(self, identity: str | None = None, reads: int = 0) -> None:
+        self._identity = identity or uuid.uuid4().hex
+        self._reads = reads
+        self._lock = threading.Lock()
+        with _SECRET_READ_RECORDERS_LOCK:
+            if self._identity in _SECRET_READ_RECORDERS:
+                raise RuntimeError("secret-read recorder identity collision")
+            _SECRET_READ_RECORDERS[self._identity] = self
+
+    @property
+    def reads(self) -> int:
+        with self._lock:
+            return self._reads
+
+    def record_read(self) -> None:
+        with self._lock:
+            self._reads += 1
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_SecretReadRecorder":
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(
+        self,
+    ) -> tuple[object, tuple[str, int]]:
+        return (_restore_secret_read_recorder, (self._identity, self.reads))
+
+
+_SECRET_READ_RECORDERS: weakref.WeakValueDictionary[str, _SecretReadRecorder] = (
+    weakref.WeakValueDictionary()
+)
+_SECRET_READ_RECORDERS_LOCK = threading.RLock()
+
+
+def _restore_secret_read_recorder(
+    identity: str,
+    reads: int,
+) -> _SecretReadRecorder:
+    with _SECRET_READ_RECORDERS_LOCK:
+        recorder = _SECRET_READ_RECORDERS.get(identity)
+        if recorder is not None:
+            return recorder
+        return _SecretReadRecorder(identity, reads)
+
+
+class _CountingCredentials:
+    """Structural credential double that records access to the configured signing secret."""
+
+    api_key = "NONSECRET-API-KEY"
+    passphrase = "NONSECRET-PASSPHRASE"
+    base_url = "https://example.invalid"
+    configured_secret = "SIGNER-KEY-MATERIAL-SENTINEL"
+
+    def __init__(self) -> None:
+        self._secret_reads = _SecretReadRecorder()
+
+    @property
+    def secret_key_reads(self) -> int:
+        return self._secret_reads.reads
+
+    @property
+    def secret_key(self) -> str:
+        self._secret_reads.record_read()
+        return self.configured_secret
+
+
+def test_credential_secret_read_recorder_is_shared_across_shallow_and_deep_copies() -> None:
+    credentials = _CountingCredentials()
+    shallow = copy.copy(credentials)
+    deep = copy.deepcopy(credentials)
+
+    assert credentials.secret_key_reads == 0
+    assert shallow.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 1
+    assert deep.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 2
+
+
+def test_credential_secret_read_recorder_is_shared_across_pickle_reconstruction_and_isolated_between_credentials() -> None:
+    credentials = _CountingCredentials()
+    separate = _CountingCredentials()
+    reconstructed = pickle.loads(
+        pickle.dumps(credentials, protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    mixed_nested = pickle.loads(
+        pickle.dumps(
+            {"credentials": [copy.deepcopy(copy.copy(credentials))]},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )["credentials"][0]
+
+    assert reconstructed._secret_reads is credentials._secret_reads
+    assert mixed_nested._secret_reads is credentials._secret_reads
+    assert separate._secret_reads is not credentials._secret_reads
+    assert reconstructed.secret_key == credentials.configured_secret
+    assert mixed_nested.secret_key == credentials.configured_secret
+    assert credentials.secret_key_reads == 2
+    assert separate.secret_key_reads == 0
+
+
+def test_credential_secret_read_recorders_have_unique_lifecycles_without_sequential_masking() -> None:
+    first = _CountingCredentials()
+    second = _CountingCredentials()
+    first_recorder = weakref.ref(first._secret_reads)
+    second_recorder = weakref.ref(second._secret_reads)
+    serialized = pickle.dumps(first, protocol=pickle.HIGHEST_PROTOCOL)
+    reconstructed = pickle.loads(serialized)
+
+    assert first_recorder() is not second_recorder()
+    assert first._secret_reads._identity != second._secret_reads._identity
+    assert reconstructed._secret_reads is first_recorder()
+    assert first.secret_key == first.configured_secret
+    assert first.secret_key_reads == 1
+    assert second.secret_key_reads == 0
+    detached_payload = pickle.dumps(
+        reconstructed,
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+    del first
+    del reconstructed
+    gc.collect()
+
+    assert first_recorder() is None
+    assert second_recorder() is not None
+    detached = pickle.loads(detached_payload)
+    detached_recorder = weakref.ref(detached._secret_reads)
+    assert detached.secret_key_reads == 1
+    assert detached._secret_reads is not second_recorder()
+    assert detached.secret_key == detached.configured_secret
+    assert detached.secret_key_reads == 2
+    assert second.secret_key_reads == 0
+
+    del detached
+    gc.collect()
+
+    assert detached_recorder() is None
+    sequential = _CountingCredentials()
+    assert sequential._secret_reads is not second_recorder()
+    assert sequential.secret_key_reads == 0
+
+
+async def test_credential_secret_read_recorders_are_isolated_across_async_tasks_and_threads() -> None:
+    first = _CountingCredentials()
+    second = _CountingCredentials()
+    first_worker = pickle.loads(
+        pickle.dumps(copy.deepcopy(first), protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    second_worker = pickle.loads(
+        pickle.dumps(copy.copy(second), protocol=pickle.HIGHEST_PROTOCOL)
+    )
+
+    async def read_in_threads(credentials: _CountingCredentials, count: int) -> None:
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(lambda: credentials.secret_key)
+                for _ in range(count)
+            )
+        )
+
+    await asyncio.gather(
+        read_in_threads(first_worker, 64),
+        read_in_threads(second_worker, 96),
+    )
+
+    assert first.secret_key_reads == 64
+    assert second.secret_key_reads == 96
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("chain_index", "", id="chain-empty"),
+        pytest.param("chain_index", "abc", id="chain-non-decimal"),
+        pytest.param("chain_index", "١", id="chain-non-ascii-decimal"),
+        pytest.param("chain_index", 196, id="chain-int"),
+        pytest.param("chain_index", True, id="chain-bool"),
+        pytest.param("chain_index", _StringSubclass("196"), id="chain-str-subclass"),
+        pytest.param("wallet_type", "", id="wallet-empty"),
+        pytest.param("wallet_type", "4", id="wallet-undocumented"),
+        pytest.param("wallet_type", "1,", id="wallet-empty-tail"),
+        pytest.param("wallet_type", ",1", id="wallet-empty-head"),
+        pytest.param("wallet_type", "1,,2", id="wallet-empty-middle"),
+        pytest.param("wallet_type", "1, 2", id="wallet-whitespace"),
+        pytest.param("wallet_type", 1, id="wallet-int"),
+        pytest.param("wallet_type", _StringSubclass("1"), id="wallet-str-subclass"),
+        pytest.param("wallet_type", "SECRET-SENTINEL", id="wallet-value-not-logged"),
+        *[
+            pytest.param(field, value, id=f"{field}-{case}")
+            for field in (
+                "min_address_count",
+                "min_amount_usd",
+                "min_market_cap_usd",
+                "min_liquidity_usd",
+            )
+            for case, value in (
+                ("boolean", True),
+                ("negative", -1),
+                ("float", 1.0),
+                ("nan", float("nan")),
+                ("infinity", float("inf")),
+                ("negative-infinity", float("-inf")),
+                ("string", "1"),
+                ("none", None),
+                ("int-subclass", _IntSubclass(1)),
+            )
+        ],
+        pytest.param("min_amount_usd", 10**5000, id="amount-beyond-int-string-limit"),
+        pytest.param("cursor", "", id="cursor-empty"),
+        pytest.param("cursor", 1, id="cursor-int"),
+        pytest.param("cursor", True, id="cursor-bool"),
+        pytest.param("cursor", _StringSubclass("next"), id="cursor-str-subclass"),
+    ],
+)
+async def test_signal_list_refuses_invalid_runtime_input_before_transport(
+    field: str,
+    invalid_value: object,
+) -> None:
+    """Every invalid runtime input stops before key-material use and the real HTTP seam."""
+    import httpx
+
+    values: dict[str, object] = {
+        "chain_index": "196",
+        "wallet_type": "1",
+        "min_address_count": 2,
+        "min_amount_usd": 1000,
+        "min_market_cap_usd": 100_000,
+        "min_liquidity_usd": 20_000,
+    }
+    cursor: object | None = None
+    if field == "cursor":
+        cursor = invalid_value
+    else:
+        values[field] = invalid_value
+    filters = SignalFilters(**values)  # type: ignore[arg-type]
+
+    credential_double = _CountingCredentials()
+
+    captured: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"code": "0", "data": []})
+
+    seam_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "signal_trials" / "run_preflight.py"
+    )
+    spec = importlib_util.spec_from_file_location("invalid_matrix_real_http_seam", seam_path)
+    assert spec is not None and spec.loader is not None
+    seam = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(seam)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http:
+        with pytest.raises(ValueError) as raised:
+            await OKXMarketClient(
+                seam.HttpxTransport(http),
+                cast(OKXCredentials, credential_double),
+            ).list_signals(
+                filters,
+                cursor=cursor,  # type: ignore[arg-type]
+            )
+
+    assert captured == []
+    assert credential_double.secret_key_reads == 0
+    assert "SECRET-SENTINEL" not in str(raised.value)
+    assert credential_double.configured_secret not in str(raised.value)
+
+
+async def test_signal_list_accepts_zero_thresholds_all_wallet_codes_and_non_ascii_cursor() -> None:
+    transport = RecordingFake({"code": "0", "data": []})
+    filters = SignalFilters(
+        chain_index="0",
+        wallet_type="3,1,2",
+        min_address_count=0,
+        min_amount_usd=0,
+        min_market_cap_usd=0,
+        min_liquidity_usd=0,
+    )
+
+    await OKXMarketClient(transport, OKXCredentials("k", "s", "p")).list_signals(
+        filters,
+        cursor="café",
+    )
+
+    assert transport.calls[0][3] == [
+        {
+            "chainIndex": "0",
+            "walletType": "3,1,2",
+            "minAddressCount": "0",
+            "minAmountUsd": "0",
+            "minMarketCapUsd": "0",
+            "minLiquidityUsd": "0",
+            "cursor": "café",
+        }
+    ]
+
 
 async def test_list_signals_posts_array_body_and_parses_cursor():
     fake = RecordingFake({"code": "0", "data": [{"timestamp": "1753400000000", "price": "0.042",
@@ -317,10 +738,10 @@ async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_i
         {
             "chainIndex": "501",
             "walletType": "1",
-            "minAddressCount": 2,
-            "minAmountUsd": 1000,
-            "minMarketCapUsd": 100_000,
-            "minLiquidityUsd": 20_000,
+            "minAddressCount": "2",
+            "minAmountUsd": "1000",
+            "minMarketCapUsd": "100000",
+            "minLiquidityUsd": "20000",
             "cursor": "CURSOR-LAST",
         }
     ]

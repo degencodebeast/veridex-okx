@@ -50,7 +50,7 @@ from veridex.signal_trials.live import (
     unsettled_commit,
 )
 from veridex.signal_trials.published import read_season, read_state
-from veridex.signal_trials.receipts import verify_receipt
+from veridex.signal_trials.receipts import TERMINAL_STATUSES, verify_receipt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -298,6 +298,10 @@ def register_signal_trials_routes(
         repo = _live_trials()
         trial = repo.current() if repo is not None else None
         if trial is not None:
+            receipt_store = _store()
+            outcome = None if receipt_store is None else receipt_store.outcome(trial.trial_id)
+            if outcome is not None and outcome.status in TERMINAL_STATUSES:
+                return _error(404, "no_open_trial")
             return _open_trial_response(trial)
         provided = None if open_trial_provider is None else open_trial_provider()
         if provided is None:
