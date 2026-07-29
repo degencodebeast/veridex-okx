@@ -751,6 +751,31 @@ describe.each([390, 392])(
 );
 
 describe.each([390, 392])(
+  '/trials Match Card controls meet the narrow tap-target floor at %dpx',
+  (width) => {
+    it('measures the Fair-Play toggle and Cost Sensitivity summary at 44px or taller', async () => {
+      const page = await openSettledTrialWithTables(width);
+      const heights = {
+        checkToggle: await page
+          .getByRole('button', { name: 'Collapse Fair-Play check descriptions' })
+          .evaluate((element) => element.getBoundingClientRect().height),
+        disclosureSummary: await page
+          .locator('[data-testid="markout-table"] summary')
+          .evaluate((element) => element.getBoundingClientRect().height),
+      };
+      expect(
+        {
+          checkToggle: heights.checkToggle >= 44,
+          disclosureSummary: heights.disclosureSummary >= 44,
+        },
+        `measured heights at ${width}px: ${JSON.stringify(heights)}`,
+      ).toEqual({ checkToggle: true, disclosureSummary: true });
+      await page.close();
+    });
+  },
+);
+
+describe.each([390, 392])(
   '/trials no-season actions meet the narrow tap-target floor at %dpx',
   (width) => {
     it('gives VIEW PROBE COUNTS and READ SKILL.md at least 44px of height', async () => {

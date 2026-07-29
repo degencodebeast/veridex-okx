@@ -53,6 +53,13 @@ describe('SPEC-R1 selector-specific responsive source contract', () => {
     expect(cssDeclaration(trialCss, '.back', 'min-height', { media: phone })).toBe('44px');
   });
 
+  it.each(['.checkToggle', '.disclosureSummary'])(
+    'gives the Match Card control %s its own 44px narrow minimum',
+    (selector) => {
+      expect(cssDeclaration(trialCss, selector, 'min-height', { media: phone })).toBe('44px');
+    },
+  );
+
   it('disables rail and split motion when reduced motion is requested', () => {
     const reduced = '(prefers-reduced-motion: reduce)';
     expect(cssDeclaration(optionalCss(railCssPath), '.railNode', 'transition', { media: reduced })).toBe('none');

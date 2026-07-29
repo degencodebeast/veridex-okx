@@ -276,6 +276,8 @@
 @media (max-width: 760px) {
   .back { display: inline-flex; align-items: center; min-height: 44px; }
   .retry { min-height: 44px; }
+  .checkToggle { min-height: 44px; }
+  .disclosureSummary { min-height: 44px; align-items: center; }
   .tableWrap { overflow: visible; }
   .table, .table tbody { display: block; width: 100%; }
   .table thead { display: none; }
