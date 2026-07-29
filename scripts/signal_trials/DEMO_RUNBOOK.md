@@ -80,14 +80,42 @@ Boundary: **container operator**. This is the first durable publication gate. A 
 approve the exact sealed pack hash before replacing `<reviewed-sealed-pack-dir>`:
 
 ```sh
+APPROVED_PACK_CONTENT_HASH="<reviewed-sealed-pack-content-hash>"
 python /app/scripts/signal_trials/score_and_publish.py \
   --pack-dir <reviewed-sealed-pack-dir> \
+  --expected-content-hash "$APPROVED_PACK_CONTENT_HASH" \
   --data-dir /var/lib/veridex/signal-trials
+
+# Pack provenance remains local; the frozen public season schema has no hash field.
+jq -e --arg expected "$APPROVED_PACK_CONTENT_HASH" \
+  '.detail.approved_pack_content_hash == $expected' \
+  /var/lib/veridex/signal-trials/published/state.json
+
+LOCAL_SEASON_ID="$(jq -er '.season_id' \
+  /var/lib/veridex/signal-trials/published/season.json)"
+LOCAL_CHAIN="$(jq -er '.combo.chain_index' \
+  /var/lib/veridex/signal-trials/published/season.json)"
+LOCAL_BAR="$(jq -er '.combo.bar' \
+  /var/lib/veridex/signal-trials/published/season.json)"
+PUBLIC_SEASON="$(mktemp)"
+trap 'rm -f "$PUBLIC_SEASON"' EXIT
+curl -fsS https://api.proofarena.xyz/signal-trials/season > "$PUBLIC_SEASON"
+jq -e \
+  --arg season_id "$LOCAL_SEASON_ID" \
+  --arg chain "$LOCAL_CHAIN" \
+  --arg bar "$LOCAL_BAR" '
+    .season_id == $season_id and
+    .combo.chain_index == $chain and
+    .combo.bar == $bar
+  ' "$PUBLIC_SEASON"
+rm -f "$PUBLIC_SEASON"
+trap - EXIT
 curl -fsS https://api.proofarena.xyz/readyz
 ```
 
-No command here deploys code. Stop if the published season does not report the same chain, bar, and
-pack hash that were reviewed.
+No command here deploys code. Stop unless local state binds the reviewed pack hash and the public
+season reports the same public season ID, chain, and bar. Pack provenance is intentionally not
+added to the frozen five-key public season response.
 
 ## 4. Dry-run and open
 
@@ -245,20 +273,70 @@ challenge, payment response header, wallet account identifier, or signing materi
 
 ## 7. One-hour settlement
 
-Boundary: **container operator**. Wait until the trial's `t0_ms + 3600000` one-hour horizon has
-passed. Read the reviewed bar from the published preflight; do not guess it:
+Boundary: **container operator**. The frozen horizon is 60 minutes, but terminal evidence also
+requires a confirmed eligible candle. With no eligible candle, the earliest honest terminal
+`UNSCORED` evidence is **71 minutes** for `1m` and **130 minutes** for `1H`: one complete selected
+bar plus the frozen ten-minute fetch grace after the horizon. Read the reviewed bar from the
+published preflight; do not guess it. A process exit 0 proves only that the command applied its
+gates; the validated result below proves whether this exact trial was recorded terminally.
 
 ```sh
+TRIAL_ID="${TRIAL_ID:?TRIAL_ID is required from the verified open handoff}"
 BAR="$(jq -er '.bar | select(. == "1m" or . == "1H")' \
   /var/lib/veridex/signal-trials/preflight_result.json)"
+SETTLEMENT_DRY_RUN="$(mktemp)"
+SETTLEMENT_LIVE_RESULT="$(mktemp)"
+cleanup_settlement_workflow() {
+  rm -f "$SETTLEMENT_DRY_RUN" "$SETTLEMENT_LIVE_RESULT"
+}
+trap 'cleanup_settlement_workflow' EXIT
+
 python /app/scripts/signal_trials/settle_live_trials.py \
   --data-dir /var/lib/veridex/signal-trials \
   --chain-index 196 \
-  --bar "$BAR"
+  --bar "$BAR" \
+  --trial-id "$TRIAL_ID" \
+  --dry-run > "$SETTLEMENT_DRY_RUN"
+
+if ! jq -e --arg trial_id "$TRIAL_ID" '
+  type == "object" and
+  .dry_run == true and
+  .eligible == 1 and
+  (.trials | type == "array" and length == 1) and
+  .trials[0].trial_id == $trial_id and
+  .trials[0].recorded == false and
+  (.trials[0].status == "settled" or .trials[0].status == "UNSCORED")
+' "$SETTLEMENT_DRY_RUN" >/dev/null; then
+  echo "STOP: dry-run did not find exactly one terminally eligible row for the captured trial" >&2
+  exit 1
+fi
+
+python /app/scripts/signal_trials/settle_live_trials.py \
+  --data-dir /var/lib/veridex/signal-trials \
+  --chain-index 196 \
+  --bar "$BAR" \
+  --trial-id "$TRIAL_ID" > "$SETTLEMENT_LIVE_RESULT"
+
+if ! jq -e --arg trial_id "$TRIAL_ID" '
+  type == "object" and
+  .dry_run == false and
+  .eligible == 1 and
+  (.trials | type == "array" and length == 1) and
+  .trials[0].trial_id == $trial_id and
+  .trials[0].recorded == true and
+  (.trials[0].status == "settled" or .trials[0].status == "UNSCORED")
+' "$SETTLEMENT_LIVE_RESULT" >/dev/null; then
+  echo "STOP: live run did not record the captured trial as settled or UNSCORED" >&2
+  exit 1
+fi
+
+cat "$SETTLEMENT_LIVE_RESULT"
+cleanup_settlement_workflow
+trap - EXIT
 ```
 
-If candle coverage is incomplete or the command refuses, record nothing manually and wait for a
-later reviewed run.
+If candle coverage is incomplete, eligibility is zero or ambiguous, or either command refuses,
+record nothing manually and wait for a later reviewed run.
 
 ## 8. QA
 

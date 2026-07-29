@@ -85,8 +85,10 @@ def _fetch_and_seal_module():
 
 async def run_fetch_and_seal(preflight_path: Path, client: Any, data_dir: Path) -> Path | None:
     """Call the script's entry point, loaded by path."""
-    result: Path | None = await _fetch_and_seal_module().run_fetch_and_seal(preflight_path, client, data_dir)
-    return result
+    result: PackRef | None = await _fetch_and_seal_module().run_fetch_and_seal(
+        preflight_path, client, data_dir
+    )
+    return None if result is None else result.dir
 
 
 BAR = "1m"
@@ -1012,6 +1014,32 @@ def test_the_operator_command_seals_a_pack(tmp_path: Path, monkeypatch: pytest.M
     pack = load_pack(read_pack_ref(packs[0]))
     assert len(pack.trials) == 3
     assert pack.meta.combo == ComboSelection(CHAIN, BAR, "qualified")
+
+
+def test_a_successful_seal_prints_the_exact_pack_directory_and_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The operator receives both components of the immutable pack reference."""
+    module = _fetch_and_seal_module()
+    _set_sentinel_credentials(monkeypatch)
+    preflight_path = tmp_path / "preflight_result.json"
+    data_dir = tmp_path / "data"
+    _write_qualified(preflight_path)
+    client = RecordingClient(signals=tuple(_wire_signal(index) for index in range(3)))
+
+    code = module.main(
+        ["--from-preflight", str(preflight_path), "--out", str(data_dir / "packs")],
+        source_factory=_factory_yielding(client),
+    )
+    rendered = capsys.readouterr().out
+    (pack_dir,) = (data_dir / "packs").iterdir()
+    ref = read_pack_ref(pack_dir)
+
+    assert code == 0
+    assert str(ref.dir) in rendered
+    assert ref.content_hash in rendered
 
 
 @pytest.mark.parametrize("writer", ["no_season", "failed", "non_frozen_bar"])

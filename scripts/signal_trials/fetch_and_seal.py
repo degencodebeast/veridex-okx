@@ -76,7 +76,7 @@ from typing import Any, cast
 from veridex.signal_trials import published
 from veridex.signal_trials.challenge_spec import CanonicalSignal
 from veridex.signal_trials.okx_client import CandleSeries, SignalFilters
-from veridex.signal_trials.pack import PackMeta, seal_pack
+from veridex.signal_trials.pack import PackMeta, PackRef, seal_pack
 
 # `_collect_signals`, `_dedup_by_cooldown`, `_screen` and `_with_unique_open_times` are PRIVATE names
 # in `preflight`, imported deliberately. They are the frozen counting rules (§5.1's filters, §8.6's
@@ -313,7 +313,7 @@ async def run_fetch_and_seal(
     cooldown_ms: int = FROZEN_COOLDOWN_MS,
     horizon_ms: int = FROZEN_HORIZON_MS,
     season_id: str | None = None,
-) -> Path | None:
+) -> PackRef | None:
     """Seal the season's pack, or record why no pack could be sealed.
 
     ``async`` because the market client's read surface is async (``preflight.MarketClient``). The
@@ -341,7 +341,7 @@ async def run_fetch_and_seal(
         season_id: Override for the generated season id, for a caller that needs a stable name.
 
     Returns:
-        The sealed pack's directory, or ``None`` when the artifact was not sealable.
+        The sealed pack reference, or ``None`` when the artifact was not sealable.
 
     Raises:
         ValueError: The preflight artifact exists but cannot be read as a JSON object, or the
@@ -406,8 +406,7 @@ async def run_fetch_and_seal(
         # surface declaring it; a copy in this dict could disagree with the module that owns it.
         versions={"preflight_policy": json.dumps(artifact.get("policy", {}), sort_keys=True)},
     )
-    ref = seal_pack(trials, settlement, meta, out_dir=data_dir / PACKS_DIRNAME)
-    return ref.dir
+    return seal_pack(trials, settlement, meta, out_dir=data_dir / PACKS_DIRNAME)
 
 
 def frozen_bar_ms(bar: str) -> int:
@@ -553,7 +552,7 @@ def main(argv: Sequence[str] | None = None, *, source_factory: SourceFactory | N
 
     secrets = [credentials.api_key, credentials.secret_key, credentials.passphrase]
 
-    async def _drive() -> Path | None:
+    async def _drive() -> PackRef | None:
         async with factory(credentials) as source:
             return await run_fetch_and_seal(Path(args.from_preflight), source, data_dir)
 
@@ -575,7 +574,8 @@ def main(argv: Sequence[str] | None = None, *, source_factory: SourceFactory | N
         print(seam.redact(f"state written under {data_dir / published.PUBLISHED_DIRNAME}", secrets))
         return 0
 
-    print(seam.redact(f"pack sealed at {sealed}", secrets))
+    print(seam.redact(f"pack sealed at {sealed.dir}", secrets))
+    print(seam.redact(f"pack content hash {sealed.content_hash}", secrets))
     return 0
 
 

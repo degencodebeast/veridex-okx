@@ -415,6 +415,7 @@ async def test_commit_stub_never_free_success():
 
 def test_server_composition_requires_cors(monkeypatch):
     import pytest
+
     from veridex.api.server import create_server_app
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     with pytest.raises(ValueError, match="CORS_ORIGINS"):
@@ -1235,6 +1236,109 @@ async def test_MOUNT_free_open_trial_is_served_from_the_configured_root(tmp_path
     assert body["trial_id"] == trial.trial_id and body["trial_mode"] == "live"
     assert body["commit_deadline_ms"] == trial.commit_deadline_ms
     assert body["evidence_hash"] == trial.evidence_hash
+
+
+def _record_demo_outcome(data_root: Path, trial: Any, status: str) -> None:
+    """Record one terminal or pending outcome through the production writer."""
+    from veridex.signal_trials.live import FETCH_GRACE_MS, settle_trial
+    from veridex.signal_trials.okx_client import Candle, CandleSeries
+    from veridex.signal_trials.preflight import FROZEN_HORIZON_MS
+    from veridex.signal_trials.receipts import ReceiptStore
+
+    target = trial.t0_ms + FROZEN_HORIZON_MS
+    candles = (
+        ()
+        if status != "settled"
+        else (
+            Candle(
+                ts_open_ms=target - 60_000,
+                open=trial.sig.trigger_price,
+                high=trial.sig.trigger_price * 1.1,
+                low=trial.sig.trigger_price * 0.9,
+                close=trial.sig.trigger_price * 1.05,
+                vol=1.0,
+                vol_usd=100.0,
+                confirmed=True,
+            ),
+        )
+    )
+    series = CandleSeries(bar="1m", bar_ms=60_000, candles=candles)
+    if status == "pending":
+        now_ms = target
+    elif status == "UNSCORED":
+        now_ms = target + series.bar_ms + FETCH_GRACE_MS
+    else:
+        now_ms = target + series.bar_ms
+    settled = settle_trial(
+        trial,
+        series,
+        now_ms=now_ms,
+        chain_index="196",
+        source_endpoint="https://web3.okx.com/api/v6/dex/market/candles",
+    )
+    assert settled.outcome.status == status
+    ReceiptStore(data_root).record_outcome(trial.trial_id, settled)
+
+
+@pytest.mark.parametrize("terminal_status", ["settled", "UNSCORED"])
+async def test_terminal_current_pointer_is_closed_but_direct_history_remains(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    """Terminal projection closes discovery without deleting historical evidence."""
+    from veridex.signal_trials.live import LiveTrialRepository
+    from veridex.signal_trials.receipts import ReceiptStore
+
+    trial = _publish_trial(tmp_path, trial_id=f"trial_terminal_{terminal_status.lower()}")
+    _record_demo_outcome(tmp_path, trial, terminal_status)
+    app = _routed_app(
+        data_dir=tmp_path,
+        live_trials=LiveTrialRepository(tmp_path / "live"),
+        store=ReceiptStore(tmp_path),
+    )
+
+    async with _client_for(app) as client:
+        opened = await client.get("/signal-trials/open-trial")
+        historical = await client.get(f"/signal-trials/trials/{trial.trial_id}")
+
+    assert opened.status_code == 404
+    assert opened.json() == {"error": "no_open_trial"}
+    assert historical.status_code == 200
+    assert historical.json()["outcome"]["status"] == terminal_status
+
+
+async def test_open_projection_distinguishes_no_outcome_pending_terminal_and_provider_only(
+    tmp_path: Path,
+) -> None:
+    """Only repository-backed terminal outcomes close the open pointer."""
+    from veridex.signal_trials.live import LiveTrialRepository
+    from veridex.signal_trials.receipts import ReceiptStore
+
+    observed: dict[str, tuple[int, dict[str, Any]]] = {}
+    for status in ("none", "pending", "settled", "UNSCORED"):
+        root = tmp_path / status.lower()
+        trial = _publish_trial(root, trial_id=f"trial_{status.lower()}")
+        if status != "none":
+            _record_demo_outcome(root, trial, status)
+        app = _routed_app(
+            data_dir=root,
+            live_trials=LiveTrialRepository(root / "live"),
+            store=ReceiptStore(root),
+        )
+        async with _client_for(app) as client:
+            response = await client.get("/signal-trials/open-trial")
+        observed[status] = (response.status_code, response.json())
+
+    provider_app = _routed_app(open_trial_provider=lambda: OpenTrialResponse(**TRIAL_A))
+    async with _client_for(provider_app) as client:
+        provider = await client.get("/signal-trials/open-trial")
+
+    assert observed["none"][0] == 200
+    assert observed["pending"][0] == 200
+    assert observed["settled"] == (404, {"error": "no_open_trial"})
+    assert observed["UNSCORED"] == (404, {"error": "no_open_trial"})
+    assert provider.status_code == 200
+    assert provider.json()["trial_id"] == TRIAL_A["trial_id"]
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])

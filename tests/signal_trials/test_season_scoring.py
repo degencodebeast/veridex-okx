@@ -1581,7 +1581,7 @@ def test_season_document_matches_the_wire_schema_the_router_serves(full_pack_qua
     from veridex.signal_trials.published import read_season, read_state
 
     season = score_season(full_pack_qualified)
-    publish_season(tmp_path, season)
+    publish_season(tmp_path, season, full_pack_qualified.ref.content_hash)
 
     assert read_state(tmp_path)["state"] == "qualified"
     document = read_season(tmp_path)
@@ -1639,7 +1639,7 @@ def test_debug_climatology_inputs_NEVER_REACHES_the_published_document(full_pack
     assert _walk(document) == []
 
     # And the decisive check: the BYTES that actually land on disk.
-    publish_season(tmp_path, season)
+    publish_season(tmp_path, season, full_pack_qualified.ref.content_hash)
     written = (tmp_path / "published" / "season.json").read_text(encoding="utf-8")
     assert written, "an artifact examined must be non-empty to mean anything"
     assert "debug" not in written
@@ -1691,14 +1691,81 @@ def test_score_and_publish_scores_when_the_state_is_not_built(tmp_path, full_pac
     import scripts.signal_trials.score_and_publish as script
 
     monkeypatch.setattr(script, "load_pack", lambda ref: full_pack_qualified)
-    monkeypatch.setattr(script, "read_pack_ref", lambda pack_dir: full_pack_qualified.ref)
-
-    exit_code = script.main(["--data-dir", str(tmp_path), "--pack-dir", str(tmp_path / "pack")])
+    exit_code = script.main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--pack-dir",
+            str(tmp_path / "pack"),
+            "--expected-content-hash",
+            full_pack_qualified.ref.content_hash,
+        ]
+    )
     assert exit_code == 0
 
     from veridex.signal_trials.published import read_state
 
     assert read_state(tmp_path)["state"] == "qualified"
+
+
+def test_scoreable_publish_refuses_without_the_named_human_approved_hash(
+    tmp_path, full_pack_qualified, monkeypatch, capsys
+):
+    """A missing approval stops before any pack bytes are inspected."""
+    import scripts.signal_trials.score_and_publish as script
+
+    touched: list[str] = []
+
+    def _unexpected_read(_value):
+        touched.append("pack")
+        return full_pack_qualified
+
+    monkeypatch.setattr(script, "load_pack", _unexpected_read)
+
+    exit_code = script.main(["--data-dir", str(tmp_path), "--pack-dir", str(tmp_path / "pack")])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert touched == []
+    assert "--expected-content-hash" in captured.err
+
+
+def test_scoring_loads_the_exact_approved_pack_reference(
+    tmp_path, full_pack_qualified, monkeypatch
+):
+    """The human-approved digest, not a digest re-read from disk, reaches verification."""
+    import argparse
+
+    import scripts.signal_trials.score_and_publish as script
+    from veridex.signal_trials.pack import PackRef
+
+    pack_dir = tmp_path / "pack"
+    approved_hash = "a" * 64
+    disk_hash = "b" * 64
+    seen: list[PackRef] = []
+    monkeypatch.setattr(
+        script,
+        "parse_args",
+        lambda _argv=None: argparse.Namespace(
+            data_dir=tmp_path,
+            pack_dir=pack_dir,
+            expected_content_hash=approved_hash,
+        ),
+    )
+    monkeypatch.setattr(
+        script, "read_pack_ref", lambda _path: PackRef(pack_dir, disk_hash), raising=False
+    )
+
+    def _load(ref: PackRef):
+        seen.append(ref)
+        return full_pack_qualified
+
+    monkeypatch.setattr(script, "load_pack", _load)
+
+    exit_code = script.main([])
+
+    assert exit_code == 0
+    assert seen == [PackRef(pack_dir, approved_hash)]
 
 
 def test_publish_writes_the_payload_before_the_state(tmp_path, full_pack_qualified):
@@ -1721,7 +1788,11 @@ def test_publish_writes_the_payload_before_the_state(tmp_path, full_pack_qualifi
 
     published_module._atomic_write_json = _recording
     try:
-        publish_season(tmp_path, score_season(full_pack_qualified))
+        publish_season(
+            tmp_path,
+            score_season(full_pack_qualified),
+            full_pack_qualified.ref.content_hash,
+        )
     finally:
         published_module._atomic_write_json = original_write_json
 
