@@ -3,6 +3,26 @@
   padding: var(--space-3) var(--pad-panel);
   border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--panel);
 }
+.rail {
+  position: relative;
+  animation: railFade 250ms ease-out both;
+}
+.rail::before {
+  content: '';
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--border-strong));
+  transform-origin: left;
+  animation: railDraw 250ms ease-out both;
+}
+.railAction { color: inherit; text-decoration: none; cursor: pointer; }
+@keyframes railDraw {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+@keyframes railFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 .railHead { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .label { margin: 0; color: var(--text-3); font: 10px/1.4 var(--font-mono), monospace; letter-spacing: .1em; }
 .sub, .meta, .note { margin: 0; color: var(--text-2); font-size: 10px; }
@@ -57,5 +77,6 @@
   .railNodes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 @media (prefers-reduced-motion: reduce) {
+  .rail, .rail::before { animation: none; }
   .railNode { transition: none; }
 }

@@ -179,6 +179,17 @@
   color: var(--text-2); background: var(--panel);
 }
 
+.disclosure { display: block; }
+.disclosureSummary {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2);
+  cursor: pointer; list-style: none;
+}
+.disclosureSummary::-webkit-details-marker { display: none; }
+.disclosureState {
+  color: var(--text-2); font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .06em;
+}
+.disclosure[open] > .disclosureSummary { margin-bottom: 6px; }
+
 .actionChip {
   font-family: var(--font-mono), monospace; font-size: 9px; letter-spacing: 0.06em;
   padding: 2px 6px; border-radius: var(--radius-badge);
@@ -238,6 +249,11 @@
    (`commit-time` IS a data code — `phase: 'commit' | 'outcome'`, lib/contracts.ts:599). 3.18:1 →
    6.97:1 on the `--panel-2` of the `.checks` box these rows sit in. */
 .checkStatus[data-status='not_served'] { border-style: dashed; color: var(--text-2); }
+.checkToggle {
+  padding: 4px 7px; border: 1px solid var(--border); border-radius: var(--radius-control);
+  background: var(--panel); color: var(--accent-hi); cursor: pointer;
+  font: 9px/1.4 var(--font-mono), monospace; letter-spacing: .04em;
+}
 
 .retry {
   /* An explicit flex box rather than the <button> UA default: the narrow breakpoint below gives this

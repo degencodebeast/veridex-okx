@@ -5,6 +5,11 @@ import { cssDeclaration } from '@/lib/css-source';
 
 const seasonCss = readFileSync(resolve(__dirname, 'SeasonScreen.module.css'), 'utf8');
 const trialCss = readFileSync(resolve(__dirname, 'TrialMatchCard.module.css'), 'utf8');
+const shellCss = readFileSync(
+  resolve(__dirname, '../../layout/ProofArenaShell.module.css'),
+  'utf8',
+);
+const tokensCss = readFileSync(resolve(__dirname, '../../../styles/tokens.css'), 'utf8');
 const railCssPath = resolve(__dirname, 'SignalStatePanel.module.css');
 const splitCssPath = resolve(__dirname, 'TrialsSplitScreen.module.css');
 const phone = '(max-width: 760px)';
@@ -52,5 +57,38 @@ describe('SPEC-R1 selector-specific responsive source contract', () => {
     const reduced = '(prefers-reduced-motion: reduce)';
     expect(cssDeclaration(optionalCss(railCssPath), '.railNode', 'transition', { media: reduced })).toBe('none');
     expect(cssDeclaration(optionalCss(splitCssPath), '.splitSide', 'transition', { media: reduced })).toBe('none');
+  });
+});
+
+describe('ProofArena interaction and motion CSS contract', () => {
+  it('gives every route-scoped keyboard target the exact deterministic focus ring', () => {
+    for (const selector of [
+      '.shell a:focus-visible',
+      '.shell button:focus-visible',
+      '.shell summary:focus-visible',
+      ".shell [role='link']:focus-visible",
+    ]) {
+      expect(cssDeclaration(shellCss, selector, 'outline')).toBe('2px solid var(--accent)');
+      expect(cssDeclaration(shellCss, selector, 'outline-offset')).toBe('2px');
+    }
+    const focusBlue = ['#3B', '82F6'].join('');
+    expect(cssDeclaration(tokensCss, ':root', '--accent')).toBe(focusBlue);
+  });
+
+  it('runs one bounded railDraw and railFade entrance', () => {
+    const css = optionalCss(railCssPath);
+    expect(css).toMatch(/@keyframes\s+railDraw\s*\{/);
+    expect(css).toMatch(/@keyframes\s+railFade\s*\{/);
+    expect(cssDeclaration(css, '.rail', 'animation')).toBe('railFade 250ms ease-out both');
+    expect(cssDeclaration(css, '.rail::before', 'animation')).toBe(
+      'railDraw 250ms ease-out both',
+    );
+  });
+
+  it('disables both rail animations under reduced motion', () => {
+    const css = optionalCss(railCssPath);
+    const reduced = '(prefers-reduced-motion: reduce)';
+    expect(cssDeclaration(css, '.rail', 'animation', { media: reduced })).toBe('none');
+    expect(cssDeclaration(css, '.rail::before', 'animation', { media: reduced })).toBe('none');
   });
 });

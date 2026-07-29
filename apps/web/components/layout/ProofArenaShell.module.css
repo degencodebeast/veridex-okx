@@ -20,6 +20,17 @@
   overflow-x: clip;
 }
 
+/* One deterministic focus contract for every keyboard target inside the two-route shell. The
+   accent resolves from Direction A's token source; keeping the declaration tokenized also
+   preserves PAT-001's single palette source. */
+.shell a:focus-visible,
+.shell button:focus-visible,
+.shell summary:focus-visible,
+.shell [role='link']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ── top bar ─────────────────────────────────────────────────────────────── */
 
 .header {

@@ -805,6 +805,11 @@ describe('SPEC-R1 complete season surfaces', () => {
     stubFeatured();
     await panel();
     const rail = await screen.findByTestId('season-shared-evidence-rail');
+    expect(rail).toHaveRole('link');
+    expect(rail).toHaveAccessibleName(`OPEN FEATURED MATCH CARD ${openTrial.trial_id}`);
+    expect(rail).toHaveAttribute('href', `/trials/${openTrial.trial_id}`);
+    rail.focus();
+    expect(rail).toHaveFocus();
     expect(within(rail).getAllByTestId('rail-node')).toHaveLength(4);
     expect(within(rail).getAllByTestId('rail-hash-chip')).toHaveLength(1);
     expect(within(rail).getAllByTestId('rail-agent')).toHaveLength(2);
@@ -848,7 +853,17 @@ describe('SPEC-R1 complete season surfaces', () => {
     await panel();
     const links = await screen.findAllByTestId('season-row-link');
     expect(links).toHaveLength(seasonWire.rows.length);
-    for (const link of links) expect(link).toHaveAttribute('href', `/trials/${openTrial.trial_id}`);
+    const rows = screen.getAllByTestId('season-row');
+    for (const [index, link] of links.entries()) {
+      expect(link).toHaveAttribute('href', `/trials/${openTrial.trial_id}`);
+      expect(link).toHaveAttribute(
+        'aria-label',
+        `OPEN ${seasonWire.rows[index].agent_id} MATCH CARD`,
+      );
+      expect(rows[index]).toContainElement(link);
+      link.focus();
+      expect(link).toHaveFocus();
+    }
 
     cleanup();
     vi.unstubAllGlobals();

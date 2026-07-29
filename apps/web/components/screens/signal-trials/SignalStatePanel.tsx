@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import type { CommitReceipt, OpenTrial, TrialCard } from '@/lib/contracts';
 import styles from './SignalStatePanel.module.css';
 
@@ -27,19 +28,19 @@ export function SharedEvidenceRail({
   agents,
   compact = false,
   testId = 'shared-evidence-rail',
+  href,
+  ariaLabel,
 }: {
   trial: RailTrial;
   agents: CommitReceipt[];
   compact?: boolean;
   testId?: string;
+  href?: string;
+  ariaLabel?: string;
 }) {
   const outcome = outcomeFor(trial);
-  return (
-    <section
-      className={`${styles.rail} ${compact ? styles.compact : ''}`}
-      data-testid={testId}
-      data-mode={compact ? 'compact' : 'full'}
-    >
+  const content = (
+    <>
       <div className={styles.railHead}>
         <div>
           <p className={styles.label}>SHARED EVIDENCE RAIL</p>
@@ -101,7 +102,27 @@ export function SharedEvidenceRail({
         the settled outcome under the recorded law. A pending commitment has none yet, and an
         UNSCORED one never will.
       </p>
+    </>
+  );
+
+  return href === undefined ? (
+    <section
+      className={`${styles.rail} ${compact ? styles.compact : ''}`}
+      data-testid={testId}
+      data-mode={compact ? 'compact' : 'full'}
+    >
+      {content}
     </section>
+  ) : (
+    <Link
+      className={`${styles.rail} ${styles.railAction} ${compact ? styles.compact : ''}`}
+      href={href}
+      aria-label={ariaLabel}
+      data-testid={testId}
+      data-mode={compact ? 'compact' : 'full'}
+    >
+      {content}
+    </Link>
   );
 }
 

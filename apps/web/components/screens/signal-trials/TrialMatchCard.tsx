@@ -125,6 +125,13 @@ const CHECK_DESCRIPTION: Record<FrozenCheckKey, string> = {
   outcome_source: 'Three obligations: the close boundary, the law’s outputs (entry, both markout legs and follow_profitable) and the fetch source all re-derive from the recorded candle.',
 };
 
+const CHECK_STATUS_PRESENTATION = {
+  pass: { glyph: '✓', word: 'PASS' },
+  fail: { glyph: '✕', word: 'FAIL' },
+  pending: { glyph: '◷', word: 'PENDING' },
+  not_served: { glyph: '—', word: 'not served' },
+} as const;
+
 // ---------------------------------------------------------------------------
 // state machines — one per failure domain, deliberately not merged
 // ---------------------------------------------------------------------------
@@ -745,6 +752,7 @@ function ParticipantRow({ entry }: { entry: ParticipantEntry }) {
 
 function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
   const { receipt, checks } = entry;
+  const [descriptionsExpanded, setDescriptionsExpanded] = useState(true);
   const verify = checks.kind === 'ok' ? checks.verify : null;
   // The verify route can serve a receipt whose status disagrees with the one the participant route
   // served. Surfaced rather than silently preferring one: they are two published reads of the same
@@ -772,7 +780,21 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
       // yet" from "settled UNSCORED and never will be". Only the receipt status does.
       data-receipt-status={receipt.status}
     >
-      <p className={styles.panelLabel}>FAIR-PLAY CHECKS · {receipt.payer}</p>
+      <div className={styles.panelHead}>
+        <p className={styles.panelLabel}>FAIR-PLAY CHECKS · {receipt.payer}</p>
+        {verify === null ? null : (
+          <button
+            type="button"
+            className={styles.checkToggle}
+            aria-expanded={descriptionsExpanded}
+            onClick={() => setDescriptionsExpanded((expanded) => !expanded)}
+          >
+            {descriptionsExpanded
+              ? 'Collapse Fair-Play check descriptions'
+              : 'Expand Fair-Play check descriptions'}
+          </button>
+        )}
+      </div>
       {/* Was "was this benchmark produced correctly?". Interrogative, so it asserted nothing — but
           it puts the aggregate phrasing on screen beside eight independent verdicts, and a reader
           skimming a screenshot does not parse a question mark. Scoped to this receipt instead. */}
@@ -810,25 +832,40 @@ function FairPlayChecks({ entry }: { entry: ParticipantEntry }) {
                 constant (CF-5). The adapter already guarantees length 8 and the order; iterating
                 its output rather than a local list is what keeps a second spelling out of the
                 tree. */}
-            {verify.checks.map((c) => (
-              <li
-                key={c.key}
-                className={styles.checkRow}
-                data-testid="check-row"
-                data-key={c.key}
-                data-phase={c.phase}
-                // `null` means the backend did not serve this key. It is NOT the verdict
-                // `pending`, which the verifier would then never have made.
-                data-status={c.status === null ? 'not_served' : c.status}
-              >
-                <code className={styles.checkKey}>{c.key}</code>
-                <span className={styles.checkPhase}>{c.phase}-time</span>
-                <span className={styles.checkDesc}>{CHECK_DESCRIPTION[c.key as FrozenCheckKey]}</span>
-                <span className={styles.checkStatus} data-status={c.status === null ? 'not_served' : c.status}>
-                  {c.status === null ? 'not served' : c.status.toUpperCase()}
-                </span>
-              </li>
-            ))}
+            {verify.checks.map((c) => {
+              const status = c.status === null ? 'not_served' : c.status;
+              const presentation = CHECK_STATUS_PRESENTATION[status];
+              return (
+                <li
+                  key={c.key}
+                  className={styles.checkRow}
+                  data-testid="check-row"
+                  data-key={c.key}
+                  data-phase={c.phase}
+                  // `null` means the backend did not serve this key. It is NOT the verdict
+                  // `pending`, which the verifier would then never have made.
+                  data-status={status}
+                >
+                  <code className={styles.checkKey}>{c.key}</code>
+                  <span className={styles.checkPhase}>{c.phase}-time</span>
+                  {descriptionsExpanded ? (
+                    <span className={styles.checkDesc} data-testid="check-description">
+                      {CHECK_DESCRIPTION[c.key as FrozenCheckKey]}
+                    </span>
+                  ) : null}
+                  <span
+                    className={styles.checkStatus}
+                    data-status={status}
+                    data-testid="check-status"
+                  >
+                    <span aria-hidden="true" data-testid="check-status-glyph">
+                      {presentation.glyph}
+                    </span>{' '}
+                    {presentation.word}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
           {verify.unexpectedKeys.length > 0 ? (
             // CF-5 drift is invisible precisely because the keys are unconstrained `str`, so a
@@ -874,16 +911,15 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
     && Math.abs(fadeOfficial - officialFormulaFade) > 1e-9;
 
   return (
-    <div className={styles.panel} data-testid="markout-table">
-      <p className={styles.panelLabel}>
-        COST SENSITIVITY · <span className={styles.frozenLabel}>{SIGNAL_TRIALS_MARKOUT_LABEL}</span>
-      </p>
-      <p className={styles.panelSub}>official rank basis: {OFFICIAL_COST_BPS} bps modeled costs</p>
-      {/* VERBATIM. The DOM carries the task packet's exact spelling; `.verbatimUpper` supplies the
-          design handoff's uppercase presentation. Same resolution as the UNSCORED title above. */}
-      <p className={`${styles.tag} ${styles.verbatimUpper}`} data-testid="markout-diagnostic-tag">
-        diagnostic — does not change ranking
-      </p>
+    <details className={`${styles.panel} ${styles.disclosure}`} open={settled} data-testid="markout-table">
+      <summary className={styles.disclosureSummary}>
+        <span className={styles.panelLabel}>
+          COST SENSITIVITY · <span className={styles.frozenLabel}>{SIGNAL_TRIALS_MARKOUT_LABEL}</span>
+        </span>
+        <span className={styles.disclosureState}>
+          {settled ? 'SETTLED EVIDENCE · SWEEP AVAILABLE' : 'NO SETTLED MARKOUT · NO SWEEP'}
+        </span>
+      </summary>
 
       {!settled ? (
         <p className={styles.stateBody}>
@@ -892,6 +928,12 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
         </p>
       ) : (
         <>
+          <p className={styles.panelSub}>official rank basis: {OFFICIAL_COST_BPS} bps modeled costs</p>
+          {/* VERBATIM. The DOM carries the task packet's exact spelling; `.verbatimUpper` supplies
+              the design handoff's uppercase presentation. Same resolution as UNSCORED above. */}
+          <p className={`${styles.tag} ${styles.verbatimUpper}`} data-testid="markout-diagnostic-tag">
+            diagnostic — does not change ranking
+          </p>
           <div className={styles.tableWrap}>
             <table className={styles.table}>
               <thead>
@@ -960,6 +1002,6 @@ function MarkoutSection({ outcome }: { outcome: TrialOutcome | null }) {
           </p>
         </>
       )}
-    </div>
+    </details>
   );
 }

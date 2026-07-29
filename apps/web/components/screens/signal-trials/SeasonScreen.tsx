@@ -190,6 +190,8 @@ export function SeasonScreen() {
           agents={featuredRail.receipts}
           compact
           testId="season-shared-evidence-rail"
+          href={trialHref(featuredRail.trial.trialId)}
+          ariaLabel={`OPEN FEATURED MATCH CARD ${featuredRail.trial.trialId}`}
         />
       ) : null}
 
@@ -472,13 +474,26 @@ function SeasonRow({
   featuredTrialId: string | null;
 }) {
   return (
-    <tr className={styles.row} data-testid="season-row">
-      <td className="mono" data-testid="season-ord">{ord}</td>
+    <tr
+      className={`${styles.row} ${featuredTrialId === null ? '' : styles.rowNavigable}`}
+      data-testid="season-row"
+    >
+      <td className="mono" data-testid="season-ord">
+        {featuredTrialId === null ? null : (
+          <Link
+            className={styles.rowAction}
+            data-testid="season-row-link"
+            href={trialHref(featuredTrialId)}
+            aria-label={`OPEN ${row.agentId} MATCH CARD`}
+          >
+            <span className={styles.visuallyHidden}>OPEN {row.agentId} MATCH CARD</span>
+          </Link>
+        )}
+        {ord}
+      </td>
       <td>
         <span data-testid="season-agent">
-          {featuredTrialId === null ? row.agentId : (
-            <Link data-testid="season-row-link" href={trialHref(featuredTrialId)}>{row.agentId}</Link>
-          )}
+          {row.agentId}
         </span>
         {agentSubcaption(row) === null ? null : (
           <small className={styles.agentSub} data-testid="season-agent-sub">{agentSubcaption(row)}</small>

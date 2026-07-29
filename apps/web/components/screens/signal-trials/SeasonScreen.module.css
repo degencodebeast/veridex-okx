@@ -81,7 +81,14 @@
 .table { border-collapse: collapse; width: 100%; font-family: var(--font-mono), monospace; font-size: 11px; }
 .table th { text-align: left; padding: 9px; font-size: 9px; letter-spacing: 0.06em; color: var(--text-3); background: var(--bg-bar); border-bottom: 1px solid var(--border); white-space: nowrap; }
 .table td { padding: 9px; border-bottom: 1px solid var(--border-soft); color: var(--text-1); white-space: nowrap; }
+.row { position: relative; }
 .row:hover { background: var(--panel-2); }
+.rowNavigable { cursor: pointer; }
+.rowAction { position: absolute; inset: 0; z-index: 1; }
+.visuallyHidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 .r { text-align: right; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .dash { color: var(--text-3); }

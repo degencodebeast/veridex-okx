@@ -33,7 +33,7 @@
 // null ones; FOLLOW, FADE and ABSTAIN actions; a served check `fail`, a served `pending`, and an
 // ABSENT key. What this basis CANNOT express is stated at the bottom of this file.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
@@ -197,7 +197,7 @@ function verifyWire(
 // has `/signal-trials/trials/{id}` as a strict prefix, and `/signal-trials/receipts/{rid}/verify`
 // also contains the substring `/receipts`. A naive `includes()` chain routes the card's calls to
 // the wrong stub and the whole file becomes meaningless.
-type Route = (url: string) => Response;
+type Route = (url: string) => Response | Promise<Response>;
 interface Routes {
   trial?: Route;
   receipts?: Route;
@@ -476,6 +476,56 @@ describe('H5.3 participants — three answers, none interchangeable', () => {
 // GROUP E — Fair-Play checks, ALL EIGHT keys (element 5, CF-5)
 // ---------------------------------------------------------------------------
 describe('H5.3 Fair-Play checks', () => {
+  it('collapses all eight descriptions as one group while keeping every status visible', async () => {
+    const panel = await participants();
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    const toggle = within(group).getByRole('button', {
+      name: 'Collapse Fair-Play check descriptions',
+    });
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(within(group).getAllByTestId('check-description')).toHaveLength(8);
+    expect(within(group).getAllByTestId('check-status')).toHaveLength(8);
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAccessibleName('Expand Fair-Play check descriptions');
+    expect(within(group).queryAllByTestId('check-description')).toHaveLength(0);
+    expect(within(group).getAllByTestId('check-row')).toHaveLength(8);
+    expect(within(group).getAllByTestId('check-status')).toHaveLength(8);
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(within(group).getAllByTestId('check-description')).toHaveLength(8);
+  });
+
+  it('renders a visible glyph and status word for pass, fail, pending, and not served', async () => {
+    const missingManifest: Record<string, W.SignalTrialsCheckStatusWire> = {
+      ...ALL_EIGHT,
+      body_hash: 'fail' as const,
+    };
+    delete missingManifest.manifest;
+    const panel = await participants({ verify: verifyRoute(missingManifest) });
+    const group = within(panel).getAllByTestId('fairplay-checks')[0];
+    const rows = within(group).getAllByTestId('check-row');
+    const expectedWords = new Map([
+      ['fail', 'FAIL'],
+      ['pass', 'PASS'],
+      ['pending', 'PENDING'],
+      ['not_served', 'not served'],
+    ]);
+
+    for (const [status, word] of expectedWords) {
+      const row = rows.find((candidate) => candidate.getAttribute('data-status') === status);
+      expect(row, `missing ${status} fixture row`).toBeDefined();
+      const badge = within(row!).getByTestId('check-status');
+      expect(badge).toHaveTextContent(word);
+      const glyph = within(badge).getByTestId('check-status-glyph');
+      expect(glyph.textContent?.trim()).not.toBe('');
+      expect(glyph).toHaveAttribute('aria-hidden', 'true');
+    }
+  });
+
   it('renders all EIGHT frozen keys per participant, in the frozen order, from the shared constant', async () => {
     const panel = await participants();
     const group = within(panel).getAllByTestId('fairplay-checks')[0];
@@ -810,6 +860,15 @@ describe('H5.3 rail copy is true in every outcome state the card supports', () =
 // GROUP F — the markout table (element 4)
 // ---------------------------------------------------------------------------
 describe('H5.3 markout table', () => {
+  it('is a semantic disclosure that is open by default for settled evidence', async () => {
+    await card();
+    const disclosure = screen.getByTestId('markout-table');
+    expect(disclosure.tagName).toBe('DETAILS');
+    expect(disclosure).toHaveAttribute('open');
+    expect(within(disclosure).getByText(/COST SENSITIVITY/)).toBeInTheDocument();
+    expect(within(disclosure).getAllByTestId('markout-row')).toHaveLength(4);
+  });
+
   it('carries the frozen markout label and the diagnostic tag', async () => {
     await card();
     expect(screen.getByText(SIGNAL_TRIALS_MARKOUT_LABEL)).toBeInTheDocument();
@@ -889,8 +948,12 @@ describe('H5.3 markout table', () => {
     outcome,
   ) => {
     await card({ trial: () => jsonResponse(trial(outcome)) });
+    const disclosure = screen.getByTestId('markout-table');
+    expect(disclosure.tagName).toBe('DETAILS');
+    expect(disclosure).not.toHaveAttribute('open');
     expect(screen.queryAllByTestId('markout-row')).toHaveLength(0);
     expect(screen.queryByTestId('markout-formula-warning')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-diagnostic-tag')).not.toBeInTheDocument();
     expect(screen.getByTestId('markout-table').textContent)
       .toMatch(/no markout exists at any cost assumption/i);
   });
@@ -900,6 +963,24 @@ describe('H5.3 markout table', () => {
 // GROUP G — the trial section's own failure domains
 // ---------------------------------------------------------------------------
 describe('H5.3 trial section states', () => {
+  it.each([
+    ['loading', () => new Promise<Response>(() => {})],
+    ['not found', () => errorResponse(404, 'trial_not_found')],
+    ['unavailable', () => errorResponse(500, 'boom')],
+  ] as const)('renders no cost disclosure or diagnostic sweep while the trial is %s', async (
+    _state,
+    trialRoute,
+  ) => {
+    stubRoutes({ trial: trialRoute, receipts: OK_RECEIPTS, verify: OK_VERIFY });
+    render(<TrialMatchCard trialId={TRIAL_ID} />);
+    if (_state !== 'loading') {
+      await waitFor(() => expect(screen.getByTestId('trial-panel')).not.toHaveAttribute('data-state', 'loading'));
+    }
+    expect(screen.queryByTestId('markout-table')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-diagnostic-tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('markout-row')).not.toBeInTheDocument();
+  });
+
   it('404 renders "trial not found" with no retry — a 404 is not a transport failure', async () => {
     stubRoutes({ trial: () => errorResponse(404, 'trial_not_found'), receipts: OK_RECEIPTS, verify: OK_VERIFY });
     render(<TrialMatchCard trialId={TRIAL_ID} />);
