@@ -1,7 +1,10 @@
 import ast
 import asyncio
+import base64
 import contextlib
 import functools
+import hashlib
+import hmac
 import inspect
 import io
 import json
@@ -43,7 +46,62 @@ from veridex.signal_trials.okx_client import (
 class RecordingFake:
     def __init__(self, payload): self.payload, self.calls = payload, []
     async def request(self, method, path, *, params, json_body, headers):
-        self.calls.append((method, path, params, json_body, headers)); return self.payload
+        self.calls.append((method, path, params, json_body, headers))
+        return self.payload
+
+
+async def test_signal_list_serializes_all_six_filters_as_strings_and_signs_the_transmitted_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The v6 Signal List declares every request parameter String, including four app-level ints."""
+
+    class ByteRecordingTransport(RecordingFake):
+        transmitted_body: bytes | None = None
+
+        async def request(self, method, path, *, params, json_body, headers):
+            self.transmitted_body = json.dumps(json_body, separators=(",", ":")).encode()
+            return await super().request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                headers=headers,
+            )
+
+    fixed_timestamp = "2026-07-29T00:00:00.000Z"
+    monkeypatch.setattr(okx_client, "_timestamp", lambda: fixed_timestamp)
+    filters = SignalFilters(
+        chain_index="196",
+        wallet_type="1",
+        min_address_count=7,
+        min_amount_usd=1234,
+        min_market_cap_usd=567_890,
+        min_liquidity_usd=23_456,
+    )
+    # The wire conversion belongs at the client boundary; application threshold types remain ints.
+    assert isinstance(filters.min_address_count, int)
+    assert isinstance(filters.min_amount_usd, int)
+    assert isinstance(filters.min_market_cap_usd, int)
+    assert isinstance(filters.min_liquidity_usd, int)
+
+    transport = ByteRecordingTransport({"code": "0", "data": []})
+    creds = OKXCredentials("api-key-sentinel", "secret-sentinel", "passphrase-sentinel")
+    await OKXMarketClient(transport, creds).list_signals(filters)
+
+    expected_body = (
+        b'[{"chainIndex":"196","walletType":"1","minAddressCount":"7",'
+        b'"minAmountUsd":"1234","minMarketCapUsd":"567890","minLiquidityUsd":"23456"}]'
+    )
+    assert transport.transmitted_body == expected_body
+
+    assert len(transport.calls) == 1
+    headers = transport.calls[0][4]
+    prehash = fixed_timestamp.encode() + b"POST" + b"/api/v6/dex/market/signal/list" + expected_body
+    expected_signature = base64.b64encode(
+        hmac.new(b"secret-sentinel", prehash, hashlib.sha256).digest()
+    ).decode()
+    assert headers["OK-ACCESS-SIGN"] == expected_signature
+
 
 async def test_list_signals_posts_array_body_and_parses_cursor():
     fake = RecordingFake({"code": "0", "data": [{"timestamp": "1753400000000", "price": "0.042",
@@ -317,10 +375,10 @@ async def test_list_signals_takes_the_cursor_from_the_last_row_and_round_trips_i
         {
             "chainIndex": "501",
             "walletType": "1",
-            "minAddressCount": 2,
-            "minAmountUsd": 1000,
-            "minMarketCapUsd": 100_000,
-            "minLiquidityUsd": 20_000,
+            "minAddressCount": "2",
+            "minAmountUsd": "1000",
+            "minMarketCapUsd": "100000",
+            "minLiquidityUsd": "20000",
             "cursor": "CURSOR-LAST",
         }
     ]

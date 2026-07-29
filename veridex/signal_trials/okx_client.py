@@ -409,10 +409,10 @@ class OKXMarketClient:
         filters: dict[str, Any] = {
             "chainIndex": f.chain_index,
             "walletType": f.wallet_type,
-            "minAddressCount": f.min_address_count,
-            "minAmountUsd": f.min_amount_usd,
-            "minMarketCapUsd": f.min_market_cap_usd,
-            "minLiquidityUsd": f.min_liquidity_usd,
+            "minAddressCount": str(f.min_address_count),
+            "minAmountUsd": str(f.min_amount_usd),
+            "minMarketCapUsd": str(f.min_market_cap_usd),
+            "minLiquidityUsd": str(f.min_liquidity_usd),
         }
         if cursor is not None:
             filters["cursor"] = cursor
