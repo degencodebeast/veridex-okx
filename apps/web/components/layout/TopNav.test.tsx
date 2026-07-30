@@ -5,9 +5,9 @@ import { TopNav } from '@/components/layout/TopNav';
 vi.mock('next/navigation', () => ({ usePathname: () => '/markets' }));
 
 describe('TopNav (REQ-001)', () => {
-  it('renders the five public sections and nothing else as tabs', () => {
+  it('renders the six public sections and nothing else as tabs', () => {
     render(<TopNav />);
-    for (const label of ['Competitions', 'Arena', 'Markets', 'Leaderboard', 'Agents']) {
+    for (const label of ['Competitions', 'Arena', 'Trials', 'Markets', 'Leaderboard', 'Agents']) {
       expect(screen.getByRole('link', { name: label })).toBeInTheDocument();
     }
     expect(screen.queryByRole('link', { name: 'My Agents' })).toBeNull();

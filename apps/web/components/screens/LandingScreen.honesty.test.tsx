@@ -42,6 +42,7 @@ const CLASS_OVERCLAIMS: { pattern: RegExp; why: string }[] = [
 const NAV_ROUTE_SCREEN: Record<string, string> = {
   '/competitions': 'components/screens/CompetitionsScreen.tsx',
   '/arena': 'components/screens/ArenaEmptyState.tsx',
+  '/trials': 'components/screens/signal-trials/SeasonScreen.tsx',
   '/markets': 'components/screens/MarketsScreen.tsx',
   '/leaderboard': 'components/screens/LeaderboardScreen.tsx',
   '/agents': 'components/screens/AgentsScreen.tsx',

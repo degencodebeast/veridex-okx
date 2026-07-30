@@ -2,6 +2,7 @@
 export const NAV_SECTIONS = [
   { label: 'Competitions', href: '/competitions' },
   { label: 'Arena', href: '/arena' },
+  { label: 'Trials', href: '/trials' },
   { label: 'Markets', href: '/markets' },
   { label: 'Leaderboard', href: '/leaderboard' },
   { label: 'Agents', href: '/agents' },

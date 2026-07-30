@@ -9,12 +9,12 @@ test('landing renders the V4 product promise', async ({ page }) => {
   await expect(page.getByText(/payout state is always labeled honestly/i)).toBeVisible();
 });
 
-test('the app Primary nav exposes the five public sections (on an app route)', async ({ page }) => {
+test('the app Primary nav exposes the six public sections (on an app route)', async ({ page }) => {
   // `/` is now the standalone marketing landing; the app Primary nav lives in the (app)
   // route group, so assert it on an app route (URL-transparent — path unchanged).
   await page.goto('/leaderboard');
   const nav = page.getByRole('navigation', { name: 'Primary' });
-  for (const label of ['Competitions', 'Arena', 'Markets', 'Leaderboard', 'Agents']) {
+  for (const label of ['Competitions', 'Arena', 'Trials', 'Markets', 'Leaderboard', 'Agents']) {
     await expect(nav.getByRole('link', { name: label })).toBeVisible();
   }
 });

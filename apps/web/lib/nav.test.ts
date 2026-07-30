@@ -2,12 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { NAV_SECTIONS, CONTEXTUAL_ROUTES, isActiveSection } from '@/lib/nav';
 
 describe('IA (REQ-001/002/003)', () => {
-  it('top nav carries exactly the five public sections', () => {
+  it('top nav carries exactly the six public sections', () => {
     expect(NAV_SECTIONS.map((s) => s.label)).toEqual([
-      'Competitions', 'Arena', 'Markets', 'Leaderboard', 'Agents',
+      'Competitions', 'Arena', 'Trials', 'Markets', 'Leaderboard', 'Agents',
     ]);
     expect(NAV_SECTIONS.map((s) => s.href)).toEqual([
-      '/competitions', '/arena', '/markets', '/leaderboard', '/agents',
+      '/competitions', '/arena', '/trials', '/markets', '/leaderboard', '/agents',
     ]);
   });
 
